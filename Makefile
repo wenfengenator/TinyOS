@@ -1,8 +1,11 @@
 # tinyos build
 #
-#   make            build os.img (boot + kernel + user)
-#   make run        run on QEMU (real hardware path; needs qemu-system-i386)
-#   make run-emu    run on the bundled Unicorn emulator (works without QEMU)
+#   make               build os.img (boot + kernel + user)   [ARCH=i386, default]
+#   make run           run on QEMU (real hardware path; needs qemu-system-i386)
+#   make run-emu       run on the bundled Unicorn emulator (works without QEMU)
+#   make ARCH=x64        build the x64 UEFI app (build/BOOTX64.EFI)
+#   make ARCH=x64 run    boot the x64 build in a QEMU window (OVMF); needs a display
+#   make run-x64-headless boot the x64 build headless (serial only; for CI/sandbox)
 #   make clean
 #
 # Toolchain: assembly via GNU as/ld/objcopy; C via tools/xcc (gcc), C++ via
@@ -25,7 +28,8 @@ ASFLAGS  := --32
 LDFLAGS  := -m elf_i386 -T kernel/linker.ld -nostdlib
 
 # object order matters: entry first (.text.boot -> 0x10000), user last (ring 3)
-KSRC  := $(wildcard kernel/*.c)
+# x64-only kernel sources (kernel/*64.c) belong to the ARCH=x64 path, not here.
+KSRC  := $(filter-out $(wildcard kernel/*64.c),$(wildcard kernel/*.c))
 USRC  := $(wildcard user/*.cpp)
 KOBJS := $(BUILD)/entry.o $(patsubst kernel/%.c,$(BUILD)/k_%.o,$(KSRC))
 UOBJS := $(patsubst user/%.cpp,$(BUILD)/u_%.o,$(USRC))
@@ -42,8 +46,41 @@ PYLIBS ?= .pylibs
 PYTHON ?= python3
 EMU    := PYTHONPATH=$(PYLIBS) $(PYTHON) tools/emulate.py
 
-.PHONY: all run run-emu run-emu-kernel deps clean
-all: os.img fs.img
+# ---- architecture switch: ARCH=i386 (default) or ARCH=x64 (UEFI long mode) ----
+ARCH      ?= i386
+QEMU64    ?= qemu-system-x86_64
+OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS_4M.fd
+ESP       := $(BUILD)/esp
+
+# x64 UEFI app: PE32+ built with pure binutils (no mingw/gnu-efi/clang).
+#   -fPIC + --strip-all -> position-independent, no fragile HIGHLOW base relocs,
+#                          and no stray .comment section => OVMF loads it cleanly.
+#   ld -mi386pep --subsystem=10 -> EFI application; low image base so 32-bit
+#                          address references still resolve at link time.
+EFI_CFLAGS  := -m64 -ffreestanding -fshort-wchar -mno-red-zone -fno-stack-protector \
+               -fPIC -fvisibility=hidden -fno-ident -fno-builtin -fno-asynchronous-unwind-tables \
+               -mno-sse -mno-mmx -O2 $(CWARN) -Ikernel -I$(BUILD)
+EFI_LDFLAGS := -mi386pep -e efi_main --subsystem=10 --image-base 0x100000 \
+               -nostdlib --strip-all
+
+# x64 kernel objects linked into the single PE32+ EFI application.
+EFI_HDRS := kernel/boot64.h kernel/font8x8.h
+EFI_OBJS := $(BUILD)/efi_main.o $(BUILD)/entry64.o \
+            $(BUILD)/kmain64.o $(BUILD)/fb64.o $(BUILD)/mm64.o \
+            $(BUILD)/time64.o $(BUILD)/kbd64.o $(BUILD)/demo64.o \
+            $(BUILD)/smp64.o $(BUILD)/vmbus64.o
+
+ifeq ($(ARCH),x64)
+ALL_TGT := $(BUILD)/BOOTX64.EFI
+RUN_TGT := run-x64
+else
+ALL_TGT := os.img fs.img
+RUN_TGT := run-i386
+endif
+
+.PHONY: all run run-i386 run-x64 run-x64-headless run-x64-disk vhdx bootx64 esp run-emu run-emu-kernel deps clean
+all: $(ALL_TGT)
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -105,7 +142,10 @@ fs.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*)
 
 # graphical QEMU (VGA + PS/2 keyboard) — the normal way to use tinyos.
 # Attaches fs.img as a second disk so `mount`/`cd /mnt` work.
-run: os.img fs.img
+# `make run` dispatches to the arch-specific target (run-i386 / run-x64).
+run: $(RUN_TGT)
+
+run-i386: os.img fs.img
 	$(QEMU) -drive format=raw,file=os.img \
 	        -drive format=raw,file=fs.img,index=1,media=disk
 
@@ -114,6 +154,80 @@ run-serial: os.img fs.img
 	$(QEMU) -display none -serial stdio -net none \
 	        -drive format=raw,file=os.img \
 	        -drive format=raw,file=fs.img,index=1,media=disk
+
+# ---- x64 / UEFI build (ARCH=x64) ----------------------------------------
+# The UEFI loader (boot/efi_main.c) and the 64-bit kernel (kernel/*64.*) are
+# compiled freestanding and linked straight to one PE32+ EFI application.
+$(BUILD)/efi_main.o: boot/efi_main.c $(EFI_HDRS) | $(BUILD)
+	$(CC) $(EFI_CFLAGS) -c -o $@ $<
+$(BUILD)/%64.o: kernel/%64.c $(EFI_HDRS) | $(BUILD)
+	$(CC) $(EFI_CFLAGS) -c -o $@ $<
+$(BUILD)/entry64.o: kernel/entry64.s | $(BUILD)
+	$(AS) --64 -o $@ $<
+
+# AP startup trampoline: real->protected->long mode, linked flat at 0x8000 and
+# embedded as a byte blob the BSP copies to physical 0x8000 before SIPIs.
+$(BUILD)/ap_trampoline.bin: kernel/ap_trampoline.s | $(BUILD)
+	$(AS) --64 -o $(BUILD)/ap_tramp_pre.o $<
+	$(LD) -m elf_x86_64 -Ttext=0x8000 -e _tramp_start -nostdlib -o $(BUILD)/ap_tramp.elf $(BUILD)/ap_tramp_pre.o
+	$(OBJCOPY) -O binary $(BUILD)/ap_tramp.elf $@
+# emit the trampoline as a same-TU C array (reliable under ld -mi386pep)
+$(BUILD)/ap_tramp_array.h: $(BUILD)/ap_trampoline.bin | $(BUILD)
+	$(PYTHON) -c "d=open('$(BUILD)/ap_trampoline.bin','rb').read(); open('$(BUILD)/ap_tramp_array.h','w').write('static const unsigned char ap_tramp[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/smp64.o: $(BUILD)/ap_tramp_array.h
+
+$(BUILD)/BOOTX64.EFI: $(EFI_OBJS)
+	$(LD) $(EFI_LDFLAGS) -o $@ $(EFI_OBJS)
+	@file $@
+
+bootx64: $(BUILD)/BOOTX64.EFI
+
+# stage an EFI System Partition tree (removable-media path /EFI/BOOT/BOOTX64.EFI)
+esp: $(BUILD)/BOOTX64.EFI
+	mkdir -p $(ESP)/EFI/BOOT
+	cp $(BUILD)/BOOTX64.EFI $(ESP)/EFI/BOOT/BOOTX64.EFI
+	$(PYTHON) -c "open('$(ESP)/TINYWAD.DAT','wb').write(bytes(range(256))*16384)"
+
+# boot the x64 build under qemu-system-x86_64 + OVMF in a graphical window so the
+# framebuffer demo is visible; the serial console is mirrored to the terminal.
+# Prefers KVM (much faster) and falls back to TCG.  Give the demo keyboard focus
+# by clicking the QEMU window: arrows move the box, Q/ESC quits.
+run-x64: esp
+	cp $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
+	$(QEMU64) -machine q35,accel=kvm:tcg -m 512 \
+	  -drive if=pflash,format=raw,unit=0,readonly=on,file=$(OVMF_CODE) \
+	  -drive if=pflash,format=raw,unit=1,file=$(BUILD)/OVMF_VARS.fd \
+	  -drive format=raw,file=fat:rw:$(ESP) \
+	  -vga std -serial stdio -no-reboot
+
+# same boot, but headless (no window) — for CI / sandboxes without a display.
+run-x64-headless: esp
+	cp $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
+	$(QEMU64) -machine q35 -accel tcg -m 512 \
+	  -drive if=pflash,format=raw,unit=0,readonly=on,file=$(OVMF_CODE) \
+	  -drive if=pflash,format=raw,unit=1,file=$(BUILD)/OVMF_VARS.fd \
+	  -drive format=raw,file=fat:rw:$(ESP) \
+	  -serial stdio -display none -no-reboot
+
+# ---- Hyper-V Gen 2 artifact: a GPT disk with a FAT32 ESP, packaged as VHDX ----
+# tools/mkgptesp.py writes the GPT + FAT32 volume by hand (no mkfs.vfat needed).
+$(BUILD)/tinyos.img: esp tools/mkgptesp.py
+	$(PYTHON) tools/mkgptesp.py $@ $(ESP)
+
+tinyos.vhdx: $(BUILD)/tinyos.img
+	qemu-img convert -f raw -O vhdx $< $@
+	@echo "tinyos.vhdx ready — attach to a Hyper-V Gen 2 VM (Secure Boot OFF)"
+
+vhdx: tinyos.vhdx
+
+# boot the GPT disk image itself (proxy for Hyper-V) in a QEMU window + OVMF
+run-x64-disk: $(BUILD)/tinyos.img
+	cp $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
+	$(QEMU64) -machine q35,accel=kvm:tcg -m 512 \
+	  -drive if=pflash,format=raw,unit=0,readonly=on,file=$(OVMF_CODE) \
+	  -drive if=pflash,format=raw,unit=1,file=$(BUILD)/OVMF_VARS.fd \
+	  -drive format=raw,file=$(BUILD)/tinyos.img \
+	  -vga std -serial stdio -no-reboot
 
 # ensure the Unicorn CPU emulator is importable; install into .pylibs if not.
 deps:
@@ -129,4 +243,4 @@ run-emu-kernel: kernel.bin deps
 	$(EMU) --kernel kernel.bin
 
 clean:
-	rm -rf $(BUILD) boot.bin kernel.bin os.img fs.img
+	rm -rf $(BUILD) boot.bin kernel.bin os.img fs.img tinyos.vhdx
