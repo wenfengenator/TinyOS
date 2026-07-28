@@ -1,0 +1,14 @@
+#!/bin/sh
+# tinyos C compiler wrapper.
+# Prefers a system gcc; falls back to the WSL/snap host toolchain when running
+# inside the Copilot sandbox (where gcc lives under the hostfs mount).
+if command -v gcc-13 >/dev/null 2>&1; then exec gcc-13 "$@"; fi
+if command -v gcc    >/dev/null 2>&1; then exec gcc    "$@"; fi
+H=/var/lib/snapd/hostfs
+if [ -x "$H/usr/bin/gcc-13" ]; then
+    LD_LIBRARY_PATH="$H/usr/lib/x86_64-linux-gnu:$H/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+    export LD_LIBRARY_PATH
+    exec "$H/usr/bin/gcc-13" "$@"
+fi
+echo "xcc: no C compiler found (need gcc or gcc-13)" >&2
+exit 1

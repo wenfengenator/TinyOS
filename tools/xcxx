@@ -1,0 +1,12 @@
+#!/bin/sh
+# tinyos C++ compiler wrapper (see xcc).
+if command -v g++-13 >/dev/null 2>&1; then exec g++-13 "$@"; fi
+if command -v g++    >/dev/null 2>&1; then exec g++    "$@"; fi
+H=/var/lib/snapd/hostfs
+if [ -x "$H/usr/bin/g++-13" ]; then
+    LD_LIBRARY_PATH="$H/usr/lib/x86_64-linux-gnu:$H/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+    export LD_LIBRARY_PATH
+    exec "$H/usr/bin/g++-13" "$@"
+fi
+echo "xcxx: no C++ compiler found (need g++ or g++-13)" >&2
+exit 1

@@ -1,0 +1,9 @@
+build/
+boot.bin
+kernel.bin
+os.img
+__pycache__/
+*.o
+*.elf
+.pylibs/
+fs.img

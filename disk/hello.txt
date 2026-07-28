@@ -1,0 +1,2 @@
+tinyos rocks
+edit me with:  vi /mnt/hello.txt
