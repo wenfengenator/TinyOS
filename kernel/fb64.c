@@ -90,9 +90,11 @@ void fb_present(const uint32_t *back) {
         memcpy((void *)(g_fb + y * g_pitch), back + y * g_w, (unsigned long)g_w * 4);
 }
 
-/* Draw a string into a tight w-pitched buffer at pixel (x,y). */
-void fb_text_to(uint32_t *buf, uint32_t x, uint32_t y,
-                const char *s, uint32_t fg_rgb, uint32_t bg_rgb) {
+/* Draw a string into a tight w-pitched buffer at pixel (x,y), each 8x8 glyph
+ * magnified by an integer `scale` (nearest-neighbour, so it stays crisp). */
+void fb_text_to_s(uint32_t *buf, uint32_t x, uint32_t y,
+                  const char *s, uint32_t fg_rgb, uint32_t bg_rgb, uint32_t scale) {
+    if (scale < 1) scale = 1;
     uint32_t fg = pack(fg_rgb), bg = pack(bg_rgb);
     for (; *s; s++) {
         unsigned uc = (unsigned char)*s;
@@ -101,13 +103,30 @@ void fb_text_to(uint32_t *buf, uint32_t x, uint32_t y,
         for (uint32_t row = 0; row < 8; row++) {
             unsigned char bits = g[row];
             for (uint32_t col = 0; col < 8; col++) {
-                uint32_t xx = x + col, yy = y + row;
-                if (xx < g_w && yy < g_h) buf[yy * g_w + xx] = (bits & (1u << col)) ? fg : bg;
+                uint32_t px = (bits & (1u << col)) ? fg : bg;
+                for (uint32_t sy = 0; sy < scale; sy++) {
+                    uint32_t yy = y + row * scale + sy;
+                    if (yy >= g_h) continue;
+                    for (uint32_t sx = 0; sx < scale; sx++) {
+                        uint32_t xx = x + col * scale + sx;
+                        if (xx < g_w) buf[yy * g_w + xx] = px;
+                    }
+                }
             }
         }
-        x += 8;
+        x += 8 * scale;
     }
 }
+
+/* Draw a string into a tight w-pitched buffer at pixel (x,y). */
+void fb_text_to(uint32_t *buf, uint32_t x, uint32_t y,
+                const char *s, uint32_t fg_rgb, uint32_t bg_rgb) {
+    fb_text_to_s(buf, x, y, s, fg_rgb, bg_rgb, 1);
+}
+
+/* boot console glyph cell: the 8x8 font magnified CON_SCALE times */
+#define CON_SCALE 2
+#define CON_CELL  (8 * CON_SCALE)
 
 static void draw_glyph(char c, uint32_t cx, uint32_t cy) {
     unsigned uc = (unsigned char)c;
@@ -116,21 +135,25 @@ static void draw_glyph(char c, uint32_t cx, uint32_t cy) {
     uint32_t fg = pack(g_fg), bg = pack(g_bg);
     for (uint32_t row = 0; row < 8; row++) {
         unsigned char bits = g[row];
-        for (uint32_t col = 0; col < 8; col++)
-            putpx(cx * 8 + col, cy * 8 + row, (bits & (1u << col)) ? fg : bg);
+        for (uint32_t col = 0; col < 8; col++) {
+            uint32_t px = (bits & (1u << col)) ? fg : bg;
+            for (uint32_t sy = 0; sy < CON_SCALE; sy++)
+                for (uint32_t sx = 0; sx < CON_SCALE; sx++)
+                    putpx(cx * CON_CELL + col * CON_SCALE + sx, cy * CON_CELL + row * CON_SCALE + sy, px);
+        }
     }
 }
 static void fb_scroll(void) {
-    uint32_t rows = g_h / 8;
-    for (uint32_t y = 0; y < (rows - 1) * 8; y++)
+    uint32_t rows = g_h / CON_CELL;
+    for (uint32_t y = 0; y < (rows - 1) * CON_CELL; y++)
         for (uint32_t x = 0; x < g_w; x++)
-            g_fb[y * g_pitch + x] = g_fb[(y + 8) * g_pitch + x];
+            g_fb[y * g_pitch + x] = g_fb[(y + CON_CELL) * g_pitch + x];
     uint32_t bg = pack(g_bg);
-    for (uint32_t y = (rows - 1) * 8; y < g_h; y++)
+    for (uint32_t y = (rows - 1) * CON_CELL; y < g_h; y++)
         for (uint32_t x = 0; x < g_w; x++) g_fb[y * g_pitch + x] = bg;
 }
 static void fb_putc(char c) {
-    uint32_t cols = g_w / 8, rows = g_h / 8;
+    uint32_t cols = g_w / CON_CELL, rows = g_h / CON_CELL;
     if (c == '\n')       { g_cx = 0; g_cy++; }
     else if (c == '\r')  { g_cx = 0; }
     else {

@@ -17,8 +17,6 @@
 #include "wm64.h"
 
 #define MAX_WIN     8
-#define TITLE_H     16
-#define TASKBAR_H   18
 #define MOVE_STEP   24
 #define MARGIN      12
 #define CONTENT_BG  0x08111C
@@ -28,6 +26,18 @@ static int         g_nwin, g_focus, g_move;
 static uint32_t    g_scr_w, g_scr_h, g_fps;
 static uint32_t   *g_back;                 /* full-screen compositor buffer      */
 static boot_info_t *g_bi;
+
+/* UI metrics chosen from the resolution in wm_run: a small framebuffer (Hyper-V's
+ * fixed 1024x768) uses an 8px font so the desktop isn't cramped; a big one uses
+ * 16px so text stays legible.  Title/task bars and line pitch derive from these. */
+static int g_uisc   = 2;                   /* font scale: 1 (low-res) or 2 (hi-res) */
+static int g_cell   = 16;                  /* glyph cell = 8 * g_uisc               */
+static int g_titleh = 24;                  /* window title bar height               */
+static int g_taskh  = 26;                  /* desktop task bar height               */
+static int g_lineh  = 24;                  /* sysmon line pitch                     */
+
+int wm_ui_scale(void) { return g_uisc; }
+int wm_ui_cell(void)  { return g_cell; }
 
 int         wm_window_count(void)       { return g_nwin; }
 const char *wm_window_title(int i)      { return (i >= 0 && i < g_nwin) ? g_wins[i].title : ""; }
@@ -51,25 +61,53 @@ static void fill_rect(uint32_t *back, int x, int y, int w, int h, uint32_t rgb) 
 
 /* "label<decimal>" at (x,y), label dim-blue and value white */
 static void draw_kv(uint32_t *back, int x, int y, const char *label, uint32_t val) {
-    fb_text_to(back, (uint32_t)x, (uint32_t)y, label, 0x99CCFF, CONTENT_BG);
+    fb_text_to_s(back, (uint32_t)x, (uint32_t)y, label, 0x99CCFF, CONTENT_BG, g_uisc);
     char b[12]; int n = 0; uint32_t v = val;
     if (!v) b[n++] = '0';
     else { char tmp[12]; int m = 0; while (v) { tmp[m++] = (char)('0' + v % 10); v /= 10; } while (m) b[n++] = tmp[--m]; }
     b[n] = 0;
-    fb_text_to(back, (uint32_t)(x + (int)slen(label) * 8), (uint32_t)y, b, 0xFFFFFF, CONTENT_BG);
+    fb_text_to_s(back, (uint32_t)(x + (int)slen(label) * g_cell), (uint32_t)y, b, 0xFFFFFF, CONTENT_BG, g_uisc);
+}
+
+/* like draw_kv but renders the value as 0x-prefixed hex (for status bitfields) */
+static void draw_kv_hex(uint32_t *back, int x, int y, const char *label, uint32_t val) {
+    fb_text_to_s(back, (uint32_t)x, (uint32_t)y, label, 0x99CCFF, CONTENT_BG, g_uisc);
+    char b[12]; int n = 0; b[n++] = '0'; b[n++] = 'x';
+    for (int s = 28; s >= 0; s -= 4) { int d = (int)((val >> s) & 0xF); b[n++] = (char)(d < 10 ? '0' + d : 'A' + d - 10); }
+    b[n] = 0;
+    fb_text_to_s(back, (uint32_t)(x + (int)slen(label) * g_cell), (uint32_t)y, b, 0xFFFFFF, CONTENT_BG, g_uisc);
+}
+
+/* render "RES <w>x<h>" (the live framebuffer resolution) */
+static void draw_res(uint32_t *back, int x, int y, uint32_t w, uint32_t h) {
+    fb_text_to_s(back, (uint32_t)x, (uint32_t)y, "RES      ", 0x99CCFF, CONTENT_BG, g_uisc);
+    char b[16]; int n = 0, m; uint32_t v; char t[6];
+    v = w; m = 0; if (!v) t[m++] = '0'; while (v) { t[m++] = (char)('0' + v % 10); v /= 10; } while (m) b[n++] = t[--m];
+    b[n++] = 'x';
+    v = h; m = 0; if (!v) t[m++] = '0'; while (v) { t[m++] = (char)('0' + v % 10); v /= 10; } while (m) b[n++] = t[--m];
+    b[n] = 0;
+    fb_text_to_s(back, (uint32_t)(x + 9 * g_cell), (uint32_t)y, b, 0xFFFFFF, CONTENT_BG, g_uisc);
 }
 
 /* live system-stats window (content callback) */
 static void sysmon_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw, int ch) {
     (void)win; (void)cw; (void)ch;
-    fb_text_to(back, (uint32_t)cx, (uint32_t)cy, "tinyos x64 kernel", 0x66FFCC, CONTENT_BG);
-    draw_kv(back, cx, cy + 16, "FPS      ", g_fps);
-    draw_kv(back, cx, cy + 28, "UPTIME S ", (uint32_t)(millis() / 1000));
-    draw_kv(back, cx, cy + 40, "HEAP MB  ", (uint32_t)(heap_total() / (1024 * 1024)));
-    draw_kv(back, cx, cy + 52, "USED MB  ", (uint32_t)(heap_used()  / (1024 * 1024)));
-    draw_kv(back, cx, cy + 64, "CORES    ", (uint32_t)smp_online_count());
-    draw_kv(back, cx, cy + 76, "TSC MHZ  ", (uint32_t)(tsc_freq_hz() / 1000000));
-    draw_kv(back, cx, cy + 88, "HV STAGE ", (uint32_t)hvkbd_stage());
+    int y = cy;
+    fb_text_to_s(back, (uint32_t)cx, (uint32_t)y, "tinyos x64 kernel", 0x66FFCC, CONTENT_BG, g_uisc);
+    y += g_lineh + 4;
+    draw_kv(back, cx, y, "FPS      ", g_fps);                                      y += g_lineh;
+    draw_kv(back, cx, y, "UPTIME S ", (uint32_t)(millis() / 1000));                y += g_lineh;
+    draw_kv(back, cx, y, "HEAP MB  ", (uint32_t)(heap_total() / (1024 * 1024)));    y += g_lineh;
+    draw_kv(back, cx, y, "USED MB  ", (uint32_t)(heap_used()  / (1024 * 1024)));    y += g_lineh;
+    draw_kv(back, cx, y, "CORES    ", (uint32_t)smp_online_count());               y += g_lineh;
+    draw_kv(back, cx, y, "TSC MHZ  ", (uint32_t)(tsc_freq_hz() / 1000000));         y += g_lineh;
+    draw_kv(back, cx, y, "HV STAGE ", (uint32_t)hvkbd_stage());                    y += g_lineh;
+    draw_kv(back, cx, y, "STOR STG ", (uint32_t)storvsc_stage());                  y += g_lineh;
+    draw_kv_hex(back, cx, y, "STOR IO  ", (uint32_t)storvsc_diag());               y += g_lineh;
+    draw_kv_hex(back, cx, y, "STOR VER ", (uint32_t)storvsc_ver());                y += g_lineh;
+    draw_kv(back, cx, y, "STOR BSZ ", (uint32_t)storvsc_blksz());                  y += g_lineh;
+    draw_res(back, cx, y, g_scr_w, g_scr_h);                                       y += g_lineh;
+    draw_kv(back, cx, y, "GOP MODES", g_bi ? g_bi->gop_modes : 0);
 }
 
 /* draw one window (frame + content) into the back buffer */
@@ -77,11 +115,11 @@ static void draw_window(wm_window_t *w, uint32_t *back, int focused) {
     uint32_t border  = focused ? 0x3AA0FF : 0x2A4A66;
     uint32_t titlebg = focused ? 0x1E5FA8 : 0x1A2A3A;
     fill_rect(back, w->x - 1, w->y - 1, w->w + 2, w->h + 2, border);
-    fill_rect(back, w->x, w->y, w->w, TITLE_H, titlebg);
-    fb_text_to(back, (uint32_t)(w->x + 4), (uint32_t)(w->y + 4), w->title, 0xFFFFFF, titlebg);
+    fill_rect(back, w->x, w->y, w->w, g_titleh, titlebg);
+    fb_text_to_s(back, (uint32_t)(w->x + 6), (uint32_t)(w->y + 4), w->title, 0xFFFFFF, titlebg, g_uisc);
     if (focused && g_move)
-        fb_text_to(back, (uint32_t)(w->x + w->w - 56), (uint32_t)(w->y + 4), "[MOVE]", 0xFFEE44, titlebg);
-    int cyc = w->y + TITLE_H, chc = w->h - TITLE_H;
+        fb_text_to_s(back, (uint32_t)(w->x + w->w - 7 * g_cell), (uint32_t)(w->y + 4), "[MOVE]", 0xFFEE44, titlebg, g_uisc);
+    int cyc = w->y + g_titleh, chc = w->h - g_titleh;
     fill_rect(back, w->x, cyc, w->w, chc, CONTENT_BG);
     /* direct dispatch by kind (no cross-object function pointers) */
     switch (w->kind) {
@@ -93,10 +131,10 @@ static void draw_window(wm_window_t *w, uint32_t *back, int focused) {
 
 static void compositor(uint32_t *back) {
     fill_rect(back, 0, 0, (int)g_scr_w, (int)g_scr_h, 0x0A1830);      /* desktop  */
-    fill_rect(back, 0, 0, (int)g_scr_w, TASKBAR_H, 0x102A4A);         /* task bar */
-    fb_text_to(back, 6, 5,
-               "tinyos desktop    F1 = focus    F2 = move + arrows    terminal: type help",
-               0xEAF2FF, 0x102A4A);
+    fill_rect(back, 0, 0, (int)g_scr_w, g_taskh, 0x102A4A);           /* task bar */
+    fb_text_to_s(back, 8, 5,
+               "tinyos desktop    F1 focus    F2 move    terminal: type help",
+               0xEAF2FF, 0x102A4A, g_uisc);
     for (int i = 0; i < g_nwin; i++) if (i != g_focus) draw_window(&g_wins[i], back, 0);
     if (g_nwin) draw_window(&g_wins[g_focus], back, 1);
 }
@@ -105,28 +143,29 @@ static void clamp_window(wm_window_t *w) {
     if (w->x + w->w > (int)g_scr_w) w->x = (int)g_scr_w - w->w;
     if (w->y + w->h > (int)g_scr_h) w->y = (int)g_scr_h - w->h;
     if (w->x < 0) w->x = 0;
-    if (w->y < TASKBAR_H) w->y = TASKBAR_H;
+    if (w->y < g_taskh) w->y = g_taskh;
 }
 
 static void setup_windows(boot_info_t *bi) {
     g_nwin = g_focus = g_move = 0;
-    int top = TASKBAR_H + MARGIN;
+    int top = g_taskh + MARGIN;
+    int wh  = (int)g_scr_h - top - MARGIN;                /* both windows full height */
 
-    /* terminal fills the left ~62% of the desktop */
-    int tw = (int)g_scr_w * 62 / 100; if (tw < 320) tw = 320;
-    int th = (int)g_scr_h - top - MARGIN;
-    int cols = (tw - 12) / 8;
-    int rows = (th - TITLE_H - 12) / 8;
+    /* system monitor: right-hand column sized to fit its longest line (~24 chars),
+     * capped so wide screens stay balanced; the terminal fills the rest. */
+    int sw = (int)g_scr_w * 30 / 100;
+    if (sw < 24 * g_cell)             sw = 24 * g_cell;
+    if (sw > (int)g_scr_w * 45 / 100) sw = (int)g_scr_w * 45 / 100;
+
+    int tw = (int)g_scr_w - sw - 3 * MARGIN; if (tw < 20 * g_cell) tw = 20 * g_cell;
+    int cols = (tw - 12) / g_cell, rows = (wh - g_titleh - 12) / g_cell;
     wm_window_t *tm = &g_wins[g_nwin++];
-    tm->x = MARGIN; tm->y = top; tm->w = tw; tm->h = th; tm->title = "terminal";
+    tm->x = MARGIN; tm->y = top; tm->w = tw; tm->h = wh; tm->title = "terminal";
     tm->user = term_create(bi, cols, rows);
     tm->kind = WIN_TERMINAL;
 
-    /* system monitor sits to the right */
-    int sx = MARGIN + tw + MARGIN;
-    int sw = (int)g_scr_w - sx - MARGIN; if (sw < 200) sw = 200;
     wm_window_t *sm = &g_wins[g_nwin++];
-    sm->x = sx; sm->y = top; sm->w = sw; sm->h = 140; sm->title = "system monitor";
+    sm->x = MARGIN + tw + MARGIN; sm->y = top; sm->w = sw; sm->h = wh; sm->title = "system monitor";
     sm->user = 0; sm->kind = WIN_SYSMON;
 }
 
@@ -147,6 +186,12 @@ void wm_run(boot_info_t *bi) {
     g_bi = bi;
     fb_get(&g_scr_w, &g_scr_h);
     if (!g_scr_w || !g_scr_h) { kputs("[wm] no framebuffer\n"); return; }
+
+    g_uisc   = (g_scr_w >= 1440) ? 2 : 1;            /* 8px font on small panels (Hyper-V 1024) */
+    g_cell   = 8 * g_uisc;
+    g_titleh = g_cell + 8;
+    g_taskh  = g_cell + 10;
+    g_lineh  = g_cell + g_cell / 2;
 
     g_back = (uint32_t *)kmalloc((uint64_t)g_scr_w * g_scr_h * 4);
     if (!g_back) { kputs("[wm] back-buffer alloc failed\n"); return; }

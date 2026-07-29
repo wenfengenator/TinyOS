@@ -126,8 +126,15 @@ void arch_init(void) {
     kputs("[arch] gdt + tss + idt installed (ring 0/3 ready)\n");
 }
 
+/* Install an interrupt gate at runtime.  The IDT is already loaded (arch_init),
+ * so this takes effect immediately; used by the scheduler for the LAPIC timer. */
+void arch_set_irq_gate(int vec, uint64_t handler) {
+    if (vec >= 0 && vec < 256) set_gate(vec, handler);
+}
+
 /* ---- syscall dispatch (called from kernel/trap64.s:syscall_entry) ---- */
 static int arch_exec_named(const char *name, const char *arg);  /* nested child */
+static int proc_info(int i, int *pid, int *ring, int *state, char *name); /* ps */
 
 uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
     switch (num) {
@@ -173,22 +180,47 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2) {
         sys_exit_resume();                    /* does not return           */
         return 0;
     case 15: {                                /* readdir(dir,i,name)       */
-        const char *dir = (const char *)a0; int idx = (int)a1; char *name = (char *)a2;
+        char full[80]; fs_resolve((const char *)a0, full);
+        int idx = (int)a1; char *name = (char *)a2;
         uint16_t dcl = 0; uint8_t at; uint16_t cl; uint32_t sz;
-        if (dir && dir[0] && !(dir[0] == '/' && dir[1] == 0)) {
-            if (fat_resolve(dir, &at, &cl, &sz) < 0 || !(at & 0x10)) return (uint64_t)-1;
+        if (!(full[0] == '/' && full[1] == 0)) {
+            if (fat_resolve(full, &at, &cl, &sz) < 0 || !(at & 0x10)) return (uint64_t)-1;
             dcl = cl;
         }
         if (fat_list(dcl, idx, name, &at, &cl, &sz) < 0) return (uint64_t)-1;
         return (uint64_t)((at & 0x10) ? 1 : 0);
     }
+    case 16: {                                /* taskinfo(i, buf) -> ps    */
+        struct pinfo { int pid, ring, state; char name[16]; } *o = (struct pinfo *)a1;
+        return (uint64_t)(int)proc_info((int)a0, &o->pid, &o->ring, &o->state, o->name);
+    }
     case 18: {                                /* readfile(path,buf,max)    */
+        char full[80]; fs_resolve((const char *)a0, full);
         uint8_t at; uint16_t cl; uint32_t sz;
-        if (fat_resolve((const char *)a0, &at, &cl, &sz) < 0 || (at & 0x10)) return (uint64_t)-1;
+        if (fat_resolve(full, &at, &cl, &sz) < 0 || (at & 0x10)) return (uint64_t)-1;
         return (uint64_t)(int)fat_read(cl, sz, (void *)a1, (uint32_t)a2);
     }
-    case 22:                                  /* writefile(path,buf,n)     */
-        return (uint64_t)(int)fat_write((const char *)a0, (const void *)a1, (uint32_t)a2);
+    case 22: {                                /* writefile(path,buf,n)     */
+        char full[80]; fs_resolve((const char *)a0, full);
+        return (uint64_t)(int)fat_write(full, (const void *)a1, (uint32_t)a2);
+    }
+    case 23: {                                /* mkdir(path)               */
+        char full[80]; fs_resolve((const char *)a0, full);
+        return (uint64_t)(int)fat_mkdir(full);
+    }
+    case 24: {                                /* unlink(path)              */
+        char full[80]; fs_resolve((const char *)a0, full);
+        return (uint64_t)(int)fat_unlink(full);
+    }
+    case 25:                                  /* chdir(path)               */
+        return (uint64_t)(int)fs_chdir((const char *)a0);
+    case 26:                                  /* getcwd(buf)               */
+        fs_getcwd((char *)a0);
+        return 0;
+    case 27: {                                /* winsize() -> (cols<<16)|rows */
+        int c = 0, r = 0; term_active_size(&c, &r);
+        return (uint64_t)(((unsigned)c << 16) | (unsigned)(r & 0xFFFF));
+    }
     default:
         return (uint64_t)-1;
     }
@@ -278,10 +310,31 @@ void arch_user_init(void) {
     else                  kputs("[fs] fat16 mount failed\n");
 }
 
+/* ---- process table: the ring-3 exec stack (surfaced to `ps` via SYS_TASKINFO) */
+#define PROC_MAXLVL 2
+static char g_pname[PROC_MAXLVL][16];
+static int  g_ppid[PROC_MAXLVL];
+static int  g_plevels;                          /* active ring-3 nesting levels */
+
+/* i=0 -> the kernel; i=1..g_plevels -> the ring-3 exec stack.  0 ok, -1 at end. */
+static int proc_info(int i, int *pid, int *ring, int *state, char *name) {
+    if (i == 0) {
+        *pid = 0; *ring = 0; *state = 0;
+        const char *k = "kernel"; int j = 0; while (k[j]) { name[j] = k[j]; j++; } name[j] = 0;
+        return 0;
+    }
+    int lvl = i - 1;
+    if (lvl < 0 || lvl >= g_plevels) return -1;
+    *pid = g_ppid[lvl]; *ring = 3;
+    *state = (lvl == g_plevels - 1) ? 0 : 1;    /* innermost runs, callers wait */
+    int j = 0; while (g_pname[lvl][j] && j < 15) { name[j] = g_pname[lvl][j]; j++; } name[j] = 0;
+    return 0;
+}
+
 /* load an image into a frame set and run it to completion in ring 3.  argv[0]
  * (the program's single string argument) is staged in the code-region tail while
  * the CALLER is still mapped, then handed to umain via rdi (see trap64.s). */
-static int run_prog(const uint8_t *img, uint64_t size,
+static int run_prog(const char *name, const uint8_t *img, uint64_t size,
                     uint8_t *code, uint8_t *stk, uint8_t *kstack_top, const char *arg) {
     uint64_t cap = (uint64_t)USER_CODE_PAGES * 4096;
     if (size > cap) return -2;
@@ -294,17 +347,24 @@ static int run_prog(const uint8_t *img, uint64_t size,
     arch_set_syscall_stack((uint64_t)kstack_top);
     int saved_exit = g_user_exit_code, saved_pid = g_cur_pid;
     g_user_exit_code = 0; g_cur_pid++;
+    int lvl = g_depth;                                      /* record for `ps`   */
+    if (lvl >= 0 && lvl < PROC_MAXLVL) {
+        int j = 0; while (name[j] && j < 15) { g_pname[lvl][j] = name[j]; j++; } g_pname[lvl][j] = 0;
+        g_ppid[lvl] = g_cur_pid;
+    }
+    int saved_levels = g_plevels; g_plevels = lvl + 1;
     enter_user(USER_CODE_VA, USER_STK_TOP - 16, USER_CODE_VA + USER_ARG_OFF);
+    g_plevels = saved_levels;
     int ec = g_user_exit_code;
     g_user_exit_code = saved_exit; g_cur_pid = saved_pid;
     return ec;
 }
 
 /* primary program launched from the kernel console (`run`), nesting level 0 */
-static int arch_user_run(const uint8_t *img, uint64_t size, const char *arg) {
+static int arch_user_run(const char *name, const uint8_t *img, uint64_t size, const char *arg) {
     if (!g_ucode) return -1;
     g_depth = 0;
-    int ec = run_prog(img, size, g_ucode, g_ustk, g_ksys0 + sizeof(g_ksys0), arg);
+    int ec = run_prog(name, img, size, g_ucode, g_ustk, g_ksys0 + sizeof(g_ksys0), arg);
     arch_set_syscall_stack((uint64_t)(g_ksys0 + sizeof(g_ksys0)));
     return ec;
 }
@@ -332,7 +392,7 @@ static int find_prog(const char *name) {
 int arch_user_run_named(const char *name, const char *arg) {
     int idx = find_prog(name);
     if (idx < 0) return -1;
-    return arch_user_run(g_uprogs[idx].img, g_uprogs[idx].size, arg);
+    return arch_user_run(g_uprogs[idx].name, g_uprogs[idx].img, g_uprogs[idx].size, arg);
 }
 
 const char *arch_user_prog_name(int i) {
@@ -346,7 +406,7 @@ static int arch_exec_named(const char *name, const char *arg) {
     int idx = find_prog(name);
     if (idx < 0) return -1;
     g_depth = 1;
-    int ec = run_prog(g_uprogs[idx].img, g_uprogs[idx].size, g_ccode, g_cstk, g_ksys1 + sizeof(g_ksys1), arg);
+    int ec = run_prog(g_uprogs[idx].name, g_uprogs[idx].img, g_uprogs[idx].size, g_ccode, g_cstk, g_ksys1 + sizeof(g_ksys1), arg);
     map_region(g_ucode, g_ustk);               /* remap the window back to the parent */
     arch_set_syscall_stack((uint64_t)(g_ksys0 + sizeof(g_ksys0)));
     g_depth = 0;

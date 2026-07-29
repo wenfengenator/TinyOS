@@ -22,5 +22,13 @@ int  fat_resolve(const char *path, uint8_t *attr, uint16_t *cluster, uint32_t *s
 int  fat_read(uint16_t cluster, uint32_t size, void *buf, uint32_t maxlen);
 /* create/overwrite a file with len bytes; persists to the RAM image this session */
 int  fat_write(const char *sub, const void *buf, uint32_t len);
+/* directory create + file delete (absolute paths) */
+int  fat_mkdir(const char *sub);          /* 0 ok, -1 fail                       */
+int  fat_unlink(const char *sub);         /* 0 ok, -1 not found, -2 is-a-dir     */
+
+/* current-directory helpers (a single kernel cwd all FS syscalls resolve against) */
+void fs_resolve(const char *path, char *out);   /* -> absolute path (out >= 80B) */
+int  fs_chdir(const char *path);                /* 0 ok, -1 not a directory      */
+void fs_getcwd(char *out);                      /* copy cwd into out (>= 80B)    */
 
 #endif /* TINYOS_FAT64_H */

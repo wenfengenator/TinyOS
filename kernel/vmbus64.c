@@ -96,6 +96,12 @@ static uint64_t g_post_status;     /* last HvPostMessage raw status (diag) */
 static int      g_poll_sint;       /* SINT a polled message arrived on     */
 static uint32_t g_msg_connid = VMBUS_MESSAGE_CONNID;   /* working msg connection */
 
+/* all enumerated channel offers (so other drivers, e.g. StorVSC, can find theirs) */
+#define MAX_OFFERS 24
+static struct { uint8_t guid[16]; uint32_t relid, connid; } g_offers[MAX_OFFERS];
+static int g_noffers;
+static int g_vmbus_ok;                 /* VMBus connected + offers enumerated */
+
 /* ---- page allocator (4 KiB aligned, zeroed; heap is identity-mapped) ---- */
 static void *palloc_n(unsigned pages) {
     uint8_t *p = (uint8_t *)kmalloc((uint64_t)(pages + 1) * 4096);
@@ -386,6 +392,11 @@ int hvkbd_init(void) {
             const volatile uint8_t *if_type = p + 8;
             uint32_t relid  = *(volatile uint32_t *)(p + 8 + 176);   /* child_relid   */
             uint32_t connid = *(volatile uint32_t *)(p + 8 + 184);   /* connection_id */
+            if (g_noffers < MAX_OFFERS) {                             /* record every offer */
+                for (int i = 0; i < 16; i++) g_offers[g_noffers].guid[i] = if_type[i];
+                g_offers[g_noffers].relid = relid; g_offers[g_noffers].connid = connid;
+                g_noffers++;
+            }
             int is_kbd = 1;
             for (int i = 0; i < 16; i++) if (if_type[i] != KBD_GUID[i]) { is_kbd = 0; break; }
             if (is_kbd) { g_kbd_relid = (int)relid; g_kbd_connid = connid; }
@@ -395,10 +406,38 @@ int hvkbd_init(void) {
         if (offers > 64) break;
     }
     g_stage = 4;
+    g_vmbus_ok = 1;
 
     if (g_kbd_relid < 0) { kputs("[hv] synthetic keyboard NOT offered\n"); return 0; }
     g_stage = 5;
     kputs("[hv] keyboard relid "); kput_u32dec((uint32_t)g_kbd_relid);
     kputs(" connid "); kput_u32dec(g_kbd_connid); kputs("; opening channel\n");
     return open_kbd_channel();
+}
+
+/* ---- VMBus primitives exposed for other synthetic drivers (kernel/storvsc64.c).
+ * Thin wrappers over the message/offer/event layer established during keyboard
+ * bring-up; a second channel (e.g. synthetic SCSI) reuses the same connection. */
+int  vmbus_ready(void) { return g_vmbus_ok; }
+void *vmbus_palloc(unsigned pages) { return palloc_n(pages); }
+int  vmbus_msg_post(const void *msg, uint32_t len) { return vmbus_post(msg, len); }
+volatile unsigned char *vmbus_msg_poll(uint32_t iters) { return vmbus_poll(iters); }
+void vmbus_msg_done(void) { vmbus_done(); }
+void vmbus_signal_event(uint32_t connid) { signal_host(connid); }
+/* Mask/unmask the SynIC message SINT (vector 0x30).  The scheduler runs with
+ * interrupts ON but wants only the LAPIC timer; VMBus stays pollable while masked
+ * (the message page still fills and keyboard events arrive via the ring buffer),
+ * so a stray synthetic interrupt can't vector into an unhandled IDT gate. */
+void vmbus_synic_set_masked(int masked) {
+    if (!g_hcall) return;                          /* not Hyper-V: nothing to silence */
+    uint32_t v = 0x30 | (1u << 17);                /* vector 0x30, auto-EOI */
+    if (masked) v |= (1u << 16);                   /* set the SINT mask bit */
+    wrmsr(HV_MSR_SINT2, v);
+}
+int  vmbus_find_offer(const uint8_t *guid, uint32_t *relid, uint32_t *connid) {
+    for (int i = 0; i < g_noffers; i++) {
+        int m = 1; for (int j = 0; j < 16; j++) if (g_offers[i].guid[j] != guid[j]) { m = 0; break; }
+        if (m) { if (relid) *relid = g_offers[i].relid; if (connid) *connid = g_offers[i].connid; return 1; }
+    }
+    return 0;
 }

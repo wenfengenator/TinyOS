@@ -83,6 +83,11 @@ void term_gotoxy_active(int row, int col) {
     if (col < 0) col = 0; else if (col >= t->cols) col = t->cols - 1;
     t->cy = row; t->cx = col;
 }
+void term_active_size(int *cols, int *rows) {
+    terminal_t *t = g_active;
+    if (cols) *cols = t ? t->cols : 80;
+    if (rows) *rows = t ? t->rows : 25;
+}
 
 /* ---- the console: run one command line ---- */
 static void console_exec(terminal_t *t, char *line) {
@@ -98,7 +103,7 @@ static void console_exec(terminal_t *t, char *line) {
         t_puts(t, "COMMANDS:\n");
         t_puts(t, "  HELP  CLEAR  ECHO <T>  VER\n");
         t_puts(t, "  MEM  CPU  UPTIME  TIME\n");
-        t_puts(t, "  ASSET  WIN  RUN <P>  DEMO  PONG  REBOOT\n");
+        t_puts(t, "  ASSET  WIN  RUN <P>  DEMO  PONG  SCHED  REBOOT\n");
         t_puts(t, "DESKTOP: F1=FOCUS  F2=MOVE+ARROWS\n");
     } else if (t_ieq(cmd, "clear") || t_ieq(cmd, "cls")) {
         t_clear(t);
@@ -152,6 +157,9 @@ static void console_exec(terminal_t *t, char *line) {
     } else if (t_ieq(cmd, "pong")) {
         t_puts(t, "LAUNCHING PONG - Q/ESC RETURNS\n");
         pong_run(t->bi);
+    } else if (t_ieq(cmd, "sched")) {
+        t_puts(t, "LAUNCHING PREEMPTIVE SCHEDULER DEMO - Q/ESC RETURNS\n");
+        sched_demo();
     } else if (t_ieq(cmd, "reboot")) {
         t_puts(t, "REBOOTING...\n");
         sleep_ms(300);
@@ -202,6 +210,7 @@ void term_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw, int ch)
     (void)cw; (void)ch;
     terminal_t *t = (terminal_t *)win->user;
     if (!t) return;
+    int cell = wm_ui_cell(), sc = wm_ui_scale();
     char rowbuf[256];
     for (int r = 0; r < t->rows; r++) {
         const char *g = &t->grid[r * t->cols];
@@ -209,9 +218,9 @@ void term_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw, int ch)
         for (int c = 0; c < t->cols && c < 255; c++) { rowbuf[c] = g[c]; if (g[c] != ' ') last = c; }
         if (last < 0) continue;                 /* blank row: content bg shows through */
         rowbuf[last + 1] = 0;
-        fb_text_to(back, (uint32_t)cx, (uint32_t)(cy + r * 8), rowbuf, 0x33FF66, 0x08111C);
+        fb_text_to_s(back, (uint32_t)cx, (uint32_t)(cy + r * cell), rowbuf, 0x33FF66, 0x08111C, sc);
     }
     /* blinking block cursor */
     if ((millis() / 500) & 1)
-        fb_text_to(back, (uint32_t)(cx + t->cx * 8), (uint32_t)(cy + t->cy * 8), "_", 0xFFFFFF, 0x08111C);
+        fb_text_to_s(back, (uint32_t)(cx + t->cx * cell), (uint32_t)(cy + t->cy * cell), "_", 0xFFFFFF, 0x08111C, sc);
 }

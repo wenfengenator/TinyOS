@@ -52,6 +52,11 @@ QEMU64    ?= qemu-system-x86_64
 OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE_4M.fd
 OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS_4M.fd
 ESP       := $(BUILD)/esp
+DATADISK  := tinyfs.img
+PERSIST_KB ?= 16384
+# virtio-blk data disk (legacy interface) for persistent FS on the QEMU dev box
+VIRTIO_BLK := -drive file=$(DATADISK),format=raw,if=none,id=vblk0 \
+              -device virtio-blk-pci,drive=vblk0,disable-modern=on,disable-legacy=off
 
 # x64 UEFI app: PE32+ built with pure binutils (no mingw/gnu-efi/clang).
 #   -fPIC + --strip-all -> position-independent, no fragile HIGHLOW base relocs,
@@ -71,7 +76,7 @@ EFI_OBJS := $(BUILD)/efi_main.o $(BUILD)/entry64.o \
             $(BUILD)/time64.o $(BUILD)/kbd64.o $(BUILD)/demo64.o $(BUILD)/pong64.o \
             $(BUILD)/smp64.o $(BUILD)/vmbus64.o \
             $(BUILD)/wm64.o $(BUILD)/term64.o $(BUILD)/login64.o \
-            $(BUILD)/arch64.o $(BUILD)/trap64.o $(BUILD)/fat64.o
+            $(BUILD)/arch64.o $(BUILD)/trap64.o $(BUILD)/fat64.o $(BUILD)/sched64.o $(BUILD)/vblk64.o $(BUILD)/storvsc64.o
 
 # x64 ring-3 user programs: compiled from programs/*.cpp, embedded as blobs.
 # -mcmodel=large + link at USER_CODE_VA => absolute 64-bit addressing that is
@@ -224,25 +229,31 @@ esp: $(BUILD)/BOOTX64.EFI
 	cp $(BUILD)/BOOTX64.EFI $(ESP)/EFI/BOOT/BOOTX64.EFI
 	$(PYTHON) -c "open('$(ESP)/TINYWAD.DAT','wb').write(bytes(range(256))*16384)"
 
+# persistent filesystem disk: seeded ONCE from disk/, kept outside build/ so
+# `make clean` won't wipe it.  `rm tinyfs.img` to re-seed from disk/.
+tinyfs.img:
+	$(PYTHON) tools/mkfatfs.py $@ disk $(PERSIST_KB)
+	@echo "seeded persistent disk $@ ($(PERSIST_KB) KB) from disk/"
+
 # boot the x64 build under qemu-system-x86_64 + OVMF in a graphical window so the
 # framebuffer demo is visible; the serial console is mirrored to the terminal.
 # Prefers KVM (much faster) and falls back to TCG.  Give the demo keyboard focus
 # by clicking the QEMU window: arrows move the box, Q/ESC quits.
-run-x64: esp
+run-x64: esp tinyfs.img
 	cp $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
 	$(QEMU64) -machine q35,accel=kvm:tcg -m 512 \
 	  -drive if=pflash,format=raw,unit=0,readonly=on,file=$(OVMF_CODE) \
 	  -drive if=pflash,format=raw,unit=1,file=$(BUILD)/OVMF_VARS.fd \
-	  -drive format=raw,file=fat:rw:$(ESP) \
+	  -drive format=raw,file=fat:rw:$(ESP) $(VIRTIO_BLK) \
 	  -vga std -serial stdio -no-reboot
 
 # same boot, but headless (no window) — for CI / sandboxes without a display.
-run-x64-headless: esp
+run-x64-headless: esp tinyfs.img
 	cp $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
 	$(QEMU64) -machine q35 -accel tcg -m 512 \
 	  -drive if=pflash,format=raw,unit=0,readonly=on,file=$(OVMF_CODE) \
 	  -drive if=pflash,format=raw,unit=1,file=$(BUILD)/OVMF_VARS.fd \
-	  -drive format=raw,file=fat:rw:$(ESP) \
+	  -drive format=raw,file=fat:rw:$(ESP) $(VIRTIO_BLK) \
 	  -serial stdio -display none -no-reboot
 
 # ---- Hyper-V Gen 2 artifact: a GPT disk with a FAT32 ESP, packaged as VHDX ----

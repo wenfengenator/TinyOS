@@ -98,8 +98,13 @@ typedef struct {
     EFI_PHYSICAL_ADDRESS FrameBufferBase;
     UINTN                FrameBufferSize;
 } EFI_GOP_MODE;
-typedef struct {
-    void *QueryMode, *SetMode, *Blt;
+struct _EFI_GRAPHICS_OUTPUT_PROTOCOL;
+typedef EFI_STATUS (EFIAPI *EFI_GOP_QUERY_MODE)(struct _EFI_GRAPHICS_OUTPUT_PROTOCOL *, uint32_t, UINTN *, EFI_GOP_MODE_INFO **);
+typedef EFI_STATUS (EFIAPI *EFI_GOP_SET_MODE)(struct _EFI_GRAPHICS_OUTPUT_PROTOCOL *, uint32_t);
+typedef struct _EFI_GRAPHICS_OUTPUT_PROTOCOL {
+    EFI_GOP_QUERY_MODE QueryMode;
+    EFI_GOP_SET_MODE   SetMode;
+    void *Blt;
     EFI_GOP_MODE *Mode;
 } EFI_GRAPHICS_OUTPUT_PROTOCOL;
 
@@ -229,6 +234,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     /* 1) Graphics Output Protocol -> linear framebuffer */
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
     if (BS->LocateProtocol(&GOP_GUID, 0, (void **)&gop) == EFI_SUCCESS && gop) {
+        /* choose the largest 32-bpp mode up to 1920x1080 for a roomy desktop */
+        uint32_t best = gop->Mode->Mode, best_area = 0;
+        for (uint32_t i = 0; i < gop->Mode->MaxMode; i++) {
+            EFI_GOP_MODE_INFO *info = 0; UINTN isz = 0;
+            if (gop->QueryMode(gop, i, &isz, &info) != EFI_SUCCESS || !info) continue;
+            uint32_t w = info->HorizontalResolution, h = info->VerticalResolution, pf = info->PixelFormat;
+            if ((pf != 0 && pf != 1) || w > 1920 || h > 1080) continue;   /* 32bpp, capped */
+            uint32_t area = w * h;
+            if (area > best_area) { best_area = area; best = i; }
+        }
+        if (best != gop->Mode->Mode) gop->SetMode(gop, best);
         EFI_GOP_MODE *m = gop->Mode;
         g_bi.fb_base      = m->FrameBufferBase;
         g_bi.fb_size      = m->FrameBufferSize;
@@ -236,6 +252,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         g_bi.height       = m->Info->VerticalResolution;
         g_bi.pitch_px     = m->Info->PixelsPerScanLine;
         g_bi.pixel_format = m->Info->PixelFormat;   /* 0=RGBX, 1=BGRX */
+        g_bi.gop_modes    = gop->Mode->MaxMode;      /* how many modes were offered */
         sputs("[efi] GOP framebuffer acquired\n");
     } else {
         sputs("[efi] WARNING: no GOP; booting without a framebuffer\n");

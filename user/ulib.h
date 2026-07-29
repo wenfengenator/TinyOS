@@ -9,7 +9,8 @@ enum {                          // must match kernel/kernel.h
     EXIT = 1, READ = 3, WRITE = 4, OPEN = 5, CLOSE = 6,
     YIELD = 7, GETPID = 8, SPAWN = 10,
     EXEC = 9, STAT = 11, LSEEK = 12, FORK = 13, WAIT = 14, READDIR = 15, TASKINFO = 16, ECHO = 17, READFILE = 18,
-    GETCHAR = 19, CLEAR = 20, GOTOXY = 21, WRITEFILE = 22,
+    GETCHAR = 19, CLEAR = 20, GOTOXY = 21, WRITEFILE = 22, MKDIR = 23, UNLINK = 24, CHDIR = 25, GETCWD = 26,
+    WINSIZE = 27,
 };
 enum { STDIN = 0, STDOUT = 1 };
 enum {                          // extended key codes from the PS/2 driver (match kernel.h)
@@ -66,6 +67,7 @@ static inline int strcat_(char *dst, int len, const char *src) {
 
 // ---- process / fs extras ----
 struct stat_t { unsigned size; unsigned isdir; };
+struct taskinfo_t { int pid; int ring; int state; char name[16]; };
 static inline int  exec(const char *path, const char *arg = 0) { return syscall(EXEC, (long)path, (long)arg); }
 static inline int  fork()                            { return syscall(FORK); }
 static inline int  wait(int pid)                     { return syscall(WAIT, pid); }
@@ -74,6 +76,12 @@ static inline int  lseek(int fd, int off, int wh)    { return syscall(LSEEK, fd,
 static inline int  readdir(const char *dir, int i, char *name) { return syscall(READDIR, (long)dir, i, (long)name); }
 static inline int  readfile(const char *path, char *buf, int max){ return syscall(READFILE, (long)path, (long)buf, max); }
 static inline int  writefile(const char *path, const char *buf, int n){ return syscall(WRITEFILE, (long)path, (long)buf, n); }
+static inline int  mkdir(const char *path)           { return syscall(MKDIR, (long)path); }
+static inline int  unlink(const char *path)          { return syscall(UNLINK, (long)path); }
+static inline int  chdir(const char *path)           { return syscall(CHDIR, (long)path); }
+static inline int  getcwd(char *buf)                 { return syscall(GETCWD, (long)buf); }
+static inline void winsize(int *cols, int *rows)     { long v = syscall(WINSIZE);
+    if (cols) *cols = (int)((v >> 16) & 0xFFFF); if (rows) *rows = (int)(v & 0xFFFF); }
 static inline int  getchar()                         { return syscall(GETCHAR); }
 static inline void clear()                           { syscall(CLEAR); }
 static inline void gotoxy(int row, int col)          { syscall(GOTOXY, row, col); }

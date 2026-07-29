@@ -142,6 +142,77 @@ sys_exit_resume:
     popq    %rbp
     ret
 
+/* ---- preemptive scheduler: LAPIC-timer ISR + kernel-thread context switch ----
+ * In long mode the CPU pushes a full [SS][RSP][RFLAGS][CS][RIP] frame on every
+ * interrupt (even same-privilege).  Save every GP register, hand the saved rsp
+ * to sched_tick (which returns the next thread's rsp), switch stacks, restore
+ * that thread's registers, iretq. */
+    .global timer_isr
+timer_isr:
+    pushq   %rax
+    pushq   %rbx
+    pushq   %rcx
+    pushq   %rdx
+    pushq   %rsi
+    pushq   %rdi
+    pushq   %rbp
+    pushq   %r8
+    pushq   %r9
+    pushq   %r10
+    pushq   %r11
+    pushq   %r12
+    pushq   %r13
+    pushq   %r14
+    pushq   %r15
+    movq    %rsp, %rdi                 /* arg0 = interrupted thread's rsp */
+    call    sched_tick                 /* rax = next thread's rsp         */
+    movq    %rax, %rsp                 /* switch kernel stacks            */
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %r11
+    popq    %r10
+    popq    %r9
+    popq    %r8
+    popq    %rbp
+    popq    %rdi
+    popq    %rsi
+    popq    %rdx
+    popq    %rcx
+    popq    %rbx
+    popq    %rax
+    iretq
+
+/* First entry of a new kernel thread: iretq lands here with rdi=fn, rsi=arg. */
+    .global thread_trampoline
+thread_trampoline:
+    movq    %rdi, %rax                 /* rax = fn         */
+    movq    %rsi, %rdi                 /* rdi = arg (arg0) */
+    call    *%rax                      /* fn(arg)          */
+    call    sched_exit                 /* retire if it returns */
+1:  jmp     1b
+
+/* Spurious LAPIC interrupt: no EOI required, just return. */
+    .global spurious_isr
+spurious_isr:
+    iretq
+
+/* PC-relative address accessors (C taking asm-symbol addresses is unsafe under
+ * the -mi386pep EFI link; hand them back from asm instead). */
+    .global timer_isr_addr
+timer_isr_addr:
+    leaq    timer_isr(%rip), %rax
+    ret
+    .global spurious_isr_addr
+spurious_isr_addr:
+    leaq    spurious_isr(%rip), %rax
+    ret
+    .global thread_trampoline_addr
+thread_trampoline_addr:
+    leaq    thread_trampoline(%rip), %rax
+    ret
+
 /* ---- exception stubs ---- */
     .macro ISR n
     .global isr\n
@@ -187,10 +258,17 @@ isr\n:
     ISR 30
     ISR 31
 
+/* Unhandled hardware interrupt (vectors 32..255).  The kernel is polled
+ * everywhere except the scheduler, which turns interrupts on for the LAPIC timer;
+ * a stray host interrupt (e.g. a VMBus/SynIC vector left pending from boot) must
+ * not be fatal, so acknowledge it at the LAPIC and return.  CPU exceptions
+ * (0..31) still dump and halt via their own isr0..isr31 stubs. */
 isr_default:
-    pushq   $0
-    pushq   $0xFF
-    jmp     isr_common
+    pushq   %rax
+    movq    $0xFEE000B0, %rax              /* LAPIC EOI register (xAPIC MMIO) */
+    movl    $0, (%rax)
+    popq    %rax
+    iretq
 
 /* stack at entry: [vector][errcode][rip][cs][rflags][rsp][ss] */
 isr_common:

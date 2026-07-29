@@ -14,6 +14,7 @@ static int  nlines = 1;
 static int  cx = 0, cy = 0, top = 0;
 static char fname[128];
 static bool dirty = false;
+static int  VH = 24;                   // visible text rows (terminal height - 1 status)
 
 static void load(const char *path) {
     static char d[8192];
@@ -40,11 +41,11 @@ static void save() {
 
 static void redraw(const char *status) {
     sys::clear();
-    for (int r = 0; r < 24 && top + r < nlines; r++) {
+    for (int r = 0; r < VH && top + r < nlines; r++) {
         sys::gotoxy(r, 0);
         sys::write_n(sys::STDOUT, buf[top + r], len[top + r]);
     }
-    sys::gotoxy(24, 0); sys::write(status);
+    sys::gotoxy(VH, 0); sys::write(status);
     sys::gotoxy(cy - top, cx);
 }
 
@@ -91,6 +92,7 @@ extern "C" int umain(const char *arg) {
     int i = 0; if (arg) while (arg[i] && i < 127) { fname[i] = arg[i]; i++; } fname[i] = 0;
     if (!fname[0]) { sys::write("vi: usage: vi <file>\n"); return 1; }
     load(fname);
+    { int c = 0, r = 0; sys::winsize(&c, &r); if (r > 2) VH = r - 1; }
     bool insert = false;
 
     for (;;) {
@@ -148,7 +150,7 @@ extern "C" int umain(const char *arg) {
             }
         }
         if (cy < top) top = cy;
-        if (cy >= top + 24) top = cy - 23;
+        if (cy >= top + VH) top = cy - (VH - 1);
         if (cx > len[cy]) cx = len[cy];
     }
 }

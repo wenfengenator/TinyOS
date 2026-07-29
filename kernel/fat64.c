@@ -7,13 +7,23 @@
 #include "fat64.h"
 #include "fatfs.h"                 /* static const unsigned char fatfs_img[] */
 
-/* ------------------------------ RAM block device ------------------------- */
+/* ------------------------------ block device ----------------------------
+ * A persistent virtio-blk disk when present (QEMU dev), else a RAM copy of the
+ * embedded image (Hyper-V etc. — ephemeral until the VMBus StorVSC driver). */
 #define BLK 512
 static uint8_t  *g_disk;
 static uint32_t  g_disk_sectors;
+static int       g_vblk;
+static int       g_stor;
+
+static int  blk_read(uint32_t lba, void *buf);
+static int  blk_write(uint32_t lba, const void *buf);
+static void blk_seed_if_blank(void);
 
 void blk_init(void) {
-    uint32_t len   = (uint32_t)sizeof(fatfs_img);
+    if (vblk_init())    { g_vblk = 1; return; }         /* virtio-blk (QEMU dev)     */
+    if (storvsc_init()) { g_stor = 1; blk_seed_if_blank(); return; }  /* Hyper-V SCSI */
+    uint32_t len   = (uint32_t)sizeof(fatfs_img);       /* RAM fallback              */
     uint32_t pages = (len + 4095) / 4096;
     g_disk = (uint8_t *)page_alloc(pages);
     if (!g_disk) { g_disk_sectors = 0; return; }
@@ -21,14 +31,36 @@ void blk_init(void) {
     g_disk_sectors = len / BLK;
 }
 static int blk_read(uint32_t lba, void *buf) {
+    if (g_vblk) return vblk_read(lba, buf);
+    if (g_stor) return storvsc_read(lba, buf);
     if (!g_disk || lba >= g_disk_sectors) return -1;
     memcpy(buf, g_disk + (uint64_t)lba * BLK, BLK);
     return 0;
 }
 static int blk_write(uint32_t lba, const void *buf) {
+    if (g_vblk) return vblk_write(lba, buf);
+    if (g_stor) return storvsc_write(lba, buf);
     if (!g_disk || lba >= g_disk_sectors) return -1;
     memcpy(g_disk + (uint64_t)lba * BLK, buf, BLK);
     return 0;
+}
+
+/* Lay the embedded image onto a persistent disk that has no FAT16 boot sector
+ * yet (a fresh Hyper-V VHDX), so there is a filesystem to mount.  Writing only
+ * when blank keeps previously persisted data intact across reboots. */
+static void blk_seed_if_blank(void) {
+    uint8_t bs[BLK];
+    if (blk_read(0, bs) == 0 &&
+        bs[510] == 0x55 && bs[511] == 0xAA && bs[11] == 0x00 && bs[12] == 0x02)
+        return;                                             /* already formatted */
+    uint32_t len  = (uint32_t)sizeof(fatfs_img);
+    uint32_t secs = (len + BLK - 1) / BLK;
+    for (uint32_t s = 0; s < secs; s++) {
+        uint8_t tmp[BLK]; memset(tmp, 0, BLK);
+        uint32_t n = len - s * BLK; if (n > BLK) n = BLK;
+        memcpy(tmp, fatfs_img + (uint64_t)s * BLK, n);
+        if (blk_write(s, tmp) < 0) return;
+    }
 }
 
 /* --------------------------------- FAT16 --------------------------------- */
@@ -279,3 +311,102 @@ int fat_write(const char *sub, const void *buf, uint32_t len) {
     if (blk_write(lba, sb) < 0) return -1;
     return (int)len;
 }
+
+/* ============================ directory ops ============================== */
+
+/* create the subdirectory `sub` (absolute path); 0 on success, -1 on failure */
+int fat_mkdir(const char *sub) {
+    if (!f_mounted) return -1;
+    uint16_t dir; char name[16];
+    if (fat_parent(sub, &dir, name) < 0) return -1;
+    uint8_t at; uint16_t cl; uint32_t sz;
+    if (fat_lookup(dir, name, &at, &cl, &sz) == 0) return -1;      /* already exists */
+    uint8_t raw[11]; to83(name, raw);
+
+    uint32_t slot = 0xFFFFFFFF;                                    /* free slot in parent */
+    uint8_t e[32];
+    for (uint32_t i = 0; dir_raw(dir, i, e) == 0; i++)
+        if (e[0] == 0x00 || e[0] == 0xE5) { slot = i; break; }
+    if (slot == 0xFFFFFFFF) return -1;                             /* directory full */
+
+    uint16_t nc = fat_alloc();                                    /* cluster for the new dir */
+    if (!nc) return -1;
+
+    /* initialise the cluster with "." and ".." then zeros */
+    static uint8_t sb[512];
+    memset(sb, 0, 512);
+    sb[0] = '.'; for (int j = 1; j < 11; j++) sb[j] = ' ';
+    sb[11] = 0x10; sb[26] = (uint8_t)(nc & 0xFF); sb[27] = (uint8_t)((nc >> 8) & 0xFF);
+    sb[32] = '.'; sb[33] = '.'; for (int j = 2; j < 11; j++) sb[32 + j] = ' ';
+    sb[43] = 0x10; sb[58] = (uint8_t)(dir & 0xFF); sb[59] = (uint8_t)((dir >> 8) & 0xFF);
+    blk_write(f_data_start + (uint32_t)(nc - 2) * f_spc, sb);
+    memset(sb, 0, 512);
+    for (uint32_t s = 1; s < f_spc; s++) blk_write(f_data_start + (uint32_t)(nc - 2) * f_spc + s, sb);
+
+    memset(e, 0, 32);                                             /* dir entry in parent */
+    for (int j = 0; j < 11; j++) e[j] = raw[j];
+    e[11] = 0x10;
+    e[26] = (uint8_t)(nc & 0xFF); e[27] = (uint8_t)((nc >> 8) & 0xFF);
+    uint32_t lba, off;
+    if (dirent_loc(dir, slot, &lba, &off) < 0) return -1;
+    if (blk_read(lba, sb) < 0) return -1;
+    for (int j = 0; j < 32; j++) sb[off + j] = e[j];
+    if (blk_write(lba, sb) < 0) return -1;
+    return 0;
+}
+
+/* delete the file `sub` (absolute path).  0 ok, -1 not found, -2 is a directory */
+int fat_unlink(const char *sub) {
+    if (!f_mounted) return -1;
+    uint16_t dir; char name[16];
+    if (fat_parent(sub, &dir, name) < 0) return -1;
+    uint8_t raw[11]; to83(name, raw);
+    uint8_t e[32];
+    for (uint32_t i = 0; dir_raw(dir, i, e) == 0; i++) {
+        if (e[0] == 0x00) break;
+        if (e[0] == 0xE5 || e[11] == 0x0F || (e[11] & 0x08)) continue;
+        int same = 1; for (int j = 0; j < 11; j++) if (e[j] != raw[j]) { same = 0; break; }
+        if (!same) continue;
+        if (e[11] & 0x10) return -2;                              /* directory: refuse */
+        uint16_t cl = e[26] | (e[27] << 8);
+        if (cl >= 2) fat_free_chain(cl);
+        uint32_t lba, off;
+        if (dirent_loc(dir, i, &lba, &off) < 0) return -1;
+        static uint8_t sb[512];
+        if (blk_read(lba, sb) < 0) return -1;
+        sb[off] = 0xE5;                                           /* mark the entry deleted */
+        if (blk_write(lba, sb) < 0) return -1;
+        return 0;
+    }
+    return -1;                                                    /* not found */
+}
+
+/* ============================ current directory ========================= */
+
+static char g_cwd[80] = "/";
+
+static void s_copy(char *d, const char *s) { int i = 0; while (s[i]) { d[i] = s[i]; i++; } d[i] = 0; }
+
+/* resolve a user path against the cwd into `out` (absolute).  "" or "." => cwd. */
+void fs_resolve(const char *path, char *out) {
+    if (!path || !path[0] || (path[0] == '.' && path[1] == 0)) { s_copy(out, g_cwd); return; }
+    if (path[0] == '/') { s_copy(out, path); return; }
+    int p = 0;
+    for (int i = 0; g_cwd[i]; i++) out[p++] = g_cwd[i];
+    if (!(g_cwd[0] == '/' && g_cwd[1] == 0)) out[p++] = '/';      /* no double slash at root */
+    for (int i = 0; path[i]; i++) out[p++] = path[i];
+    out[p] = 0;
+}
+
+/* change the current directory; 0 on success, -1 if the target is not a directory */
+int fs_chdir(const char *path) {
+    if (path && path[0] == '.' && path[1] == '.' && path[2] == 0) { s_copy(g_cwd, "/"); return 0; }
+    char full[80]; fs_resolve(path, full);
+    if (full[0] == '/' && full[1] == 0) { s_copy(g_cwd, "/"); return 0; }
+    uint8_t at; uint16_t cl; uint32_t sz;
+    if (fat_resolve(full, &at, &cl, &sz) < 0 || !(at & 0x10)) return -1;
+    s_copy(g_cwd, full);
+    return 0;
+}
+
+void fs_getcwd(char *out) { s_copy(out, g_cwd); }

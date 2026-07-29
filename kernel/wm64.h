@@ -39,6 +39,10 @@ int         wm_window_count(void);
 const char *wm_window_title(int i);
 int         wm_focused_index(void);
 
+/* UI font scale chosen from the framebuffer resolution (kernel/wm64.c). */
+int         wm_ui_scale(void);          /* glyph magnification: 1 (low-res) or 2 */
+int         wm_ui_cell(void);           /* glyph cell size in px = 8 * wm_ui_scale */
+
 /* terminal widget (kernel/term64.c). */
 void *term_create(boot_info_t *bi, int cols, int rows);
 void  term_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw, int ch);

@@ -62,6 +62,7 @@ static int parse_madt(uint64_t rsdp) {
 
 int smp_cpu_count(void)    { return g_cpu_count; }
 int smp_online_count(void) { return g_online; }
+uint64_t smp_lapic_base(void) { return g_lapic; }
 
 /* ---- AP C entry (reached from the trampoline in long mode) ---- */
 void ap_entry(void) {

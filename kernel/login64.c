@@ -95,38 +95,38 @@ void login_run(boot_info_t *bi) {
         L_fill(bb, 0, 0, (int)L_w, 4, 0x1E5FA8);
         L_fill(bb, 0, (int)L_h - 4, (int)L_w, 4, 0x1E5FA8);
 
-        int pw = 380, ph = 176;
+        int pw = 600, ph = 300;
         int px = ((int)L_w - pw) / 2, py = ((int)L_h - ph) / 2;
         L_fill(bb, px - 1, py - 1, pw + 2, ph + 2, 0x3AA0FF);    /* border       */
         L_fill(bb, px, py, pw, ph, 0x101C2E);                    /* panel        */
-        L_fill(bb, px, py, pw, 22, 0x1E5FA8);                    /* title bar    */
-        fb_text_to(bb, px + 12, py + 7, "tinyos  -  sign in", 0xFFFFFF, 0x1E5FA8);
+        L_fill(bb, px, py, pw, 34, 0x1E5FA8);                    /* title bar    */
+        fb_text_to_s(bb, px + 16, py + 9, "tinyos  -  sign in", 0xFFFFFF, 0x1E5FA8, 2);
 
-        int fx = px + 20, fy = py + 46;
+        int fx = px + 28, fy = py + 74;
         uint32_t abg = 0x14324F, ibg = 0x0C1420;                 /* active/idle  */
-        fb_text_to(bb, fx, fy,      "login:",    0x99CCFF, 0x101C2E);
-        fb_text_to(bb, fx, fy + 34, "password:", 0x99CCFF, 0x101C2E);
+        fb_text_to_s(bb, fx, fy,      "login:",    0x99CCFF, 0x101C2E, 2);
+        fb_text_to_s(bb, fx, fy + 54, "password:", 0x99CCFF, 0x101C2E, 2);
 
-        int bxx = fx + 88, bw = pw - 88 - 40;
-        L_fill(bb, bxx - 4, fy - 4,      bw, 24, field == 0 ? abg : ibg);
-        L_fill(bb, bxx - 4, fy + 34 - 4, bw, 24, field == 1 ? abg : ibg);
-        fb_text_to(bb, bxx, fy, ubuf, 0xEAF2FF, field == 0 ? abg : ibg);
+        int bxx = fx + 176, bw = pw - 176 - 56;
+        L_fill(bb, bxx - 6, fy - 6,      bw, 32, field == 0 ? abg : ibg);
+        L_fill(bb, bxx - 6, fy + 54 - 6, bw, 32, field == 1 ? abg : ibg);
+        fb_text_to_s(bb, bxx, fy, ubuf, 0xEAF2FF, field == 0 ? abg : ibg, 2);
 
         char mask[L_MAX + 4]; int i;
         for (i = 0; i < plen; i++) mask[i] = '*';
         mask[i] = 0;
-        fb_text_to(bb, bxx, fy + 34, mask, 0xEAF2FF, field == 1 ? abg : ibg);
+        fb_text_to_s(bb, bxx, fy + 54, mask, 0xEAF2FF, field == 1 ? abg : ibg, 2);
 
         if ((millis() / 500) & 1) {                              /* blink cursor */
-            int cxp = bxx + (field == 0 ? ulen : plen) * 8;
-            int cyp = fy + (field == 0 ? 0 : 34);
-            fb_text_to(bb, cxp, cyp, "_", 0xFFFFFF, abg);
+            int cxp = bxx + (field == 0 ? ulen : plen) * 16;
+            int cyp = fy + (field == 0 ? 0 : 54);
+            fb_text_to_s(bb, cxp, cyp, "_", 0xFFFFFF, abg, 2);
         }
 
-        if (msg[0]) fb_text_to(bb, px + 20, py + ph - 42, msg, 0xFF6666, 0x101C2E);
-        fb_text_to(bb, px + 20, py + ph - 22,
-                   "enter = next / sign in     tab = switch     esc = clear",
-                   0x6688AA, 0x101C2E);
+        if (msg[0]) fb_text_to_s(bb, px + 28, py + ph - 64, msg, 0xFF6666, 0x101C2E, 2);
+        fb_text_to_s(bb, px + 28, py + ph - 32,
+                     "enter=next   tab=switch   esc=clear",
+                     0x6688AA, 0x101C2E, 2);
 
         fb_present(bb);
     }
