@@ -78,7 +78,7 @@ arch_setup_syscall_msrs:
     ret
 
 /* SYSCALL entry.  CPU: rcx=user rip, r11=user rflags, CPL now 0, still on the
- * user stack.  ABI: rax=num, rdi/rsi/rdx = a0/a1/a2 -> C syscall_c(num,a0,a1,a2). */
+ * user stack.  Linux ABI: rax=num, args=rdi/rsi/rdx/r10/r8/r9. */
     .global syscall_entry
 syscall_entry:
     movq    %rsp, g_user_rsp(%rip)         /* transient: bridge the stack switch  */
@@ -92,11 +92,15 @@ syscall_entry:
     pushq   %r8
     pushq   %r9
     pushq   %r10
+    pushq   %r9                           /* C arg6 = Linux syscall arg5        */
+    movq    %r8, %r9                      /* C arg5 = Linux syscall arg4        */
+    movq    %r10, %r8                     /* C arg4 = Linux syscall arg3        */
     movq    %rdx, %rcx                     /* shuffle args -> SysV C ABI           */
     movq    %rsi, %rdx
     movq    %rdi, %rsi
     movq    %rax, %rdi
     call    syscall_c                      /* rax = return value                   */
+    addq    $8, %rsp                       /* discard stacked C arg6               */
     popq    %r10
     popq    %r9
     popq    %r8

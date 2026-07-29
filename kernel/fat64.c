@@ -312,6 +312,182 @@ int fat_write(const char *sub, const void *buf, uint32_t len) {
     return (int)len;
 }
 
+static int fat_file_entry(const char *path, uint16_t *first, uint32_t *size,
+                          uint32_t *entry_lba, uint32_t *entry_off) {
+    uint16_t dir; char name[16];
+    if (fat_parent(path, &dir, name) < 0) return -1;
+    uint8_t raw[11], e[32]; to83(name, raw);
+    for (uint32_t i = 0; dir_raw(dir, i, e) == 0; i++) {
+        if (e[0] == 0x00) break;
+        if (e[0] == 0xE5 || e[11] == 0x0F || (e[11] & 0x08)) continue;
+        int same = 1;
+        for (int j = 0; j < 11; j++) if (e[j] != raw[j]) { same = 0; break; }
+        if (!same || (e[11] & 0x10)) continue;
+        *first = e[26] | (e[27] << 8);
+        *size = e[28] | (e[29] << 8) | (e[30] << 16) | (e[31] << 24);
+        return dirent_loc(dir, i, entry_lba, entry_off);
+    }
+    return -1;
+}
+
+static uint16_t fat_cluster_at(uint16_t first, uint32_t index) {
+    uint16_t cluster = first;
+    while (index-- && cluster >= 2 && cluster < 0xFFF8) cluster = fat_next(cluster);
+    return cluster;
+}
+
+int fat_pread(const char *path, void *buf, uint32_t len, uint32_t offset) {
+    if (!f_mounted || !len) return 0;
+    uint16_t first; uint32_t size, entry_lba, entry_off;
+    if (fat_file_entry(path, &first, &size, &entry_lba, &entry_off) < 0) return -1;
+    (void)entry_lba; (void)entry_off;
+    if (offset >= size) return 0;
+    if (len > size - offset) len = size - offset;
+
+    uint32_t bpc = (uint32_t)f_spc * 512;
+    uint16_t cluster = fat_cluster_at(first, offset / bpc);
+    uint32_t within = offset % bpc, done = 0;
+    static uint8_t sb[512];
+    while (cluster >= 2 && cluster < 0xFFF8 && done < len) {
+        uint32_t sector = within / 512;
+        uint32_t byte = within % 512;
+        for (; sector < f_spc && done < len; sector++, byte = 0) {
+            if (blk_read(f_data_start + (uint32_t)(cluster - 2) * f_spc + sector, sb) < 0)
+                return done ? (int)done : -1;
+            uint32_t n = 512 - byte;
+            if (n > len - done) n = len - done;
+            memcpy((uint8_t *)buf + done, sb + byte, n);
+            done += n;
+        }
+        within = 0;
+        cluster = fat_next(cluster);
+    }
+    return (int)done;
+}
+
+static int fat_zero_cluster(uint16_t cluster) {
+    static uint8_t zero[512];
+    memset(zero, 0, sizeof(zero));
+    for (uint32_t sector = 0; sector < f_spc; sector++)
+        if (blk_write(f_data_start + (uint32_t)(cluster - 2) * f_spc + sector, zero) < 0) return -1;
+    return 0;
+}
+
+static int fat_zero_span(uint16_t first, uint32_t offset, uint32_t len) {
+    if (!len) return 0;
+    uint32_t bpc = (uint32_t)f_spc * 512;
+    uint16_t cluster = fat_cluster_at(first, offset / bpc);
+    uint32_t within = offset % bpc, done = 0;
+    static uint8_t sb[512];
+    while (cluster >= 2 && cluster < 0xFFF8 && done < len) {
+        uint32_t sector = within / 512;
+        uint32_t byte = within % 512;
+        for (; sector < f_spc && done < len; sector++, byte = 0) {
+            uint32_t lba = f_data_start + (uint32_t)(cluster - 2) * f_spc + sector;
+            uint32_t n = 512 - byte; if (n > len - done) n = len - done;
+            if (blk_read(lba, sb) < 0) return -1;
+            memset(sb + byte, 0, n);
+            if (blk_write(lba, sb) < 0) return -1;
+            done += n;
+        }
+        within = 0; cluster = fat_next(cluster);
+    }
+    return done == len ? 0 : -1;
+}
+
+static int fat_update_file_entry(uint32_t lba, uint32_t off, uint16_t first, uint32_t size) {
+    static uint8_t sb[512];
+    if (blk_read(lba, sb) < 0) return -1;
+    sb[off + 26] = (uint8_t)first;
+    sb[off + 27] = (uint8_t)(first >> 8);
+    sb[off + 28] = (uint8_t)size;
+    sb[off + 29] = (uint8_t)(size >> 8);
+    sb[off + 30] = (uint8_t)(size >> 16);
+    sb[off + 31] = (uint8_t)(size >> 24);
+    return blk_write(lba, sb);
+}
+
+int fat_truncate(const char *path, uint32_t new_size) {
+    uint16_t first; uint32_t old_size, entry_lba, entry_off;
+    if (!f_mounted || fat_file_entry(path, &first, &old_size, &entry_lba, &entry_off) < 0) return -1;
+    if (new_size == old_size) return 0;
+    uint32_t bpc = (uint32_t)f_spc * 512;
+    uint32_t old_count = (old_size + bpc - 1) / bpc;
+    uint32_t new_count = (new_size + bpc - 1) / bpc;
+    uint16_t last = first;
+    if (old_count) for (uint32_t i = 1; i < old_count; i++) last = fat_next(last);
+    while (old_count < new_count) {
+        uint16_t cluster = fat_alloc();
+        if (!cluster || fat_zero_cluster(cluster) < 0) return -1;
+        if (old_count) fat_set(last, cluster); else first = cluster;
+        fat_set(cluster, 0xFFFF);
+        last = cluster; old_count++;
+    }
+    if (new_count < old_count) {
+        if (!new_count) { fat_free_chain(first); first = 0; }
+        else {
+            last = fat_cluster_at(first, new_count - 1);
+            uint16_t tail = fat_next(last);
+            fat_set(last, 0xFFFF);
+            if (tail >= 2 && tail < 0xFFF8) fat_free_chain(tail);
+        }
+    }
+    if (new_size > old_size && fat_zero_span(first, old_size, new_size - old_size) < 0) return -1;
+    if (new_size < old_size && new_size &&
+        fat_zero_span(first, new_size, new_count * bpc - new_size) < 0) return -1;
+    return fat_update_file_entry(entry_lba, entry_off, first, new_size);
+}
+
+int fat_pwrite(const char *path, const void *buf, uint32_t len, uint32_t offset) {
+    if (!f_mounted || !len || offset + len < offset) return len ? -1 : 0;
+    uint16_t first; uint32_t size, entry_lba, entry_off;
+    if (fat_file_entry(path, &first, &size, &entry_lba, &entry_off) < 0) return -1;
+    uint32_t bpc = (uint32_t)f_spc * 512;
+    uint32_t need = (offset + len + bpc - 1) / bpc;
+    uint16_t last = first; uint32_t have = 0;
+    if (last >= 2) {
+        have = 1;
+        for (;;) {
+            uint16_t next = fat_next(last);
+            if (next < 2 || next >= 0xFFF8) break;
+            last = next; have++;
+        }
+    }
+    while (have < need) {
+        uint16_t cluster = fat_alloc();
+        if (!cluster || fat_zero_cluster(cluster) < 0) return -1;
+        if (last >= 2) fat_set(last, cluster); else first = cluster;
+        fat_set(cluster, 0xFFFF);
+        last = cluster; have++;
+    }
+    if (offset > size && fat_zero_span(first, size, offset - size) < 0) return -1;
+
+    uint16_t cluster = fat_cluster_at(first, offset / bpc);
+    uint32_t within = offset % bpc, done = 0;
+    static uint8_t sb[512];
+    while (cluster >= 2 && cluster < 0xFFF8 && done < len) {
+        uint32_t sector = within / 512;
+        uint32_t byte = within % 512;
+        for (; sector < f_spc && done < len; sector++, byte = 0) {
+            uint32_t lba = f_data_start + (uint32_t)(cluster - 2) * f_spc + sector;
+            uint32_t n = 512 - byte;
+            if (n > len - done) n = len - done;
+            if ((byte || n < 512) && blk_read(lba, sb) < 0) return done ? (int)done : -1;
+            if (!byte && n == 512) memcpy(sb, (const uint8_t *)buf + done, 512);
+            else memcpy(sb + byte, (const uint8_t *)buf + done, n);
+            if (blk_write(lba, sb) < 0) return done ? (int)done : -1;
+            done += n;
+        }
+        within = 0;
+        cluster = fat_next(cluster);
+    }
+
+    uint32_t new_size = offset + done;
+    if (new_size < size) new_size = size;
+    if (fat_update_file_entry(entry_lba, entry_off, first, new_size) < 0) return -1;
+    return (int)done;
+}
+
 /* ============================ directory ops ============================== */
 
 /* create the subdirectory `sub` (absolute path); 0 on success, -1 on failure */

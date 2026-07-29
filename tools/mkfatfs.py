@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a FAT16 disk image from a source directory (one level of subdirs).
 
-  mkfatfs.py <out.img> <srcdir>
+    mkfatfs.py <out.img> <srcdir> [size_kb] [NAME=path ...]
 
 Produces a 4 MB FAT16 image tinyos can mount.  (Images made by mkfs.vfat -F16
 also work with tinyos's reader.)
@@ -58,7 +58,7 @@ class Fat:
         return first, len(data)
 
 
-def build(srcdir):
+def build(srcdir, extra_files=()):
     fat = Fat()
     root = b""
 
@@ -86,6 +86,11 @@ def build(srcdir):
             data = open(p, "rb").read()
             c, sz = fat.alloc_chain(data)
             root += dirent(entry, 0x20, c, len(data))
+
+    for name, path in extra_files:
+        data = open(path, "rb").read()
+        c, sz = fat.alloc_chain(data)
+        root += dirent(name, 0x20, c, len(data))
 
     # ---- assemble image ----
     img = bytearray(TOTAL_SECTORS * SECSZ)
@@ -130,11 +135,16 @@ def build(srcdir):
 
 
 def main():
-    if len(sys.argv) not in (3, 4):
+    if len(sys.argv) < 3:
         sys.exit(__doc__)
-    size_kb = int(sys.argv[3]) if len(sys.argv) == 4 else 4096
+    size_kb = int(sys.argv[3]) if len(sys.argv) >= 4 else 4096
+    extra_files = []
+    for spec in sys.argv[4:]:
+        if "=" not in spec:
+            sys.exit("invalid extra file (expected NAME=path): " + spec)
+        extra_files.append(spec.split("=", 1))
     configure(size_kb)
-    open(sys.argv[1], "wb").write(build(sys.argv[2]))
+    open(sys.argv[1], "wb").write(build(sys.argv[2], extra_files))
     print("FAT16 image: %s (%d KB) from %s/" % (sys.argv[1], size_kb, sys.argv[2]))
 
 

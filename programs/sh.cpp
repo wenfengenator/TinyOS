@@ -31,6 +31,7 @@ extern "C" int umain() {
         if (eq(cmd, "help")) {
             sys::write("  fs: pwd  cd <d>  ls  cat <f>  wr <f> <t>  mkdir <d>  rm|del <f>\n");
             sys::write("  sys: ps  echo <t>  ver  exit    programs: hello  count  greet  vi <f>\n");
+            sys::write("  static ELF files: ./musl.bin\n");
         } else if (eq(cmd, "echo")) {
             sys::write(arg); sys::write("\n");
         } else if (eq(cmd, "ver") || eq(cmd, "about")) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Build a GPT disk image with a single FAT32 EFI System Partition.
+"""Build a GPT disk image with a FAT32 ESP and a FAT16 TinyOS data partition.
 
-    mkgptesp.py <out.img> <esp_dir>
+    mkgptesp.py <out.img> <esp_dir> <data.img>
 
 Populates the ESP with the contents of <esp_dir> (recursively) and wraps a
 FAT32 volume in a GPT-partitioned disk that UEFI firmware (OVMF, and Hyper-V
@@ -18,8 +18,10 @@ RESERVED = 32                        # FAT32 reserved sectors (boot + fsinfo + b
 NFATS = 2
 PART_SECTORS = 131072                # 64 MiB ESP  (>> 65525 clusters => real FAT32)
 PART_START_LBA = 2048                # 1 MiB alignment
+DATA_START_LBA = PART_START_LBA + PART_SECTORS
 
 ESP_TYPE_GUID = uuid.UUID("C12A7328-F81F-11D2-BA4B-00A0C93EC93B")
+DATA_TYPE_GUID = uuid.UUID("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7")
 
 
 # ---------------- FAT32 volume ----------------
@@ -163,16 +165,32 @@ def build_fat(esp_dir):
 
 
 # ---------------- GPT wrapper ----------------
-def gpt_disk(part_img):
+def partition_entry(type_guid, first_lba, last_lba, name):
+    entry = bytearray(128)
+    entry[0:16] = type_guid.bytes_le
+    entry[16:32] = uuid.uuid4().bytes_le
+    struct.pack_into("<Q", entry, 32, first_lba)
+    struct.pack_into("<Q", entry, 40, last_lba)
+    encoded_name = name.encode("utf-16-le")
+    entry[56:56 + len(encoded_name)] = encoded_name
+    return entry
+
+
+def gpt_disk(part_img, data_img):
     part_sectors = len(part_img) // SECT
     part_end = PART_START_LBA + part_sectors - 1
-    disk_sectors = part_end + 1 + 33                         # +backup array(32)+header(1)
+    if len(data_img) % SECT:
+        raise SystemExit("mkgptesp: data image must be sector-aligned")
+    data_sectors = len(data_img) // SECT
+    data_end = DATA_START_LBA + data_sectors - 1
+    disk_sectors = data_end + 1 + 33                         # +backup array(32)+header(1)
     backup_hdr_lba = disk_sectors - 1
     backup_arr_lba = disk_sectors - 33
     disk = bytearray(disk_sectors * SECT)
 
     # place the partition
     disk[PART_START_LBA * SECT: PART_START_LBA * SECT + len(part_img)] = part_img
+    disk[DATA_START_LBA * SECT: DATA_START_LBA * SECT + len(data_img)] = data_img
 
     # protective MBR
     mbr = bytearray(SECT)
@@ -186,15 +204,9 @@ def gpt_disk(part_img):
     disk[0:SECT] = mbr
 
     # partition entry array
-    entry = bytearray(128)
-    entry[0:16] = ESP_TYPE_GUID.bytes_le
-    entry[16:32] = uuid.uuid4().bytes_le
-    struct.pack_into("<Q", entry, 32, PART_START_LBA)
-    struct.pack_into("<Q", entry, 40, part_end)
-    struct.pack_into("<Q", entry, 48, 0)
-    entry[56:56 + len("EFI System Partition".encode("utf-16-le"))] = "EFI System Partition".encode("utf-16-le")
     arr = bytearray(128 * 128)
-    arr[0:128] = entry
+    arr[0:128] = partition_entry(ESP_TYPE_GUID, PART_START_LBA, part_end, "EFI System Partition")
+    arr[128:256] = partition_entry(DATA_TYPE_GUID, DATA_START_LBA, data_end, "TinyOS Data")
     arr_crc = binascii.crc32(arr) & 0xFFFFFFFF
 
     disk_guid = uuid.uuid4().bytes_le
@@ -224,12 +236,12 @@ def gpt_disk(part_img):
 
 
 def main():
-    if len(sys.argv) != 3:
-        sys.exit("usage: mkgptesp.py <out.img> <esp_dir>")
-    out, esp = sys.argv[1], sys.argv[2]
-    disk = gpt_disk(build_fat(esp))
+    if len(sys.argv) != 4:
+        sys.exit("usage: mkgptesp.py <out.img> <esp_dir> <data.img>")
+    out, esp, data_path = sys.argv[1], sys.argv[2], sys.argv[3]
+    disk = gpt_disk(build_fat(esp), open(data_path, "rb").read())
     open(out, "wb").write(disk)
-    print("GPT+FAT32 ESP image: %s (%d MiB)" % (out, len(disk) // (1024 * 1024)))
+    print("GPT ESP+data image: %s (%d MiB)" % (out, len(disk) // (1024 * 1024)))
 
 
 if __name__ == "__main__":

@@ -14,8 +14,8 @@
  * INCREMENT 1: channel open + vstor handshake (pins the protocol version, stage 8).
  * INCREMENT 2 (this file): SCSI READ(10)/WRITE(10) via a GPA-direct data buffer.
  * A pattern write/read/verify self-test on a scratch sector (stages 9/10/11) must
- * pass before the disk is claimed.  The FAT16 volume lives in the GPT alignment
- * gap (STOR_BASE_LBA), clear of the protective MBR/GPT/ESP on the boot disk. */
+ * pass before the disk is claimed.  The FAT16 volume lives in a dedicated GPT
+ * data partition at STOR_BASE_LBA; only the self-test remains in the safe gap. */
 #include "boot64.h"
 
 extern void *memset(void *, int, unsigned long);
@@ -57,12 +57,9 @@ static const uint8_t SCSI_GUID[16] = {
 #define VMSCSI_NODATA 2                /* data_in: no transfer (e.g. TEST UNIT READY) */
 #define SECTOR 512
 
-/* The Hyper-V boot disk is GPT: LBA 0-33 hold the protective MBR + primary GPT
- * and the ESP starts at LBA 2048.  Park our raw FAT16 volume in the 1 MiB
- * alignment gap (LBA 34-2047) so it never collides with the GPT/ESP — nor gets
- * wiped when firmware repairs the primary GPT from its backup on boot (which is
- * why seeding at LBA 0 never persisted).  Keep base + image (< 1984 sectors). */
-#define STOR_BASE_LBA    64            /* FS sector 0 maps to this physical LBA */
+/* The Hyper-V boot disk has a 64 MiB ESP at LBA 2048 followed by the dedicated
+ * TinyOS FAT16 data partition.  Keep the scratch self-test in the pre-ESP gap. */
+#define STOR_BASE_LBA    133120        /* FS sector 0 maps to GPT data partition */
 #define STOR_SCRATCH_LBA 48            /* unused gap sector for the I/O self-test */
 
 /* ring buffer: 1 control + 2 data pages per direction (same shape as vmbus64) */

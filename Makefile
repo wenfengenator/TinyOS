@@ -85,8 +85,12 @@ EFI_OBJS := $(BUILD)/efi_main.o $(BUILD)/entry64.o \
 UPROG_CXXFLAGS := -m64 -ffreestanding -fno-exceptions -fno-rtti -fno-threadsafe-statics \
                   -fno-stack-protector -fno-asynchronous-unwind-tables -fno-builtin \
                   -mno-red-zone -fno-pic -fno-pie -mcmodel=large -mno-sse -mno-mmx -O2 -Iuser
-X64PROGS     := hello count greet sh vi
+X64PROGS     := hello count greet sh vi exec_probe
 X64PROG_HDRS := $(patsubst %,$(BUILD)/u%.h,$(X64PROGS))
+LINUX_TEST_HDR := $(BUILD)/linux_hello.h
+MUSL_ROOT ?= /tmp/tinyos-musl
+MUSL_LIBDIR := $(MUSL_ROOT)/usr/lib/x86_64-linux-musl
+MUSL_TEST_HDR := $(BUILD)/musl_probe.h
 
 ifeq ($(ARCH),x64)
 ALL_TGT := $(BUILD)/BOOTX64.EFI
@@ -205,14 +209,27 @@ $(BUILD)/u%.bin: programs/%.cpp programs/crt0_64.s programs/user64.ld user/ulib.
 	$(OBJCOPY) -O binary --set-section-flags .bss=alloc,load,contents $(BUILD)/u$*.elf $@
 $(BUILD)/u%.h: $(BUILD)/u%.bin | $(BUILD)
 	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char $*_prog[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
-$(BUILD)/arch64.o: $(X64PROG_HDRS)
+$(BUILD)/linux_hello.elf: programs/linux_hello.s programs/linux64.ld | $(BUILD)
+	$(AS) --64 -o $(BUILD)/linux_hello.o programs/linux_hello.s
+	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_hello.o
+$(BUILD)/linux_hello.h: $(BUILD)/linux_hello.elf | $(BUILD)
+	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char linux_hello_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/musl-gcc.specs: $(MUSL_LIBDIR)/musl-gcc.specs | $(BUILD)
+	sed -e 's|/usr/include/x86_64-linux-musl|$(MUSL_ROOT)/usr/include/x86_64-linux-musl|g' \
+	    -e 's|/usr/lib/x86_64-linux-musl|$(MUSL_LIBDIR)|g' \
+	    -e 's|-dynamic-linker /lib/x86_64-linux-musl|-dynamic-linker $(MUSL_ROOT)/lib/x86_64-linux-musl|g' $< > $@
+$(BUILD)/musl_probe.elf: programs/musl_probe.c $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/musl_probe.h: $(BUILD)/musl_probe.elf | $(BUILD)
+	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char musl_probe_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/arch64.o: $(X64PROG_HDRS) $(LINUX_TEST_HDR) $(MUSL_TEST_HDR)
 
 # x64 filesystem: a small FAT16 image (built from disk/ by tools/mkfatfs.py) is
 # embedded as a C blob and mounted as a writable RAM disk by kernel/fat64.c; the
 # ring-3 readdir/readfile/writefile syscalls route there.  FATFS_KB sizes it.
 FATFS_KB ?= 256
-$(BUILD)/fatfs.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) | $(BUILD)
-	$(PYTHON) tools/mkfatfs.py $@ disk $(FATFS_KB)
+$(BUILD)/fatfs.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) $(BUILD)/musl_probe.elf | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ disk $(FATFS_KB) MUSL.BIN=$(BUILD)/musl_probe.elf
 $(BUILD)/fatfs.h: $(BUILD)/fatfs.img | $(BUILD)
 	$(PYTHON) -c "d=open('$(BUILD)/fatfs.img','rb').read(); open('$(BUILD)/fatfs.h','w').write('static const unsigned char fatfs_img[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
 $(BUILD)/fat64.o: $(BUILD)/fatfs.h
@@ -231,8 +248,8 @@ esp: $(BUILD)/BOOTX64.EFI
 
 # persistent filesystem disk: seeded ONCE from disk/, kept outside build/ so
 # `make clean` won't wipe it.  `rm tinyfs.img` to re-seed from disk/.
-tinyfs.img:
-	$(PYTHON) tools/mkfatfs.py $@ disk $(PERSIST_KB)
+tinyfs.img: | $(BUILD)/musl_probe.elf
+	$(PYTHON) tools/mkfatfs.py $@ disk $(PERSIST_KB) MUSL.BIN=$(BUILD)/musl_probe.elf
 	@echo "seeded persistent disk $@ ($(PERSIST_KB) KB) from disk/"
 
 # boot the x64 build under qemu-system-x86_64 + OVMF in a graphical window so the
@@ -257,9 +274,13 @@ run-x64-headless: esp tinyfs.img
 	  -serial stdio -display none -no-reboot
 
 # ---- Hyper-V Gen 2 artifact: a GPT disk with a FAT32 ESP, packaged as VHDX ----
-# tools/mkgptesp.py writes the GPT + FAT32 volume by hand (no mkfs.vfat needed).
-$(BUILD)/tinyos.img: esp tools/mkgptesp.py
-	$(PYTHON) tools/mkgptesp.py $@ $(ESP)
+# tools/mkgptesp.py writes the GPT, FAT32 ESP, and persistent FAT16 data
+# partition by hand (no mkfs.vfat/mtools needed).
+HYPER_DATA_KB ?= 16384
+$(BUILD)/hyper_data.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) $(BUILD)/musl_probe.elf | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ disk $(HYPER_DATA_KB) MUSL.BIN=$(BUILD)/musl_probe.elf
+$(BUILD)/tinyos.img: esp tools/mkgptesp.py $(BUILD)/hyper_data.img
+	$(PYTHON) tools/mkgptesp.py $@ $(ESP) $(BUILD)/hyper_data.img
 
 tinyos.vhdx: $(BUILD)/tinyos.img
 	qemu-img convert -f raw -O vhdx $< $@
