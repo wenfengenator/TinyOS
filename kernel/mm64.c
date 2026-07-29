@@ -51,6 +51,20 @@ void heap_init(const boot_info_t *bi) {
 }
 
 uint64_t heap_total(void) { return g_arena_size; }
+uint64_t heap_used(void)  { return g_arena ? (uint64_t)(g_brk - g_arena) : 0; }
+
+/* Page allocator: hand out 4KB-aligned, zeroed pages (for page tables and user
+ * frames).  Shares the bump pointer with kmalloc; never freed. */
+void *page_alloc(uint64_t pages) {
+    if (!g_arena || !pages) return 0;
+    uint64_t start = align_up((uint64_t)g_brk, 4096);
+    uint64_t need  = pages * 4096u;
+    if (start + need > (uint64_t)g_arena + g_arena_size) return 0;
+    g_brk = (uint8_t *)(start + need);
+    uint8_t *p = (uint8_t *)start;
+    for (uint64_t i = 0; i < need; i++) p[i] = 0;
+    return p;
+}
 
 void *kmalloc(uint64_t n) {
     if (!g_arena || !n) return 0;

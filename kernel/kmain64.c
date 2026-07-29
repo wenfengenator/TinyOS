@@ -8,6 +8,8 @@
  * Later requirements grow the kernel from here (IDT, timer, keyboard, heap,
  * SMP, and the Doom-enabling infrastructure). */
 #include "boot64.h"
+#include "wm64.h"
+#include "arch64.h"
 
 void kmain64(boot_info_t *bi) {
     serial_init();
@@ -66,9 +68,12 @@ void kmain64(boot_info_t *bi) {
 
     smp_init(bi);
     hvkbd_init();
+    arch_init();
 
     kputs("[tinyos64] TINYOS X64 UEFI BOOT OK\n");
-    demo_run(bi);
+    arch_user_init();
+    login_run(bi);
+    wm_run(bi);
 
     kputs("[tinyos64] halting.\n");
     for (;;) __asm__ volatile("hlt");

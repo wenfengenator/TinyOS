@@ -258,13 +258,20 @@ static int open_kbd_channel(void) {
     return 1;
 }
 
-/* set-1 scancode -> ASCII (matches kbd64.c) */
+/* set-1 scancode -> ASCII, unshifted then shifted (matches kbd64.c) */
 static const char sc_ascii[128] = {
     0,27,'1','2','3','4','5','6','7','8','9','0','-','=','\b','\t',
     'q','w','e','r','t','y','u','i','o','p','[',']','\n',0,'a','s',
     'd','f','g','h','j','k','l',';','\'','`',0,'\\','z','x','c','v',
     'b','n','m',',','.','/',0,'*',0,' ',0,
 };
+static const char sc_shift[128] = {
+    0,27,'!','@','#','$','%','^','&','*','(',')','_','+','\b','\t',
+    'Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,'A','S',
+    'D','F','G','H','J','K','L',':','"','~',0,'|','Z','X','C','V',
+    'B','N','M','<','>','?',0,'*',0,' ',0,
+};
+static int s_shift, s_caps;
 
 int hvkbd_getkey(void) {
     if (!g_open) return -1;
@@ -273,12 +280,26 @@ int hvkbd_getkey(void) {
     if (n < 12 || *(uint32_t *)b != SK_EVENT) return -1;
     uint16_t make = *(uint16_t *)(b + 4);
     uint32_t info = *(uint32_t *)(b + 8);
-    if (info & SK_INFO_BREAK) return -1;              /* release */
+    int down = !(info & SK_INFO_BREAK);
+
+    if (!(info & SK_INFO_E0)) {                        /* Shift / Caps Lock */
+        if (make == 0x2A || make == 0x36) { s_shift = down; return -1; }
+        if (make == 0x3A) { if (down) s_caps ^= 1; return -1; }
+    }
+    if (!down) return -1;                              /* ignore other releases */
+
     if (info & SK_INFO_E0) {
         switch (make) { case 0x48: return KEY_UP; case 0x50: return KEY_DOWN;
                         case 0x4B: return KEY_LEFT; case 0x4D: return KEY_RIGHT; default: return -1; }
     }
-    if (make < 128) { char c = sc_ascii[make]; if (c) return (unsigned char)c; }
+    switch (make) { case 0x3B: return KEY_F1; case 0x3C: return KEY_F2; case 0x3D: return KEY_F3; }
+    if (make < 128) {
+        char c = s_shift ? sc_shift[make] : sc_ascii[make];
+        if (!c) return -1;
+        if (s_caps && c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');   /* caps flips letters */
+        else if (s_caps && c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        return (unsigned char)c;
+    }
     return -1;
 }
 

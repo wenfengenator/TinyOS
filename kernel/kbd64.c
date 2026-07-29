@@ -52,6 +52,12 @@ int kbd64_getkey(void) {
     }
     if (sc & 0x80) return -1;                  /* key release */
 
+    switch (sc) {                              /* function keys (WM controls) */
+        case 0x3B: return KEY_F1;
+        case 0x3C: return KEY_F2;
+        case 0x3D: return KEY_F3;
+    }
+
     char c = s_shift ? sc_shift[sc & 0x7F] : sc_ascii[sc & 0x7F];
     if (!c) return -1;
     if (s_caps) {

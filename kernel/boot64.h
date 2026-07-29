@@ -26,11 +26,14 @@ typedef struct {
 #define PF_RGBX8888 0
 #define PF_BGRX8888 1
 
-/* non-ASCII key codes returned by kbd64_getkey() for nav keys */
+/* non-ASCII key codes returned by kbd64_getkey() for nav + function keys */
 #define KEY_UP    0x80
 #define KEY_DOWN  0x81
 #define KEY_LEFT  0x82
 #define KEY_RIGHT 0x83
+#define KEY_F1    0x84
+#define KEY_F2    0x85
+#define KEY_F3    0x86
 #define KEY_ESC   0x1B
 
 /* ---- kernel console: serial (COM1) + GOP framebuffer (kernel/fb64.c) ---- */
@@ -55,7 +58,11 @@ void     fb_text_to(uint32_t *buf, uint32_t x, uint32_t y,
 void     heap_init(const boot_info_t *bi);
 void    *kmalloc(uint64_t n);
 void     kfree(void *p);
+void    *page_alloc(uint64_t pages);           /* 4KB-aligned zeroed pages         */
+void    *memset(void *d, int c, unsigned long n);
+void    *memcpy(void *d, const void *s, unsigned long n);
 uint64_t heap_total(void);                     /* arena size in bytes              */
+uint64_t heap_used(void);                      /* bump high-water mark in bytes    */
 
 /* ---- monotonic time via calibrated TSC (kernel/time64.c) ---- */
 void     time_init(uint64_t rsdp);             /* rsdp: for the ACPI PM timer      */
@@ -68,8 +75,12 @@ uint64_t tsc_freq_hz(void);
 void     kbd64_init(void);
 int      kbd64_getkey(void);                   /* ASCII/KEY_* code, or -1 if none  */
 
-/* ---- graphics demo (kernel/demo64.c) ---- */
+/* ---- graphics demo (kernel/demo64.c) + pong game (kernel/pong64.c) ---- */
 void     demo_run(boot_info_t *bi);
+void     pong_run(boot_info_t *bi);
+
+/* composite + present one desktop frame (kernel/wm64.c); used by blocking syscalls */
+void     wm_pump(void);
 
 /* ---- multi-core SMP bring-up (kernel/smp64.c) ---- */
 void     smp_init(boot_info_t *bi);

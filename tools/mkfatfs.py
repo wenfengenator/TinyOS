@@ -13,10 +13,21 @@ SPC = 1                      # sectors per cluster
 RESERVED = 1
 NFATS = 2
 ROOT_ENTRIES = 512
+
+# Image geometry — recomputed by configure() from a size in KB (default 4 MB).
 TOTAL_SECTORS = 8192         # 4 MB
 FAT_SECTORS = 32             # 8192 FAT16 entries
 ROOT_SECTORS = ROOT_ENTRIES * 32 // SECSZ            # 32
 DATA_START = RESERVED + NFATS * FAT_SECTORS + ROOT_SECTORS   # sector of cluster 2
+
+
+def configure(size_kb):
+    """Recompute the image geometry for a disk of size_kb kilobytes."""
+    global TOTAL_SECTORS, FAT_SECTORS, ROOT_SECTORS, DATA_START
+    TOTAL_SECTORS = size_kb * 1024 // SECSZ
+    FAT_SECTORS   = (TOTAL_SECTORS * 2 + SECSZ - 1) // SECSZ     # 2 bytes / entry
+    ROOT_SECTORS  = ROOT_ENTRIES * 32 // SECSZ
+    DATA_START    = RESERVED + NFATS * FAT_SECTORS + ROOT_SECTORS
 
 
 def dirent(name83, attr, cluster, size):
@@ -119,10 +130,12 @@ def build(srcdir):
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         sys.exit(__doc__)
+    size_kb = int(sys.argv[3]) if len(sys.argv) == 4 else 4096
+    configure(size_kb)
     open(sys.argv[1], "wb").write(build(sys.argv[2]))
-    print("FAT16 image: %s (4 MB) from %s/" % (sys.argv[1], sys.argv[2]))
+    print("FAT16 image: %s (%d KB) from %s/" % (sys.argv[1], size_kb, sys.argv[2]))
 
 
 if __name__ == "__main__":

@@ -65,11 +65,23 @@ EFI_LDFLAGS := -mi386pep -e efi_main --subsystem=10 --image-base 0x100000 \
                -nostdlib --strip-all
 
 # x64 kernel objects linked into the single PE32+ EFI application.
-EFI_HDRS := kernel/boot64.h kernel/font8x8.h
+EFI_HDRS := kernel/boot64.h kernel/font8x8.h kernel/wm64.h kernel/arch64.h kernel/fat64.h
 EFI_OBJS := $(BUILD)/efi_main.o $(BUILD)/entry64.o \
             $(BUILD)/kmain64.o $(BUILD)/fb64.o $(BUILD)/mm64.o \
-            $(BUILD)/time64.o $(BUILD)/kbd64.o $(BUILD)/demo64.o \
-            $(BUILD)/smp64.o $(BUILD)/vmbus64.o
+            $(BUILD)/time64.o $(BUILD)/kbd64.o $(BUILD)/demo64.o $(BUILD)/pong64.o \
+            $(BUILD)/smp64.o $(BUILD)/vmbus64.o \
+            $(BUILD)/wm64.o $(BUILD)/term64.o $(BUILD)/login64.o \
+            $(BUILD)/arch64.o $(BUILD)/trap64.o $(BUILD)/fat64.o
+
+# x64 ring-3 user programs: compiled from programs/*.cpp, embedded as blobs.
+# -mcmodel=large + link at USER_CODE_VA => absolute 64-bit addressing that is
+# correct when the image is loaded at that same virtual address (RIP-relative
+# -fPIC mis-placed .rodata by a byte under -O2).
+UPROG_CXXFLAGS := -m64 -ffreestanding -fno-exceptions -fno-rtti -fno-threadsafe-statics \
+                  -fno-stack-protector -fno-asynchronous-unwind-tables -fno-builtin \
+                  -mno-red-zone -fno-pic -fno-pie -mcmodel=large -mno-sse -mno-mmx -O2 -Iuser
+X64PROGS     := hello count greet sh vi
+X64PROG_HDRS := $(patsubst %,$(BUILD)/u%.h,$(X64PROGS))
 
 ifeq ($(ARCH),x64)
 ALL_TGT := $(BUILD)/BOOTX64.EFI
@@ -175,6 +187,30 @@ $(BUILD)/ap_trampoline.bin: kernel/ap_trampoline.s | $(BUILD)
 $(BUILD)/ap_tramp_array.h: $(BUILD)/ap_trampoline.bin | $(BUILD)
 	$(PYTHON) -c "d=open('$(BUILD)/ap_trampoline.bin','rb').read(); open('$(BUILD)/ap_tramp_array.h','w').write('static const unsigned char ap_tramp[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
 $(BUILD)/smp64.o: $(BUILD)/ap_tramp_array.h
+
+# ring-0/ring-3 plumbing (trap64.s)
+$(BUILD)/trap64.o: kernel/trap64.s | $(BUILD)
+	$(AS) --64 -o $@ $<
+
+# x64 ring-3 user programs: compile a .cpp to a flat PIC image, embed as a C blob
+$(BUILD)/u%.bin: programs/%.cpp programs/crt0_64.s programs/user64.ld user/ulib.h | $(BUILD)
+	$(CXX) $(UPROG_CXXFLAGS) -c -o $(BUILD)/u$*.o $<
+	$(AS) --64 -o $(BUILD)/ucrt0.o programs/crt0_64.s
+	$(LD) -m elf_x86_64 -T programs/user64.ld -o $(BUILD)/u$*.elf $(BUILD)/ucrt0.o $(BUILD)/u$*.o
+	$(OBJCOPY) -O binary --set-section-flags .bss=alloc,load,contents $(BUILD)/u$*.elf $@
+$(BUILD)/u%.h: $(BUILD)/u%.bin | $(BUILD)
+	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char $*_prog[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/arch64.o: $(X64PROG_HDRS)
+
+# x64 filesystem: a small FAT16 image (built from disk/ by tools/mkfatfs.py) is
+# embedded as a C blob and mounted as a writable RAM disk by kernel/fat64.c; the
+# ring-3 readdir/readfile/writefile syscalls route there.  FATFS_KB sizes it.
+FATFS_KB ?= 256
+$(BUILD)/fatfs.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ disk $(FATFS_KB)
+$(BUILD)/fatfs.h: $(BUILD)/fatfs.img | $(BUILD)
+	$(PYTHON) -c "d=open('$(BUILD)/fatfs.img','rb').read(); open('$(BUILD)/fatfs.h','w').write('static const unsigned char fatfs_img[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/fat64.o: $(BUILD)/fatfs.h
 
 $(BUILD)/BOOTX64.EFI: $(EFI_OBJS)
 	$(LD) $(EFI_LDFLAGS) -o $@ $(EFI_OBJS)

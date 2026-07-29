@@ -96,14 +96,13 @@ void fb_text_to(uint32_t *buf, uint32_t x, uint32_t y,
     uint32_t fg = pack(fg_rgb), bg = pack(bg_rgb);
     for (; *s; s++) {
         unsigned uc = (unsigned char)*s;
-        if (uc >= 'a' && uc <= 'z') uc -= 0x20;
         if (uc < FONT_FIRST || uc > FONT_LAST) uc = '?';
         const unsigned char *g = font8x8[uc - FONT_FIRST];
         for (uint32_t row = 0; row < 8; row++) {
             unsigned char bits = g[row];
             for (uint32_t col = 0; col < 8; col++) {
                 uint32_t xx = x + col, yy = y + row;
-                if (xx < g_w && yy < g_h) buf[yy * g_w + xx] = (bits & (0x80 >> col)) ? fg : bg;
+                if (xx < g_w && yy < g_h) buf[yy * g_w + xx] = (bits & (1u << col)) ? fg : bg;
             }
         }
         x += 8;
@@ -112,14 +111,13 @@ void fb_text_to(uint32_t *buf, uint32_t x, uint32_t y,
 
 static void draw_glyph(char c, uint32_t cx, uint32_t cy) {
     unsigned uc = (unsigned char)c;
-    if (uc >= 'a' && uc <= 'z') uc -= 0x20;          /* fold lowercase -> upper */
     if (uc < FONT_FIRST || uc > FONT_LAST) uc = '?';
     const unsigned char *g = font8x8[uc - FONT_FIRST];
     uint32_t fg = pack(g_fg), bg = pack(g_bg);
     for (uint32_t row = 0; row < 8; row++) {
         unsigned char bits = g[row];
         for (uint32_t col = 0; col < 8; col++)
-            putpx(cx * 8 + col, cy * 8 + row, (bits & (0x80 >> col)) ? fg : bg);
+            putpx(cx * 8 + col, cy * 8 + row, (bits & (1u << col)) ? fg : bg);
     }
 }
 static void fb_scroll(void) {

@@ -17,21 +17,30 @@ enum {                          // extended key codes from the PS/2 driver (matc
     KEY_DEL = 0x84, KEY_HOME = 0x85, KEY_END = 0x86, KEY_PGUP = 0x87, KEY_PGDN = 0x88,
 };
 
+#ifdef __x86_64__
+static inline long syscall(long n, long a = 0, long b = 0, long c = 0) {
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret)
+                     : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
+    return ret;
+}
+#else
 static inline int syscall(int n, int a = 0, int b = 0, int c = 0) {
     int ret;
     __asm__ volatile("int $0x80" : "=a"(ret)
                      : "a"(n), "b"(a), "c"(b), "d"(c) : "memory");
     return ret;
 }
+#endif
 
 static inline unsigned strlen(const char *s) { unsigned n = 0; while (s[n]) n++; return n; }
 
 // stdout / console
-static inline int  write(const char *s)               { return syscall(WRITE, STDOUT, (int)s, (int)strlen(s)); }
-static inline int  write_n(int fd, const char *s, int n){ return syscall(WRITE, fd, (int)s, n); }
+static inline int  write(const char *s)               { return syscall(WRITE, STDOUT, (long)s, (long)strlen(s)); }
+static inline int  write_n(int fd, const char *s, int n){ return syscall(WRITE, fd, (long)s, n); }
 // stdin / files
-static inline int  read(int fd, char *b, int n)       { return syscall(READ, fd, (int)b, n); }
-static inline int  open(const char *path, int flags = 0) { return syscall(OPEN, (int)path, flags); }
+static inline int  read(int fd, char *b, int n)       { return syscall(READ, fd, (long)b, n); }
+static inline int  open(const char *path, int flags = 0) { return syscall(OPEN, (long)path, flags); }
     enum { O_APPEND = 1 };
 static inline int  close(int fd)                      { return syscall(CLOSE, fd); }
 // process
@@ -57,18 +66,18 @@ static inline int strcat_(char *dst, int len, const char *src) {
 
 // ---- process / fs extras ----
 struct stat_t { unsigned size; unsigned isdir; };
-static inline int  exec(const char *path, const char *arg = 0) { return syscall(EXEC, (int)path, (int)arg); }
+static inline int  exec(const char *path, const char *arg = 0) { return syscall(EXEC, (long)path, (long)arg); }
 static inline int  fork()                            { return syscall(FORK); }
 static inline int  wait(int pid)                     { return syscall(WAIT, pid); }
-static inline int  stat(const char *path, stat_t *st){ return syscall(STAT, (int)path, (int)st); }
+static inline int  stat(const char *path, stat_t *st){ return syscall(STAT, (long)path, (long)st); }
 static inline int  lseek(int fd, int off, int wh)    { return syscall(LSEEK, fd, off, wh); }
-static inline int  readdir(const char *dir, int i, char *name) { return syscall(READDIR, (int)dir, i, (int)name); }
-static inline int  readfile(const char *path, char *buf, int max){ return syscall(READFILE, (int)path, (int)buf, max); }
-static inline int  writefile(const char *path, const char *buf, int n){ return syscall(WRITEFILE, (int)path, (int)buf, n); }
+static inline int  readdir(const char *dir, int i, char *name) { return syscall(READDIR, (long)dir, i, (long)name); }
+static inline int  readfile(const char *path, char *buf, int max){ return syscall(READFILE, (long)path, (long)buf, max); }
+static inline int  writefile(const char *path, const char *buf, int n){ return syscall(WRITEFILE, (long)path, (long)buf, n); }
 static inline int  getchar()                         { return syscall(GETCHAR); }
 static inline void clear()                           { syscall(CLEAR); }
 static inline void gotoxy(int row, int col)          { syscall(GOTOXY, row, col); }
-static inline int  taskinfo(int i, void *buf)        { return syscall(TASKINFO, i, (int)buf); }
+static inline int  taskinfo(int i, void *buf)        { return syscall(TASKINFO, i, (long)buf); }
 
 } // namespace sys
 #endif
