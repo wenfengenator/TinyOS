@@ -1,0 +1,17 @@
+-x
+c
+/PRINTF.C
+-x
+n
+-static
+-I/
+-nostdinc
+-nostdlib
+/CRT1.O
+/CRTI.O
+/LIBC.A
+/LIBTCC1.A
+/LIBC.A
+/CRTN.O
+-o
+/PRINTF.BIN

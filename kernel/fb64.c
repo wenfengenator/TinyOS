@@ -90,6 +90,22 @@ void fb_present(const uint32_t *back) {
         memcpy((void *)(g_fb + y * g_pitch), back + y * g_w, (unsigned long)g_w * 4);
 }
 
+/* Present only the scanlines that differ from `shadow` (updated in place), so a
+ * mostly-static screen skips the slow framebuffer / Hyper-V synthvid writes for
+ * unchanged rows.  `back` and `shadow` are tight w*h buffers. */
+void fb_present_diff(const uint32_t *back, uint32_t *shadow, uint32_t w, uint32_t h) {
+    if (!g_fb) return;
+    for (uint32_t y = 0; y < h; y++) {
+        const uint32_t *b = back + (uint64_t)y * w;
+        uint32_t *s = shadow + (uint64_t)y * w;
+        uint32_t x = 0;
+        while (x < w && b[x] == s[x]) x++;
+        if (x == w) continue;                         /* row unchanged: skip FB write */
+        memcpy((void *)(g_fb + (uint64_t)y * g_pitch), b, (unsigned long)w * 4);
+        memcpy(s, b, (unsigned long)w * 4);
+    }
+}
+
 /* Draw a string into a tight w-pitched buffer at pixel (x,y), each 8x8 glyph
  * magnified by an integer `scale` (nearest-neighbour, so it stays crisp). */
 void fb_text_to_s(uint32_t *buf, uint32_t x, uint32_t y,

@@ -57,27 +57,60 @@ class Fat:
             self.fat[c] = 0xFFFF if i == n - 1 else c + 1
         return first, len(data)
 
+    def reserve(self, nclus):
+        """Reserve a chain of nclus clusters (filled later by write_chain)."""
+        first = self.next
+        for i in range(nclus):
+            c = self.next; self.next += 1
+            self.clusters[c] = b"\0" * SECSZ
+            self.fat[c] = 0xFFFF if i == nclus - 1 else c + 1
+        return first
+
+    def write_chain(self, first, data):
+        """Write data into an already-reserved cluster chain."""
+        data = data + b"\0" * ((-len(data)) % SECSZ)
+        c = first
+        for i in range(0, len(data), SECSZ):
+            self.clusters[c] = data[i:i+SECSZ]
+            nxt = self.fat[c]
+            if nxt >= 0xFFF8:
+                break
+            c = nxt
+
+
+def build_dir(fat, path, parent_cluster):
+    """Recursively lay out a directory (any nesting) and return its first cluster.
+    ".." points at parent_cluster (0 == root), so nested paths like
+    /include/bits/alltypes.h resolve correctly."""
+    items   = sorted(os.listdir(path))
+    files   = [f for f in items if os.path.isfile(os.path.join(path, f))]
+    subdirs = [d for d in items if os.path.isdir(os.path.join(path, d))]
+    nent    = 2 + len(files) + len(subdirs)                 # '.', '..', entries
+    nclus   = max(1, (nent * 32 + SECSZ - 1) // SECSZ)
+    self_cluster = fat.reserve(nclus)                        # reserve before children
+    ents = [dirent(".", 0x10, self_cluster, 0),
+            dirent("..", 0x10, parent_cluster, 0)]
+    for f in files:
+        data = open(os.path.join(path, f), "rb").read()
+        c, _ = fat.alloc_chain(data)
+        ents.append(dirent(f, 0x20, c, len(data)))
+    for d in subdirs:
+        c = build_dir(fat, os.path.join(path, d), self_cluster)
+        ents.append(dirent(d, 0x10, c, 0))
+    fat.write_chain(self_cluster, b"".join(ents))
+    return self_cluster
+
 
 def build(srcdir, extra_files=()):
     fat = Fat()
     root = b""
 
-    # subdirectories (one level)
+    # subdirectories (recursive: one FAT entry per top-level dir, nested below)
     for entry in sorted(os.listdir(srcdir)):
         p = os.path.join(srcdir, entry)
         if os.path.isdir(p):
-            # build the directory's cluster: '.', '..', then files
-            files = []
-            for f in sorted(os.listdir(p)):
-                fp = os.path.join(p, f)
-                if os.path.isfile(fp):
-                    data = open(fp, "rb").read()
-                    c, sz = fat.alloc_chain(data)
-                    files.append(dirent(f, 0x20, c, len(data)))
-            dcluster = fat.next
-            dirdata = dirent(".", 0x10, dcluster, 0) + dirent("..", 0x10, 0, 0) + b"".join(files)
-            c2, _ = fat.alloc_chain(dirdata)     # dcluster == c2
-            root += dirent(entry, 0x10, c2, 0)
+            c = build_dir(fat, p, 0)                  # parent == root (cluster 0)
+            root += dirent(entry, 0x10, c, 0)
 
     # root files
     for entry in sorted(os.listdir(srcdir)):
@@ -144,7 +177,10 @@ def main():
             sys.exit("invalid extra file (expected NAME=path): " + spec)
         extra_files.append(spec.split("=", 1))
     configure(size_kb)
-    open(sys.argv[1], "wb").write(build(sys.argv[2], extra_files))
+    image = build(sys.argv[2], extra_files)
+    temp = sys.argv[1] + ".tmp"
+    open(temp, "wb").write(image)
+    os.replace(temp, sys.argv[1])
     print("FAT16 image: %s (%d KB) from %s/" % (sys.argv[1], size_kb, sys.argv[2]))
 
 

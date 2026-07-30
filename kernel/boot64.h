@@ -52,6 +52,15 @@ void     kput_u32dec(uint32_t v);
 uint32_t fb_pack(uint32_t rgb);                /* 0xRRGGBB -> device pixel         */
 void     fb_get(uint32_t *w, uint32_t *h);     /* visible dimensions               */
 void     fb_present(const uint32_t *back);     /* blit a tight w*h back buffer     */
+void     fb_present_diff(const uint32_t *back, uint32_t *shadow,
+                        uint32_t w, uint32_t h); /* blit only changed scanlines     */
+
+/* shared double-buffered display (kernel/disp64.c) */
+int       disp_init(void);                     /* alloc shared back buffer + shadow */
+uint32_t *disp_back(void);                     /* the shared tight w*h back buffer  */
+void      disp_dims(uint32_t *w, uint32_t *h); /* back-buffer dimensions            */
+void      disp_present(void);                  /* blit only changed scanlines       */
+void      disp_present_full(void);             /* unconditional full blit           */
 void     fb_text_to(uint32_t *buf, uint32_t x, uint32_t y,
                     const char *s, uint32_t fg_rgb, uint32_t bg_rgb);
 void     fb_text_to_s(uint32_t *buf, uint32_t x, uint32_t y,        /* integer-scaled */
@@ -112,6 +121,8 @@ int      vmbus_find_offer(const uint8_t *guid, uint32_t *relid, uint32_t *connid
 int      storvsc_init(void);                  /* 1 if a persistent SCSI disk is ready */
 int      storvsc_read(uint32_t lba, void *buf);
 int      storvsc_write(uint32_t lba, const void *buf);
+int      storvsc_read_many(uint32_t lba, void *buf, uint32_t sectors);
+int      storvsc_write_many(uint32_t lba, const void *buf, uint32_t sectors);
 int      storvsc_stage(void);                 /* bring-up progress 0..12 (diagnostic) */
 int      storvsc_diag(void);                  /* last I/O (status<<16|srb<<8|scsi); ~0=timeout */
 int      storvsc_ver(void);                   /* negotiated vstor protocol version (e.g. 0x0602) */

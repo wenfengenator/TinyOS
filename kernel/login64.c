@@ -44,7 +44,7 @@ void login_run(boot_info_t *bi) {
     (void)bi;
     fb_get(&L_w, &L_h);
     if (!L_w || !L_h) { kputs("[login] no framebuffer; skipping\n"); return; }
-    uint32_t *bb = (uint32_t *)kmalloc((uint64_t)L_w * L_h * 4);
+    uint32_t *bb = disp_back();
     if (!bb) { kputs("[login] no back buffer; skipping\n"); return; }
 
     char ubuf[L_MAX + 4] = {0}, pbuf[L_MAX + 4] = {0};
@@ -62,7 +62,6 @@ void login_run(boot_info_t *bi) {
                     field = 1;
                 } else if (L_check(ubuf, pbuf)) {
                     kputs("[login] authenticated: "); kputs(ubuf); kputc('\n');
-                    kfree(bb);
                     return;                          /* -> desktop */
                 } else {
                     msg = "login incorrect";
@@ -128,6 +127,6 @@ void login_run(boot_info_t *bi) {
                      "enter=next   tab=switch   esc=clear",
                      0x6688AA, 0x101C2E, 2);
 
-        fb_present(bb);
+        disp_present();
     }
 }

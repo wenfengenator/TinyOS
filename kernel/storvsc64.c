@@ -56,6 +56,7 @@ static const uint8_t SCSI_GUID[16] = {
 #define VMSCSI_READ  1                 /* data_in: disk  -> guest */
 #define VMSCSI_NODATA 2                /* data_in: no transfer (e.g. TEST UNIT READY) */
 #define SECTOR 512
+#define MAX_SECTORS 8                  /* one page-sized GPA-direct transfer */
 
 /* The Hyper-V boot disk has a 64 MiB ESP at LBA 2048 followed by the dedicated
  * TinyOS FAT16 data partition.  Keep the scratch self-test in the pre-ESP gap. */
@@ -243,18 +244,21 @@ static int stor_io(const struct vmscsi *srb, uint32_t xfer, struct vstor *reply)
     return -1;
 }
 
-/* One 512-byte sector at a physical LBA into/out of g_dma; 0 on SRB success. */
-static int do_io(uint32_t phys_lba, uint8_t dir) {
+/* Up to one page of sectors at a physical LBA into/out of g_dma. */
+static int do_io(uint32_t phys_lba, uint8_t dir, uint32_t sectors) {
+    if (!sectors || sectors > MAX_SECTORS) return -1;
     uint8_t cdb[10]; memset(cdb, 0, sizeof(cdb));
     cdb[0] = (dir == VMSCSI_READ) ? 0x28 : 0x2A;            /* READ(10) / WRITE(10) */
     cdb[2] = (uint8_t)(phys_lba >> 24);
     cdb[3] = (uint8_t)(phys_lba >> 16);
     cdb[4] = (uint8_t)(phys_lba >> 8);
     cdb[5] = (uint8_t)(phys_lba);
-    cdb[8] = 1;                                             /* one block */
-    struct vmscsi srb; build_srb(&srb, cdb, 10, dir, SECTOR);
+    cdb[7] = (uint8_t)(sectors >> 8);
+    cdb[8] = (uint8_t)sectors;
+    uint32_t bytes = sectors * SECTOR;
+    struct vmscsi srb; build_srb(&srb, cdb, 10, dir, bytes);
     struct vstor rep;
-    if (stor_io(&srb, SECTOR, &rep)) return -1;             /* no completion (timeout) */
+    if (stor_io(&srb, bytes, &rep)) return -1;              /* no completion (timeout) */
     if ((rep.srb.srb_status & 0x3F) != SRB_STATUS_SUCCESS) return -1;   /* SCSI-level reject */
     return 0;
 }
@@ -335,7 +339,7 @@ static int handshake(void) {
         if (!vstor_txn(&pkt, &rep) && rep.status == 0) { g_ver = vers[i]; ok = 1; break; }
     }
     if (!ok) { kputs("[stor] no protocol version accepted\n"); return 0; }
-    kputs("[stor] protocol version 0x"); kput_u64hex((uint64_t)(uint32_t)g_ver); kputc('\n');
+    kputs("[stor] protocol version "); kput_u64hex((uint64_t)(uint32_t)g_ver); kputc('\n');
     g_stage = 6;
 
     memset(&pkt, 0, sizeof(pkt)); pkt.op = OP_QUERY_PROPS;
@@ -391,27 +395,29 @@ int storvsc_init(void) {
     if (g_blksz != SECTOR) { kputs("[stor] disk block size is not 512\n"); g_ready = 0; return 0; }
     g_stage = 11;
     for (int i = 0; i < SECTOR; i++) g_dma[i] = (uint8_t)(i ^ 0x5A);
-    if (do_io(STOR_SCRATCH_LBA, VMSCSI_WRITE)) { kputs("[stor] scratch write failed\n"); g_ready = 0; return 0; }
+    if (do_io(STOR_SCRATCH_LBA, VMSCSI_WRITE, 1)) { kputs("[stor] scratch write failed\n"); g_ready = 0; return 0; }
     memset(g_dma, 0, SECTOR);
-    if (do_io(STOR_SCRATCH_LBA, VMSCSI_READ)) { kputs("[stor] scratch verify read failed\n"); g_ready = 0; return 0; }
+    if (do_io(STOR_SCRATCH_LBA, VMSCSI_READ, 1)) { kputs("[stor] scratch verify read failed\n"); g_ready = 0; return 0; }
     for (int i = 0; i < SECTOR; i++)
         if (g_dma[i] != (uint8_t)(i ^ 0x5A)) { kputs("[stor] scratch data mismatch\n"); g_ready = 0; return 0; }
     g_stage = 12;
-    kputs("[stor] SCSI I/O verified — persistent disk ready\n");
+    kputs("[stor] SCSI I/O verified - persistent disk ready\n");
     return 1;
 }
 
-int storvsc_read(uint32_t lba, void *buf) {
-    if (!g_ready) return -1;
-    if (do_io(STOR_BASE_LBA + lba, VMSCSI_READ)) return -1;
-    memcpy(buf, g_dma, SECTOR);
+int storvsc_read_many(uint32_t lba, void *buf, uint32_t sectors) {
+    if (!g_ready || !sectors || sectors > MAX_SECTORS) return -1;
+    if (do_io(STOR_BASE_LBA + lba, VMSCSI_READ, sectors)) return -1;
+    memcpy(buf, g_dma, sectors * SECTOR);
     return 0;
 }
-int storvsc_write(uint32_t lba, const void *buf) {
-    if (!g_ready) return -1;
-    memcpy(g_dma, buf, SECTOR);
-    return do_io(STOR_BASE_LBA + lba, VMSCSI_WRITE);
+int storvsc_write_many(uint32_t lba, const void *buf, uint32_t sectors) {
+    if (!g_ready || !sectors || sectors > MAX_SECTORS) return -1;
+    memcpy(g_dma, buf, sectors * SECTOR);
+    return do_io(STOR_BASE_LBA + lba, VMSCSI_WRITE, sectors);
 }
+int storvsc_read(uint32_t lba, void *buf) { return storvsc_read_many(lba, buf, 1); }
+int storvsc_write(uint32_t lba, const void *buf) { return storvsc_write_many(lba, buf, 1); }
 int storvsc_stage(void) { return g_stage; }
 int storvsc_diag(void)  { return (int)g_io_diag; }
 int storvsc_ver(void)   { return g_ver; }              /* negotiated vstor protocol version */

@@ -75,7 +75,7 @@ EFI_OBJS := $(BUILD)/efi_main.o $(BUILD)/entry64.o \
             $(BUILD)/kmain64.o $(BUILD)/fb64.o $(BUILD)/mm64.o \
             $(BUILD)/time64.o $(BUILD)/kbd64.o $(BUILD)/demo64.o $(BUILD)/pong64.o \
             $(BUILD)/smp64.o $(BUILD)/vmbus64.o \
-            $(BUILD)/wm64.o $(BUILD)/term64.o $(BUILD)/login64.o \
+            $(BUILD)/disp64.o $(BUILD)/wm64.o $(BUILD)/term64.o $(BUILD)/login64.o \
             $(BUILD)/arch64.o $(BUILD)/trap64.o $(BUILD)/fat64.o $(BUILD)/sched64.o $(BUILD)/vblk64.o $(BUILD)/storvsc64.o
 
 # x64 ring-3 user programs: compiled from programs/*.cpp, embedded as blobs.
@@ -91,6 +91,8 @@ LINUX_TEST_HDR := $(BUILD)/linux_hello.h
 MUSL_ROOT ?= /tmp/tinyos-musl
 MUSL_LIBDIR := $(MUSL_ROOT)/usr/lib/x86_64-linux-musl
 MUSL_TEST_HDR := $(BUILD)/musl_probe.h
+TCC_BIN ?= /tmp/tinycc/tcc
+TCC_SELF ?= /tmp/tcc-selfroot
 
 ifeq ($(ARCH),x64)
 ALL_TGT := $(BUILD)/BOOTX64.EFI
@@ -100,7 +102,10 @@ ALL_TGT := os.img fs.img
 RUN_TGT := run-i386
 endif
 
-.PHONY: all run run-i386 run-x64 run-x64-headless run-x64-disk vhdx bootx64 esp run-emu run-emu-kernel deps clean
+.PHONY: all run run-i386 run-x64 run-x64-headless run-x64-disk vhdx bootx64 esp run-emu run-emu-kernel deps setup-tcc clean
+
+setup-tcc:
+	sh tools/setup_tcc.sh
 all: $(ALL_TGT)
 
 $(BUILD):
@@ -214,6 +219,9 @@ $(BUILD)/linux_hello.elf: programs/linux_hello.s programs/linux64.ld | $(BUILD)
 	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_hello.o
 $(BUILD)/linux_hello.h: $(BUILD)/linux_hello.elf | $(BUILD)
 	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char linux_hello_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/linux_exec_child.elf: programs/linux_exec_child.s programs/linux64.ld | $(BUILD)
+	$(AS) --64 -o $(BUILD)/linux_exec_child.o programs/linux_exec_child.s
+	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_exec_child.o
 $(BUILD)/musl-gcc.specs: $(MUSL_LIBDIR)/musl-gcc.specs | $(BUILD)
 	sed -e 's|/usr/include/x86_64-linux-musl|$(MUSL_ROOT)/usr/include/x86_64-linux-musl|g' \
 	    -e 's|/usr/lib/x86_64-linux-musl|$(MUSL_LIBDIR)|g' \
@@ -222,14 +230,22 @@ $(BUILD)/musl_probe.elf: programs/musl_probe.c $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/musl_probe.h: $(BUILD)/musl_probe.elf | $(BUILD)
 	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char musl_probe_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/tcc_probe.elf: programs/tcc_probe.c $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/tcc_printf_probe.elf: programs/tcc_printf_probe.c $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/tcc_self_probe.elf: programs/tcc_self_probe.c $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/tcc2_probe.elf: programs/tcc2_probe.c $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/arch64.o: $(X64PROG_HDRS) $(LINUX_TEST_HDR) $(MUSL_TEST_HDR)
 
 # x64 filesystem: a small FAT16 image (built from disk/ by tools/mkfatfs.py) is
 # embedded as a C blob and mounted as a writable RAM disk by kernel/fat64.c; the
 # ring-3 readdir/readfile/writefile syscalls route there.  FATFS_KB sizes it.
 FATFS_KB ?= 256
-$(BUILD)/fatfs.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) $(BUILD)/musl_probe.elf | $(BUILD)
-	$(PYTHON) tools/mkfatfs.py $@ disk $(FATFS_KB) MUSL.BIN=$(BUILD)/musl_probe.elf
+$(BUILD)/fatfs.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf programs/tcc_hello.c | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ disk $(FATFS_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c
 $(BUILD)/fatfs.h: $(BUILD)/fatfs.img | $(BUILD)
 	$(PYTHON) -c "d=open('$(BUILD)/fatfs.img','rb').read(); open('$(BUILD)/fatfs.h','w').write('static const unsigned char fatfs_img[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
 $(BUILD)/fat64.o: $(BUILD)/fatfs.h
@@ -246,11 +262,23 @@ esp: $(BUILD)/BOOTX64.EFI
 	cp $(BUILD)/BOOTX64.EFI $(ESP)/EFI/BOOT/BOOTX64.EFI
 	$(PYTHON) -c "open('$(ESP)/TINYWAD.DAT','wb').write(bytes(range(256))*16384)"
 
-# persistent filesystem disk: seeded ONCE from disk/, kept outside build/ so
-# `make clean` won't wipe it.  `rm tinyfs.img` to re-seed from disk/.
-tinyfs.img: | $(BUILD)/musl_probe.elf
-	$(PYTHON) tools/mkfatfs.py $@ disk $(PERSIST_KB) MUSL.BIN=$(BUILD)/musl_probe.elf
-	@echo "seeded persistent disk $@ ($(PERSIST_KB) KB) from disk/"
+# Persistent-disk staging root: disk/ plus /lib (crt, libc.a, libtcc1.a), the full
+# musl /include header tree, and a K&R sample so on-device `./tcc.bin a.c -o a.bin`
+# resolves the standard library through TCC's built-in search paths.
+$(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h programs/tcc_kr_demo.c $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
+	rm -rf $(BUILD)/fsroot
+	mkdir -p $(BUILD)/fsroot/lib $(BUILD)/fsroot/include
+	cp -r disk/. $(BUILD)/fsroot/
+	cp $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a $(BUILD)/fsroot/lib/
+	cp -r $(TCC_SELF)/include/. $(BUILD)/fsroot/include/
+	cp programs/tcc_kr_demo.c $(BUILD)/fsroot/kr.c
+	touch $@
+
+# persistent filesystem disk: seeded ONCE from the staging root, kept outside
+# build/ so `make clean` won't wipe it.  `rm tinyfs.img` to re-seed.
+tinyfs.img: $(BUILD)/fsroot.stamp | $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(TCC_BIN)
+	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(PERSIST_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c
+	@echo "seeded persistent disk $@ ($(PERSIST_KB) KB) from build/fsroot/"
 
 # boot the x64 build under qemu-system-x86_64 + OVMF in a graphical window so the
 # framebuffer demo is visible; the serial console is mirrored to the terminal.
@@ -277,8 +305,8 @@ run-x64-headless: esp tinyfs.img
 # tools/mkgptesp.py writes the GPT, FAT32 ESP, and persistent FAT16 data
 # partition by hand (no mkfs.vfat/mtools needed).
 HYPER_DATA_KB ?= 16384
-$(BUILD)/hyper_data.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) $(BUILD)/musl_probe.elf | $(BUILD)
-	$(PYTHON) tools/mkfatfs.py $@ disk $(HYPER_DATA_KB) MUSL.BIN=$(BUILD)/musl_probe.elf
+$(BUILD)/hyper_data.img: tools/mkfatfs.py $(BUILD)/fsroot.stamp $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/tcc_self_probe.elf $(BUILD)/tcc2_probe.elf programs/tcc_hello.c programs/tcc_printf_hello.c programs/tcc_printf.rsp programs/tcc_include/stdio.h $(TCC_BIN) $(TCC_SELF)/TCCSELF.I $(TCC_SELF)/BUILD.RSP $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(HYPER_DATA_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c PRINTF.RSP=programs/tcc_printf.rsp STDIO.H=programs/tcc_include/stdio.h SELFRUN.BIN=$(BUILD)/tcc_self_probe.elf TCC2RUN.BIN=$(BUILD)/tcc2_probe.elf TCCSELF.I=$(TCC_SELF)/TCCSELF.I BUILD.RSP=$(TCC_SELF)/BUILD.RSP CRT1.O=$(TCC_SELF)/lib/crt1.o CRTI.O=$(TCC_SELF)/lib/crti.o CRTN.O=$(TCC_SELF)/lib/crtn.o LIBC.A=$(TCC_SELF)/lib/libc.a LIBTCC1.A=$(TCC_SELF)/lib/libtcc1.a
 $(BUILD)/tinyos.img: esp tools/mkgptesp.py $(BUILD)/hyper_data.img
 	$(PYTHON) tools/mkgptesp.py $@ $(ESP) $(BUILD)/hyper_data.img
 

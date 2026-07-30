@@ -24,7 +24,7 @@ void demo_run(boot_info_t *bi) {
     uint32_t w, h; fb_get(&w, &h);
     if (!w || !h) { kputs("[demo] no framebuffer\n"); return; }
 
-    uint32_t *back = (uint32_t *)kmalloc((uint64_t)w * h * 4);
+    uint32_t *back = disp_back();
     if (!back) { kputs("[demo] back-buffer alloc failed\n"); return; }
 
     const uint8_t *asset = (const uint8_t *)(uintptr_t)bi->asset_base;
@@ -109,11 +109,10 @@ void demo_run(boot_info_t *bi) {
         hud_kv(back, 720, 28, "HVRSN ", (uint32_t)hvkbd_reason(), 0xFF66FF);
 
         /* ---- present + FPS bookkeeping ---- */
-        fb_present(back);
+        disp_present();
         fps_acc++;
         if (t - last >= 1000) { fps = fps_acc; fps_acc = 0; last = t; }
     }
 
-    kfree(back);
     kputs("[demo] exited\n");
 }

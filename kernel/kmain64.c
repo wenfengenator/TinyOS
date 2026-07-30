@@ -72,6 +72,7 @@ void kmain64(boot_info_t *bi) {
 
     kputs("[tinyos64] TINYOS X64 UEFI BOOT OK\n");
     arch_user_init();
+    if (disp_init() != 0) kputs("[disp] shared back buffer unavailable\n");
     login_run(bi);
     wm_run(bi);
 

@@ -16,11 +16,36 @@ static uint32_t  g_disk_sectors;
 static int       g_vblk;
 static int       g_stor;
 
+/* Read-ahead cache for the device-backed disks (virtio/StorVSC): one device
+ * transfer fills an 8-sector (4 KiB) window, so small sequential reads — TCC
+ * scanning a 2.5 MB libc.a in ~1 KB chunks — don't each pay a synchronous
+ * round trip.  Any write invalidates the covering line to stay coherent. */
+#define RC_W     8
+#define RC_LINES 16
+static uint8_t  g_rc[RC_LINES][RC_W * BLK];
+static uint32_t g_rc_base[RC_LINES];
+static int      g_rc_valid[RC_LINES];
+
 static int  blk_read(uint32_t lba, void *buf);
 static int  blk_write(uint32_t lba, const void *buf);
 static void blk_seed_if_blank(void);
 
+static void rc_reset(void) { for (int i = 0; i < RC_LINES; i++) g_rc_valid[i] = 0; }
+static void rc_invalidate(uint32_t lba) {
+    uint32_t base = (lba / RC_W) * RC_W;
+    int line = (int)((lba / RC_W) % RC_LINES);
+    if (g_rc_valid[line] && g_rc_base[line] == base) g_rc_valid[line] = 0;
+}
+/* fill one window straight from the device (never via the cache — no recursion) */
+static int rc_fill(uint32_t base, uint8_t *dst) {
+    if (g_stor) return storvsc_read_many(base, dst, RC_W);
+    for (uint32_t i = 0; i < RC_W; i++)
+        if (vblk_read(base + i, dst + (uint64_t)i * BLK) < 0) return -1;
+    return 0;
+}
+
 void blk_init(void) {
+    rc_reset();
     if (vblk_init())    { g_vblk = 1; return; }         /* virtio-blk (QEMU dev)     */
     if (storvsc_init()) { g_stor = 1; blk_seed_if_blank(); return; }  /* Hyper-V SCSI */
     uint32_t len   = (uint32_t)sizeof(fatfs_img);       /* RAM fallback              */
@@ -31,17 +56,41 @@ void blk_init(void) {
     g_disk_sectors = len / BLK;
 }
 static int blk_read(uint32_t lba, void *buf) {
-    if (g_vblk) return vblk_read(lba, buf);
-    if (g_stor) return storvsc_read(lba, buf);
+    if (g_stor || g_vblk) {
+        uint32_t base = (lba / RC_W) * RC_W;
+        int line = (int)((lba / RC_W) % RC_LINES);
+        if (!(g_rc_valid[line] && g_rc_base[line] == base)) {
+            if (rc_fill(base, g_rc[line]) < 0) {        /* e.g. window past disk end */
+                if (g_stor) return storvsc_read(lba, buf);
+                return vblk_read(lba, buf);
+            }
+            g_rc_base[line] = base; g_rc_valid[line] = 1;
+        }
+        memcpy(buf, g_rc[line] + (uint64_t)(lba - base) * BLK, BLK);
+        return 0;
+    }
     if (!g_disk || lba >= g_disk_sectors) return -1;
     memcpy(buf, g_disk + (uint64_t)lba * BLK, BLK);
     return 0;
 }
 static int blk_write(uint32_t lba, const void *buf) {
+    if (g_stor || g_vblk) rc_invalidate(lba);
     if (g_vblk) return vblk_write(lba, buf);
     if (g_stor) return storvsc_write(lba, buf);
     if (!g_disk || lba >= g_disk_sectors) return -1;
     memcpy(g_disk + (uint64_t)lba * BLK, buf, BLK);
+    return 0;
+}
+static int blk_write_many(uint32_t lba, const void *buf, uint32_t sectors) {
+    if (g_stor) {
+        for (uint32_t i = 0; i < sectors; i++) rc_invalidate(lba + i);
+        return storvsc_write_many(lba, buf, sectors);
+    }
+    static uint8_t io[BLK];
+    for (uint32_t i = 0; i < sectors; i++) {
+        memcpy(io, (const uint8_t *)buf + (uint64_t)i * BLK, BLK);
+        if (blk_write(lba + i, io) < 0) return -1;
+    }
     return 0;
 }
 
@@ -68,6 +117,24 @@ static int      f_mounted = 0;
 static uint8_t  f_spc, f_nfats;
 static uint16_t f_reserved, f_fatsz, f_root_entries, f_total;
 static uint32_t f_fat_start, f_root_start, f_root_sectors, f_data_start;
+static uint8_t  f_fat_cache[512];
+static uint32_t f_fat_cache_lba;
+static int      f_fat_cache_valid;
+static int      f_fat_cache_dirty;
+static uint16_t f_alloc_hint;
+
+/* forward-resume memo for fat_cluster_at: avoids re-walking a chain from its
+ * first cluster on every read of a large file (linking libc.a was O(n^2)). */
+static uint16_t f_walk_first;   /* memoized file's first cluster (0 = invalid) */
+static uint32_t f_walk_index;   /* cluster index last resolved */
+static uint16_t f_walk_cl;      /* cluster number at f_walk_index */
+
+/* read-side index->cluster cache: one full chain walk, then O(1) random seeks
+ * (TCC seeks around a 2.5MB libc.a). Invalidated on any chain mutation. */
+#define FAT_RCHAIN_MAX 65536
+static uint16_t *f_rchain;
+static uint16_t  f_rchain_first;   /* 0 = invalid */
+static uint32_t  f_rchain_len;
 
 static char lc(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 
@@ -75,6 +142,11 @@ int fat_mounted(void) { return f_mounted; }
 
 int fat_mount(void) {
     static uint8_t bs[512];
+    f_fat_cache_valid = 0;
+    f_fat_cache_dirty = 0;
+    f_alloc_hint = 2;
+    f_walk_first = 0;
+    f_rchain_first = 0;
     if (blk_read(0, bs) < 0) return -1;
     if (bs[510] != 0x55 || bs[511] != 0xAA) return -1;
     if (!(bs[11] == 0x00 && bs[12] == 0x02)) return -1;      /* 512 bytes/sector */
@@ -92,11 +164,29 @@ int fat_mount(void) {
     return 0;
 }
 
+static int fat_cache_flush(void) {
+    if (!f_fat_cache_valid || !f_fat_cache_dirty) return 0;
+    uint32_t index = f_fat_cache_lba - f_fat_start;
+    for (uint8_t fi = 0; fi < f_nfats; fi++)
+        if (blk_write(f_fat_start + (uint32_t)fi * f_fatsz + index, f_fat_cache) < 0)
+            return -1;
+    f_fat_cache_dirty = 0;
+    return 0;
+}
+
+static int fat_cache_load(uint32_t lba) {
+    if (f_fat_cache_valid && f_fat_cache_lba == lba) return 0;
+    if (fat_cache_flush() < 0 || blk_read(lba, f_fat_cache) < 0) return -1;
+    f_fat_cache_lba = lba;
+    f_fat_cache_valid = 1;
+    return 0;
+}
+
 static uint16_t fat_next(uint16_t c) {
     uint32_t off = (uint32_t)c * 2;
-    static uint8_t sb[512];
-    if (blk_read(f_fat_start + off / 512, sb) < 0) return 0xFFFF;
-    return sb[off % 512] | (sb[off % 512 + 1] << 8);
+    uint32_t lba = f_fat_start + off / 512;
+    if (fat_cache_load(lba) < 0) return 0xFFFF;
+    return f_fat_cache[off % 512] | (f_fat_cache[off % 512 + 1] << 8);
 }
 
 /* fetch the raw 32-byte directory slot #i of a directory (root if cluster==0) */
@@ -196,20 +286,24 @@ static uint32_t cluster_count(void) {
 
 static void fat_set(uint16_t c, uint16_t val) {
     uint32_t off = (uint32_t)c * 2;
-    static uint8_t sb[512];
-    for (uint8_t fi = 0; fi < f_nfats; fi++) {
-        uint32_t sec = f_fat_start + (uint32_t)fi * f_fatsz + off / 512;
-        if (blk_read(sec, sb) < 0) return;
-        sb[off % 512]     = (uint8_t)(val & 0xFF);
-        sb[off % 512 + 1] = (uint8_t)((val >> 8) & 0xFF);
-        blk_write(sec, sb);
-    }
+    if (fat_cache_load(f_fat_start + off / 512) < 0) return;
+    f_fat_cache[off % 512]     = (uint8_t)(val & 0xFF);
+    f_fat_cache[off % 512 + 1] = (uint8_t)(val >> 8);
+    f_fat_cache_dirty = 1;
+    f_walk_first = 0;                        /* chain changed: drop the walk memo */
+    f_rchain_first = 0;                      /* and the read chain cache */
 }
 
 static uint16_t fat_alloc(void) {
     uint32_t n = cluster_count();
-    for (uint16_t c = 2; c < n; c++)
-        if (fat_next(c) == 0x0000) { fat_set(c, 0xFFFF); return c; }
+    for (uint32_t i = 0; i < n - 2; i++) {
+        uint16_t c = (uint16_t)(2 + (f_alloc_hint - 2 + i) % (n - 2));
+        if (fat_next(c) != 0x0000) continue;
+        fat_set(c, 0xFFFF);
+        f_alloc_hint = (uint16_t)(c + 1);
+        if (f_alloc_hint >= n) f_alloc_hint = 2;
+        return c;
+    }
     return 0;
 }
 
@@ -296,8 +390,6 @@ int fat_write(const char *sub, const void *buf, uint32_t len) {
         }
         prev = c;
     }
-    if (prev) fat_set(prev, 0xFFFF);                               /* terminate chain */
-
     memset(e, 0, 32);
     for (int j = 0; j < 11; j++) e[j] = raw[j];
     e[11] = 0x20;                                                  /* archive attr */
@@ -305,6 +397,7 @@ int fat_write(const char *sub, const void *buf, uint32_t len) {
     e[28] = (uint8_t)(len & 0xFF);        e[29] = (uint8_t)((len >> 8) & 0xFF);
     e[30] = (uint8_t)((len >> 16) & 0xFF); e[31] = (uint8_t)((len >> 24) & 0xFF);
     uint32_t lba, off;
+    if (fat_cache_flush() < 0) return -1;
     if (dirent_loc(dir, slot, &lba, &off) < 0) return -1;
     if (blk_read(lba, sb) < 0) return -1;
     for (int j = 0; j < 32; j++) sb[off + j] = e[j];
@@ -331,9 +424,32 @@ static int fat_file_entry(const char *path, uint16_t *first, uint32_t *size,
 }
 
 static uint16_t fat_cluster_at(uint16_t first, uint32_t index) {
-    uint16_t cluster = first;
-    while (index-- && cluster >= 2 && cluster < 0xFFF8) cluster = fat_next(cluster);
+    uint16_t cluster; uint32_t i;
+    if (first == f_walk_first && f_walk_cl >= 2 && index >= f_walk_index) {
+        cluster = f_walk_cl; i = index - f_walk_index;   /* resume forward */
+    } else {
+        cluster = first; i = index;
+    }
+    while (i-- && cluster >= 2 && cluster < 0xFFF8) cluster = fat_next(cluster);
+    if (cluster >= 2 && cluster < 0xFFF8) {
+        f_walk_first = first; f_walk_index = index; f_walk_cl = cluster;
+    }
     return cluster;
+}
+
+/* O(1) cluster-at-index for reads: caches the whole chain of one file. */
+static uint16_t fat_locate(uint16_t first, uint32_t index) {
+    if (first < 2) return 0xFFFF;
+    if (first != f_rchain_first) {
+        if (!f_rchain) {
+            f_rchain = (uint16_t *)page_alloc((FAT_RCHAIN_MAX * 2 + 4095) / 4096);
+            if (!f_rchain) return fat_cluster_at(first, index);   /* no heap: fall back */
+        }
+        uint32_t n = 0; uint16_t c = first;
+        while (c >= 2 && c < 0xFFF8 && n < FAT_RCHAIN_MAX) { f_rchain[n++] = c; c = fat_next(c); }
+        f_rchain_first = first; f_rchain_len = n;
+    }
+    return index < f_rchain_len ? f_rchain[index] : 0xFFFF;
 }
 
 int fat_pread(const char *path, void *buf, uint32_t len, uint32_t offset) {
@@ -345,7 +461,7 @@ int fat_pread(const char *path, void *buf, uint32_t len, uint32_t offset) {
     if (len > size - offset) len = size - offset;
 
     uint32_t bpc = (uint32_t)f_spc * 512;
-    uint16_t cluster = fat_cluster_at(first, offset / bpc);
+    uint16_t cluster = fat_locate(first, offset / bpc);
     uint32_t within = offset % bpc, done = 0;
     static uint8_t sb[512];
     while (cluster >= 2 && cluster < 0xFFF8 && done < len) {
@@ -397,6 +513,7 @@ static int fat_zero_span(uint16_t first, uint32_t offset, uint32_t len) {
 
 static int fat_update_file_entry(uint32_t lba, uint32_t off, uint16_t first, uint32_t size) {
     static uint8_t sb[512];
+    if (fat_cache_flush() < 0) return -1;
     if (blk_read(lba, sb) < 0) return -1;
     sb[off + 26] = (uint8_t)first;
     sb[off + 27] = (uint8_t)(first >> 8);
@@ -420,7 +537,6 @@ int fat_truncate(const char *path, uint32_t new_size) {
         uint16_t cluster = fat_alloc();
         if (!cluster || fat_zero_cluster(cluster) < 0) return -1;
         if (old_count) fat_set(last, cluster); else first = cluster;
-        fat_set(cluster, 0xFFFF);
         last = cluster; old_count++;
     }
     if (new_count < old_count) {
@@ -455,9 +571,8 @@ int fat_pwrite(const char *path, const void *buf, uint32_t len, uint32_t offset)
     }
     while (have < need) {
         uint16_t cluster = fat_alloc();
-        if (!cluster || fat_zero_cluster(cluster) < 0) return -1;
+        if (!cluster) return -1;
         if (last >= 2) fat_set(last, cluster); else first = cluster;
-        fat_set(cluster, 0xFFFF);
         last = cluster; have++;
     }
     if (offset > size && fat_zero_span(first, size, offset - size) < 0) return -1;
@@ -466,6 +581,22 @@ int fat_pwrite(const char *path, const void *buf, uint32_t len, uint32_t offset)
     uint32_t within = offset % bpc, done = 0;
     static uint8_t sb[512];
     while (cluster >= 2 && cluster < 0xFFF8 && done < len) {
+        if (!within && f_spc == 1 && len - done >= 512) {
+            uint32_t run = 1, max = (len - done) / 512;
+            if (max > 8) max = 8;
+            uint16_t tail = cluster;
+            while (run < max) {
+                uint16_t next = fat_next(tail);
+                if (next != (uint16_t)(tail + 1)) break;
+                tail = next; run++;
+            }
+            uint32_t lba = f_data_start + (uint32_t)(cluster - 2);
+            if (blk_write_many(lba, (const uint8_t *)buf + done, run) < 0)
+                return done ? (int)done : -1;
+            done += run * 512;
+            cluster = fat_next(tail);
+            continue;
+        }
         uint32_t sector = within / 512;
         uint32_t byte = within % 512;
         for (; sector < f_spc && done < len; sector++, byte = 0) {
@@ -524,6 +655,7 @@ int fat_mkdir(const char *sub) {
     e[11] = 0x10;
     e[26] = (uint8_t)(nc & 0xFF); e[27] = (uint8_t)((nc >> 8) & 0xFF);
     uint32_t lba, off;
+    if (fat_cache_flush() < 0) return -1;
     if (dirent_loc(dir, slot, &lba, &off) < 0) return -1;
     if (blk_read(lba, sb) < 0) return -1;
     for (int j = 0; j < 32; j++) sb[off + j] = e[j];
@@ -547,6 +679,7 @@ int fat_unlink(const char *sub) {
         uint16_t cl = e[26] | (e[27] << 8);
         if (cl >= 2) fat_free_chain(cl);
         uint32_t lba, off;
+        if (fat_cache_flush() < 0) return -1;
         if (dirent_loc(dir, i, &lba, &off) < 0) return -1;
         static uint8_t sb[512];
         if (blk_read(lba, sb) < 0) return -1;

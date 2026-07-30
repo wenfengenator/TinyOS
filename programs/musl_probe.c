@@ -47,5 +47,10 @@ int main(void) {
         perror("close");
         return 1;
     }
-    return 0;
+
+    char *const child_argv[] = { (char *)"/exec.bin", (char *)"alpha", NULL };
+    char *const child_envp[] = { (char *)"TINYOS=1", NULL };
+    execve(child_argv[0], child_argv, child_envp);
+    perror("execve");
+    return 1;
 }

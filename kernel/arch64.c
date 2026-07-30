@@ -46,6 +46,7 @@ static struct tss64 g_tss;
 static uint8_t      g_kstack0[16384] __attribute__((aligned(16)));   /* TSS RSP0 (faults)     */
 static uint8_t      g_ksys0[16384]   __attribute__((aligned(16)));   /* SYSCALL kstack level 0 */
 static uint8_t      g_ksys1[16384]   __attribute__((aligned(16)));   /* SYSCALL kstack level 1 */
+static uint8_t      g_ksys2[16384]   __attribute__((aligned(16)));   /* execve replacement     */
 
 /* ---- IDT ---- */
 struct idt_entry {
@@ -63,6 +64,7 @@ static enum user_abi g_user_abi = USER_ABI_TINYOS;
 #define USER_CODE_VA    0x0000700000000000ULL
 #define USER_STK_TOP    0x0000700000100000ULL
 #define LINUX_LOAD_VA   0x0000000000400000ULL
+#define LINUX_LOAD_LIMIT 0x0000000000600000ULL
 #define LINUX_STK_TOP   0x00007FFFFFF00000ULL
 #define LINUX_BRK_BASE  0x0000500000000000ULL
 #define LINUX_BRK_LIMIT 0x0000500010000000ULL
@@ -70,6 +72,7 @@ static enum user_abi g_user_abi = USER_ABI_TINYOS;
 #define LINUX_MMAP_LIMIT 0x0000600100000000ULL
 #define USER_CODE_PAGES 16
 #define USER_STK_PAGES  4
+#define LINUX_LOAD_PAGES ((LINUX_LOAD_LIMIT - LINUX_LOAD_VA) / 4096)
 #define USER_ARG_OFF    (USER_CODE_PAGES * 4096 - 256)   /* argv[0] staged here */
 #define PTE_P   0x1
 #define PTE_RW  0x2
@@ -169,12 +172,29 @@ static int linux_clock_gettime(int clock_id, void *timespec);
 static int linux_getrandom(void *buf, uint32_t len, uint32_t flags);
 static int linux_writev(int fd, const void *iov, int count);
 static int linux_ioctl(int fd, uint64_t request, void *arg);
+struct linux_exec_args;
+static int linux_execve(const char *path, const char *const *argv,
+                        const char *const *envp);
+static int run_linux_path(const char *path, uint8_t *stk, uint8_t *kstack_top,
+                          const struct linux_exec_args *args);
 static int arch_user_run(const char *name, const uint8_t *img, uint64_t size,
                          const char *arg);
 
 static uint64_t g_linux_fs_base;
 static uint64_t g_linux_sigmask;
 static uint64_t g_linux_clear_tid;
+static uint64_t g_kernel_cr3;
+static uint8_t *g_linux_code;
+static uint8_t *g_linux_stk;
+static uint8_t *g_linux_kstack_top;
+
+#define LINUX_EXEC_MAX 8
+#define LINUX_EXEC_STR 128
+struct linux_exec_args {
+    int argc, envc;
+    char argv[LINUX_EXEC_MAX][LINUX_EXEC_STR];
+    char envp[LINUX_EXEC_MAX][LINUX_EXEC_STR];
+};
 
 static void write_fs_base(uint64_t base) {
     uint32_t lo = (uint32_t)base, hi = (uint32_t)(base >> 32);
@@ -226,6 +246,9 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
         case 39:                            /* getpid                     */
         case 186:                           /* gettid                     */
             return (uint64_t)g_cur_pid;
+        case 59:                            /* execve                     */
+            return (uint64_t)(int64_t)linux_execve((const char *)a0,
+                (const char *const *)a1, (const char *const *)a2);
         case 77:                            /* ftruncate                  */
             return (uint64_t)(int64_t)linux_ftruncate((int)a0, a1);
         case 79:                            /* getcwd                     */
@@ -874,9 +897,10 @@ static int linux_munmap(uint64_t addr, uint64_t len) {
     return 0;
 }
 
-static uint64_t *linux_address_space(const uint64_t code_pte[USER_CODE_PAGES],
-                                     uint8_t *code, uint8_t *stk) {
-    uint64_t *current = (uint64_t *)(read_cr3() & ~0xFFFULL);
+static uint64_t *linux_address_space(const uint64_t code_pte[LINUX_LOAD_PAGES],
+                                     uint8_t *code, uint64_t code_pages,
+                                     uint8_t *stk) {
+    uint64_t *current = (uint64_t *)g_kernel_cr3;
     uint64_t *pml4 = copy_page_table(current);
     if (!pml4) return 0;
 
@@ -895,9 +919,9 @@ static uint64_t *linux_address_space(const uint64_t code_pte[USER_CODE_PAGES],
     pdpt[l3] = make_table_entry(pd);
     pd[l2] = make_table_entry(code_pt);
     int code_index = (int)((LINUX_LOAD_VA >> 12) & 0x1FF);
-    for (int i = 0; i < USER_CODE_PAGES; i++) {
+    for (uint64_t i = 0; i < code_pages; i++) {
         if (code_pte[i])
-            code_pt[code_index + i] = (uint64_t)(code + (uint64_t)i * 4096) | code_pte[i];
+            code_pt[code_index + i] = (uint64_t)(code + i * 4096) | code_pte[i];
     }
 
     int s4 = (int)((LINUX_STK_TOP >> 39) & 0x1FF);
@@ -922,10 +946,10 @@ static uint64_t *linux_address_space(const uint64_t code_pte[USER_CODE_PAGES],
 }
 
 static int run_linux_elf_frames(const uint8_t *img, uint64_t size,
-                                uint8_t *code, uint8_t *stk, uint8_t *kstack_top) {
+                                uint8_t *stk, uint8_t *kstack_top,
+                                const struct linux_exec_args *args) {
     const struct elf64_ehdr *eh = (const struct elf64_ehdr *)img;
-    uint64_t cap = (uint64_t)USER_CODE_PAGES * 4096;
-    if (!code || !stk || size < sizeof(*eh)) return -1;
+    if (!stk || size < sizeof(*eh)) return -1;
     if (eh->ident[0] != 0x7F || eh->ident[1] != 'E' || eh->ident[2] != 'L' ||
         eh->ident[3] != 'F' || eh->ident[4] != 2 || eh->ident[5] != 1 ||
         eh->type != 2 || eh->machine != 62 || eh->version != 1 ||
@@ -933,17 +957,27 @@ static int run_linux_elf_frames(const uint8_t *img, uint64_t size,
         eh->phoff > size || (uint64_t)eh->phnum > (size - eh->phoff) / eh->phentsize)
         return -2;
 
-    memset(code, 0, cap);
-    uint64_t code_pte[USER_CODE_PAGES];
-    for (int i = 0; i < USER_CODE_PAGES; i++) code_pte[i] = 0;
+    uint64_t max_end = LINUX_LOAD_VA;
     const struct elf64_phdr *ph = (const struct elf64_phdr *)(img + eh->phoff);
-    int loads = 0; uint64_t phdr_addr = 0;
+    int loads = 0;
     for (uint16_t i = 0; i < eh->phnum; i++) {
         if (ph[i].type != 1) continue;
         if (ph[i].filesz > ph[i].memsz || ph[i].offset > size ||
             ph[i].filesz > size - ph[i].offset || ph[i].vaddr < LINUX_LOAD_VA ||
-            ph[i].memsz > cap || ph[i].vaddr - LINUX_LOAD_VA > cap - ph[i].memsz)
+            ph[i].memsz > LINUX_LOAD_LIMIT - LINUX_LOAD_VA ||
+            ph[i].vaddr - LINUX_LOAD_VA > LINUX_LOAD_LIMIT - LINUX_LOAD_VA - ph[i].memsz)
             return -3;
+        if (ph[i].vaddr + ph[i].memsz > max_end) max_end = ph[i].vaddr + ph[i].memsz;
+        loads++;
+    }
+    uint64_t code_pages = page_up(max_end - LINUX_LOAD_VA) / 4096;
+    uint8_t *code = (uint8_t *)page_alloc(code_pages);
+    if (!loads || !code) return -5;
+    uint64_t code_pte[LINUX_LOAD_PAGES];
+    for (uint64_t i = 0; i < LINUX_LOAD_PAGES; i++) code_pte[i] = 0;
+    uint64_t phdr_addr = 0;
+    for (uint16_t i = 0; i < eh->phnum; i++) {
+        if (ph[i].type != 1) continue;
         uint64_t dst = ph[i].vaddr - LINUX_LOAD_VA;
         for (uint64_t j = 0; j < ph[i].filesz; j++) code[dst + j] = img[ph[i].offset + j];
         uint64_t first_page = dst / 4096;
@@ -953,45 +987,70 @@ static int run_linux_elf_frames(const uint8_t *img, uint64_t size,
         if (eh->phoff >= ph[i].offset &&
             eh->phoff + (uint64_t)eh->phnum * eh->phentsize <= ph[i].offset + ph[i].filesz)
             phdr_addr = ph[i].vaddr + eh->phoff - ph[i].offset;
-        loads++;
     }
-    if (!loads || !phdr_addr || eh->entry < LINUX_LOAD_VA || eh->entry >= LINUX_LOAD_VA + cap) return -4;
+    if (!phdr_addr || eh->entry < LINUX_LOAD_VA || eh->entry >= max_end) return -4;
 
-    uint64_t *process_pml4 = linux_address_space(code_pte, code, stk);
+    uint64_t *process_pml4 = linux_address_space(code_pte, code, code_pages, stk);
     if (!process_pml4) return -5;
-    const char argv0[] = "linux-abi-selftest";
-    uint64_t argp = LINUX_STK_TOP - sizeof(argv0);
-    char *arg = (char *)(stk + 4096 - sizeof(argv0));
-    for (unsigned i = 0; i < sizeof(argv0); i++) arg[i] = argv0[i];
-    uint64_t randomp = (argp & ~15ULL) - 16;
+
+    static const char default_argv0[] = "linux-abi-selftest";
+    uint64_t cursor = LINUX_STK_TOP;
+    uint64_t argv_ptr[LINUX_EXEC_MAX], envp_ptr[LINUX_EXEC_MAX];
+    int argc = args ? args->argc : 1;
+    int envc = args ? args->envc : 0;
+    for (int i = envc - 1; i >= 0; i--) {
+        uint64_t len = 1; while (args->envp[i][len - 1]) len++;
+        cursor -= len;
+        memcpy(stk + 4096 - (LINUX_STK_TOP - cursor), args->envp[i], len);
+        envp_ptr[i] = cursor;
+    }
+    for (int i = argc - 1; i >= 0; i--) {
+        const char *src = args ? args->argv[i] : default_argv0;
+        uint64_t len = 1; while (src[len - 1]) len++;
+        cursor -= len;
+        memcpy(stk + 4096 - (LINUX_STK_TOP - cursor), src, len);
+        argv_ptr[i] = cursor;
+    }
+    uint64_t randomp = (cursor & ~15ULL) - 16;
     uint8_t *random_bytes = stk + 4096 - (LINUX_STK_TOP - randomp);
     uint64_t random0 = linux_random_state(), random1 = linux_random_state();
     for (int i = 0; i < 8; i++) {
         random_bytes[i] = (uint8_t)(random0 >> (i * 8));
         random_bytes[8 + i] = (uint8_t)(random1 >> (i * 8));
     }
-    uint64_t rsp = randomp - 30 * sizeof(uint64_t);
+    uint64_t words = (uint64_t)(1 + argc + 1 + envc + 1 + 26);
+    uint64_t rsp = (randomp - words * sizeof(uint64_t)) & ~15ULL;
     uint64_t *sp = (uint64_t *)(stk + 4096 - (LINUX_STK_TOP - rsp));
-    sp[0] = 1; sp[1] = argp; sp[2] = 0;       /* argc, argv, argv terminator */
-    sp[3] = 0;                                /* envp terminator             */
-    sp[4] = 3;  sp[5] = phdr_addr;            /* AT_PHDR                      */
-    sp[6] = 4;  sp[7] = eh->phentsize;        /* AT_PHENT                     */
-    sp[8] = 5;  sp[9] = eh->phnum;            /* AT_PHNUM                     */
-    sp[10] = 6; sp[11] = 4096;                /* AT_PAGESZ                    */
-    sp[12] = 9; sp[13] = eh->entry;           /* AT_ENTRY                     */
-    sp[14] = 11; sp[15] = 0;                  /* AT_UID                       */
-    sp[16] = 12; sp[17] = 0;                  /* AT_EUID                      */
-    sp[18] = 13; sp[19] = 0;                  /* AT_GID                       */
-    sp[20] = 14; sp[21] = 0;                  /* AT_EGID                      */
-    sp[22] = 23; sp[23] = 0;                  /* AT_SECURE                    */
-    sp[24] = 25; sp[25] = randomp;            /* AT_RANDOM                    */
-    sp[26] = 31; sp[27] = argp;               /* AT_EXECFN                    */
-    sp[28] = 0; sp[29] = 0;                   /* AT_NULL                      */
+    uint64_t n = 0;
+    sp[n++] = (uint64_t)argc;
+    for (int i = 0; i < argc; i++) sp[n++] = argv_ptr[i];
+    sp[n++] = 0;
+    for (int i = 0; i < envc; i++) sp[n++] = envp_ptr[i];
+    sp[n++] = 0;
+    sp[n++] = 3;  sp[n++] = phdr_addr;         /* AT_PHDR                      */
+    sp[n++] = 4;  sp[n++] = eh->phentsize;     /* AT_PHENT                     */
+    sp[n++] = 5;  sp[n++] = eh->phnum;         /* AT_PHNUM                     */
+    sp[n++] = 6;  sp[n++] = 4096;              /* AT_PAGESZ                    */
+    sp[n++] = 9;  sp[n++] = eh->entry;         /* AT_ENTRY                     */
+    sp[n++] = 11; sp[n++] = 0;                 /* AT_UID                       */
+    sp[n++] = 12; sp[n++] = 0;                 /* AT_EUID                      */
+    sp[n++] = 13; sp[n++] = 0;                 /* AT_GID                       */
+    sp[n++] = 14; sp[n++] = 0;                 /* AT_EGID                      */
+    sp[n++] = 23; sp[n++] = 0;                 /* AT_SECURE                    */
+    sp[n++] = 25; sp[n++] = randomp;           /* AT_RANDOM                    */
+    sp[n++] = 31; sp[n++] = argv_ptr[0];       /* AT_EXECFN                    */
+    sp[n++] = 0;  sp[n++] = 0;                 /* AT_NULL                      */
 
     enum user_abi saved_abi = g_user_abi;
     int saved_exit = g_user_exit_code;
+    uint8_t *saved_code = g_linux_code;
+    uint8_t *saved_stk = g_linux_stk;
+    uint8_t *saved_kstack_top = g_linux_kstack_top;
     g_user_abi = USER_ABI_LINUX;
     g_user_exit_code = 0;
+    g_linux_code = code;
+    g_linux_stk = stk;
+    g_linux_kstack_top = kstack_top;
     g_linux_vm.pml4 = process_pml4;
     g_linux_vm.brk = LINUX_BRK_BASE;
     g_linux_vm.mmap_next = LINUX_MMAP_BASE;
@@ -1007,14 +1066,17 @@ static int run_linux_elf_frames(const uint8_t *img, uint64_t size,
     int exit_code = g_user_exit_code;
     write_fs_base(0);
     g_linux_vm.pml4 = 0;
+    g_linux_code = saved_code;
+    g_linux_stk = saved_stk;
+    g_linux_kstack_top = saved_kstack_top;
     g_user_exit_code = saved_exit;
     g_user_abi = saved_abi;
     return exit_code;
 }
 
 static int run_linux_elf(const uint8_t *img, uint64_t size) {
-    return run_linux_elf_frames(img, size, g_ucode, g_ustk,
-                                g_ksys0 + sizeof(g_ksys0));
+    return run_linux_elf_frames(img, size, g_ustk,
+                                g_ksys0 + sizeof(g_ksys0), 0);
 }
 
 void arch_user_init(void) {
@@ -1023,6 +1085,7 @@ void arch_user_init(void) {
     if (!g_ucode || !g_ustk || !g_ccode || !g_cstk) { kputs("[user] region alloc failed\n"); g_ucode = 0; return; }
 
     uint64_t pml4 = read_cr3() & ~0xFFFULL;
+    g_kernel_cr3 = pml4;
     uint64_t cr0  = wp_disable();
     for (int i = 0; i < USER_CODE_PAGES; i++)
         map_user_page(pml4, USER_CODE_VA + (uint64_t)i * 4096, (uint64_t)(g_ucode + i * 4096), PTE_RW | PTE_US);
@@ -1129,8 +1192,8 @@ static int find_prog(const char *name) {
     return -1;
 }
 
-static int run_linux_path(const char *path, uint8_t *code, uint8_t *stk,
-                          uint8_t *kstack_top) {
+static int run_linux_path(const char *path, uint8_t *stk,
+                          uint8_t *kstack_top, const struct linux_exec_args *args) {
     char full[80];
     while (path[0] == '.' && path[1] == '/') path += 2;
     fs_resolve(path, full);
@@ -1145,9 +1208,50 @@ static int run_linux_path(const char *path, uint8_t *code, uint8_t *stk,
     if (!image) return -5;
     int read = fat_read(cluster, size, image, size);
     int result = read == (int)size
-        ? run_linux_elf_frames(image, size, code, stk, kstack_top) : -1;
+        ? run_linux_elf_frames(image, size, stk, kstack_top, args) : -1;
     kfree(image);
     return result;
+}
+
+static int linux_execve(const char *path, const char *const *argv,
+                        const char *const *envp) {
+    if (!path || !g_linux_code || !g_linux_stk || !g_linux_kstack_top) return -14;
+    struct linux_exec_args args;
+    args.argc = args.envc = 0;
+    if (argv) {
+        while (args.argc < LINUX_EXEC_MAX && argv[args.argc]) {
+            int j = 0;
+            while (argv[args.argc][j] && j < LINUX_EXEC_STR - 1) {
+                args.argv[args.argc][j] = argv[args.argc][j]; j++;
+            }
+            if (argv[args.argc][j]) return -7;
+            args.argv[args.argc][j] = 0; args.argc++;
+        }
+        if (args.argc == LINUX_EXEC_MAX && argv[args.argc]) return -7;
+    }
+    if (!args.argc) {
+        int j = 0;
+        while (path[j] && j < LINUX_EXEC_STR - 1) { args.argv[0][j] = path[j]; j++; }
+        if (path[j]) return -7;
+        args.argv[0][j] = 0; args.argc = 1;
+    }
+    if (envp) {
+        while (args.envc < LINUX_EXEC_MAX && envp[args.envc]) {
+            int j = 0;
+            while (envp[args.envc][j] && j < LINUX_EXEC_STR - 1) {
+                args.envp[args.envc][j] = envp[args.envc][j]; j++;
+            }
+            if (envp[args.envc][j]) return -7;
+            args.envp[args.envc][j] = 0; args.envc++;
+        }
+        if (args.envc == LINUX_EXEC_MAX && envp[args.envc]) return -7;
+    }
+    int result = run_linux_path(path, g_linux_stk,
+                                g_ksys2 + sizeof(g_ksys2), &args);
+    if (result < 0) return result;
+    g_user_exit_code = result;
+    sys_exit_resume();
+    return 0;
 }
 
 int arch_user_run_named(const char *name, const char *arg) {
@@ -1157,7 +1261,8 @@ int arch_user_run_named(const char *name, const char *arg) {
     }
     int idx = find_prog(name);
     if (idx < 0)
-        return run_linux_path(name, g_ucode, g_ustk, g_ksys0 + sizeof(g_ksys0));
+        return run_linux_path(name, g_ustk,
+                              g_ksys0 + sizeof(g_ksys0), 0);
     return arch_user_run(g_uprogs[idx].name, g_uprogs[idx].img, g_uprogs[idx].size, arg);
 }
 
@@ -1177,8 +1282,24 @@ static int arch_exec_named(const char *name, const char *arg) {
     if (idx >= 0)
         ec = run_prog(g_uprogs[idx].name, g_uprogs[idx].img, g_uprogs[idx].size,
                       g_ccode, g_cstk, g_ksys1 + sizeof(g_ksys1), arg);
-    else
-        ec = run_linux_path(name, g_ccode, g_cstk, g_ksys1 + sizeof(g_ksys1));
+    else {
+        /* Linux ELF: split the shell arg string into argv[1..] so a real command
+         * line like `./tcc.bin -static a.c -o a.bin` reaches the program. */
+        static struct linux_exec_args ea;   /* non-reentrant: g_depth guards it */
+        ea.argc = 0; ea.envc = 0;
+        int k = 0;
+        while (name[k] && k < LINUX_EXEC_STR - 1) { ea.argv[0][k] = name[k]; k++; }
+        ea.argv[0][k] = 0; ea.argc = 1;
+        for (const char *p = arg; p && *p && ea.argc < LINUX_EXEC_MAX; ) {
+            while (*p == ' ') p++;
+            if (!*p) break;
+            int m = 0;
+            while (*p && *p != ' ' && m < LINUX_EXEC_STR - 1) ea.argv[ea.argc][m++] = *p++;
+            ea.argv[ea.argc][m] = 0; ea.argc++;
+            while (*p && *p != ' ') p++;                 /* drop an overlong token's tail */
+        }
+        ec = run_linux_path(name, g_cstk, g_ksys1 + sizeof(g_ksys1), &ea);
+    }
     map_region(g_ucode, g_ustk);               /* remap the window back to the parent */
     arch_set_syscall_stack((uint64_t)(g_ksys0 + sizeof(g_ksys0)));
     g_depth = 0;

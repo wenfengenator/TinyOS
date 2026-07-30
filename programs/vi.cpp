@@ -115,6 +115,7 @@ extern "C" int umain(const char *arg) {
             else if (k == sys::KEY_DOWN)  { if (cy < nlines - 1) { cy++; if (cx > len[cy]) cx = len[cy]; } }
             else if (k == sys::KEY_HOME)  cx = 0;
             else if (k == sys::KEY_END)   cx = len[cy];
+            else if (k == '\t') { int n = 4 - (cx & 3); while (n-- > 0) ins_char(' '); }  // soft tab -> spaces
             else if (k >= 32 && k < 127) ins_char((char)k);
         } else {
             if (k == 'h' || k == sys::KEY_LEFT) { if (cx > 0) cx--; }

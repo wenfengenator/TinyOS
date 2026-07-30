@@ -179,7 +179,7 @@ void wm_pump(void) {
     if (t - pump_last < 33) return;
     pump_last = t;
     compositor(g_back);
-    fb_present(g_back);
+    disp_present();
 }
 
 void wm_run(boot_info_t *bi) {
@@ -193,7 +193,8 @@ void wm_run(boot_info_t *bi) {
     g_taskh  = g_cell + 10;
     g_lineh  = g_cell + g_cell / 2;
 
-    g_back = (uint32_t *)kmalloc((uint64_t)g_scr_w * g_scr_h * 4);
+    disp_init();
+    g_back = disp_back();
     if (!g_back) { kputs("[wm] back-buffer alloc failed\n"); return; }
 
     setup_windows(bi);
@@ -232,7 +233,7 @@ void wm_run(boot_info_t *bi) {
         last_frame = t;
 
         compositor(g_back);
-        fb_present(g_back);
+        disp_present();
 
         acc++;
         if (t - last >= 1000) { g_fps = acc; acc = 0; last = t; }

@@ -40,7 +40,7 @@ void pong_run(boot_info_t *bi) {
     uint32_t w, h; fb_get(&w, &h);
     if (!w || !h) { kputs("[pong] no framebuffer\n"); return; }
 
-    uint32_t *back = (uint32_t *)kmalloc((uint64_t)w * h * 4);
+    uint32_t *back = disp_back();
     if (!back) { kputs("[pong] back-buffer alloc failed\n"); return; }
 
     const uint32_t BG_RGB = 0x001018;
@@ -118,11 +118,10 @@ void pong_run(boot_info_t *bi) {
         fb_text_to(back, 8, 4, "TINYOS PONG   UP/DOWN OR W/S = MOVE   Q/ESC = QUIT", 0x00FF88, BG_RGB);
         draw_num(back, (uint32_t)w - 64, 4, fps, 0xFFFF00, BG_RGB);
 
-        fb_present(back);
+        disp_present();
         fps_acc++;
         if (t - last >= 1000) { fps = fps_acc; fps_acc = 0; last = t; }
     }
 
-    kfree(back);
     kputs("[pong] exited\n");
 }

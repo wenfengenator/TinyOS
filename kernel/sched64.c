@@ -159,7 +159,7 @@ static void put_u64(char *b, uint64_t v) {
 void sched_demo(void) {
     uint32_t w, h; fb_get(&w, &h);
     if (!w || !h) return;
-    uint32_t *back = (uint32_t *)kmalloc((uint64_t)w * h * 4);
+    uint32_t *back = disp_back();
     if (!back) return;
 
     const int NW = 4;                                   /* worker threads */
@@ -194,7 +194,7 @@ void sched_demo(void) {
                 for (uint32_t xx = 0; xx < bw; xx++) row[xx] = barc;
             }
         }
-        fb_present(back);
+        disp_present();
 
         int k = kbd64_getkey();
         if (k < 0) k = hvkbd_getkey();
@@ -202,5 +202,4 @@ void sched_demo(void) {
     }
 
     sched_stop();
-    kfree(back);
 }
