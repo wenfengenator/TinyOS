@@ -150,7 +150,6 @@ uint64_t smp_lapic_base(void);     /* Local APIC MMIO base (from ACPI MADT)     
 int      vblk_init(void);                    /* 1 if a virtio-blk device is present */
 int      vblk_read(uint32_t lba, void *buf);         /* one 512-byte sector          */
 int      vblk_write(uint32_t lba, const void *buf);
-
 /* ---- VMBus primitives shared by synthetic drivers (kernel/vmbus64.c) ---- */
 int      vmbus_ready(void);                   /* VMBus connected + offers enumerated */
 void    *vmbus_palloc(unsigned pages);
@@ -170,6 +169,46 @@ int      storvsc_stage(void);                 /* bring-up progress 0..12 (diagno
 int      storvsc_diag(void);                  /* last I/O (status<<16|srb<<8|scsi); ~0=timeout */
 int      storvsc_ver(void);                   /* negotiated vstor protocol version (e.g. 0x0602) */
 int      storvsc_blksz(void);                 /* disk block size from READ CAPACITY (want 512) */
+
+/* virtio-net NIC (Cycle 8 N1): raw Ethernet frame transport for the TCP/IP stack */
+int      vnet_init(void);                     /* 1 if a virtio-net device is present */
+void     vnet_mac(uint8_t out[6]);            /* our MAC address                     */
+int      vnet_tx(const void *frame, uint32_t len);    /* send one Ethernet frame     */
+int      vnet_rx(void *buf, uint32_t max);            /* recv one frame, 0 if none    */
+int      vnet_selftest(void);                 /* N1 gate: ARP round-trip (0 = ok)    */
+
+/* Hyper-V synthetic NIC (netvsc + RNDIS over VMBus; kernel/drivers/netvsc64.c) */
+int      netvsc_init(void);                   /* 1 if a Hyper-V NIC came up          */
+void     netvsc_mac(uint8_t out[6]);
+int      netvsc_tx(const void *frame, uint32_t len);
+int      netvsc_rx(void *buf, uint32_t max);
+int      netvsc_stage(void);                  /* bring-up progress 1..9 (diagnostic) */
+int      netvsc_diag(void);
+
+int      nic_init(void);                      /* bring up a NIC (virtio or netvsc)   */
+
+/* minimal TCP/IP stack (Cycle 8 N2): ARP/IPv4/ICMP/UDP/DNS over virtio-net */
+int      net_init(void);                      /* bind to the NIC (MAC, addressing)   */
+int      net_selftest(void);                  /* N2 gate: ping gateway + DNS (0 = ok) */
+uint32_t net_local_ip(void);                  /* our IPv4 address (host order)        */
+uint32_t net_resolve(const char *name);       /* DNS A-record lookup (host order, 0=fail) */
+int      net_ip_send(uint32_t dst, uint8_t proto, const void *payload, int plen);
+int      net_ping(uint32_t dst, uint32_t *rtt_us); /* one ICMP echo; 0=reply (rtt in us), -1=timeout */
+void     net_ifconfig(uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns, uint8_t *mac, int *up);
+void     net_setcfg(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns); /* static IP config */
+int      net_poll(void);                      /* service one RX/loopback packet       */
+void     net_drain(void);                     /* drain the RX backlog (busy-network robustness) */
+
+/* TCP (Cycle 8 N3): connection-oriented transport + the socket engine */
+void     tcp_input(uint32_t src, const uint8_t *seg, int len);
+int      tcp_selftest(void);                  /* N3 gate: loopback connect/data/close */
+int      tcp_connect(uint32_t dst, uint16_t dport);   /* active open; TCB index or -1 */
+int      tcp_listen(uint16_t port);                   /* passive open; listener index  */
+int      tcp_accept(int lidx);                        /* next established child, or -1  */
+int      tcp_send(int idx, const void *data, int len);
+int      tcp_recv(int idx, void *buf, int max);       /* bytes, 0 = EOF, -1 = error     */
+int      tcp_close(int idx);
+void     tcp_peer(int idx, uint32_t *ip, uint16_t *port);   /* remote endpoint of a TCB  */
 
 /* ---- Hyper-V VMBus synthetic keyboard (kernel/vmbus64.c) ---- */
 int      hvkbd_init(void);         /* -> 1 if the Hyper-V keyboard channel is opened */

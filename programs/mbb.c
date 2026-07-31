@@ -10,6 +10,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -19,7 +21,11 @@
 #include <time.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "tinygl.h"        /* TinyGL client library (the UMD under test) */
+#include "tnet.h"          /* kernel DNS resolver + ICMP echo helpers */
 
 extern char **environ;
 
@@ -531,6 +537,301 @@ static int ap_vi(int argc, char **argv) {
 static int run_shell(int argc, char **argv);
 static int ap_help(int argc, char **argv);
 
+/* ---- net: ping + a tiny text-mode web browser ---------------------------- */
+/* case-insensitive prefix compare: 0 when a[0..n) equals b[0..n) */
+static int ncase(const char *a, const char *b, int n) {
+    for (int i = 0; i < n; i++) { int ca = tolower((unsigned char)a[i]), cb = tolower((unsigned char)b[i]); if (ca != cb) return 1; if (!ca) return 0; }
+    return 0;
+}
+static int starts(const char *s, const char *pfx) { return ncase(s, pfx, (int)strlen(pfx)) == 0; }
+
+/* dotted-quad literal or DNS name -> IPv4 in host order (0 on failure) */
+static uint32_t resolve_host(const char *h) {
+    uint32_t lit = ntohl(inet_addr(h));
+    if (lit != 0xFFFFFFFFu && lit != 0) return lit;
+    return net_resolve(h);
+}
+static void put_ip(int fd, uint32_t ip) {
+    outnum(fd, (ip >> 24) & 255); write(fd, ".", 1); outnum(fd, (ip >> 16) & 255); write(fd, ".", 1);
+    outnum(fd, (ip >> 8) & 255);  write(fd, ".", 1); outnum(fd, ip & 255);
+}
+static void put_hex2(int fd, unsigned v) {
+    static const char h[] = "0123456789abcdef";
+    char b[2] = { h[(v >> 4) & 15], h[v & 15] }; write(fd, b, 2);
+}
+
+/* ping [-c count] host  — ICMP echo via the kernel (NET_SYS_PING). */
+static int ap_ping(int argc, char **argv) {
+    int count = 4, i = 1;
+    for (; i < argc && argv[i][0] == '-'; i++)
+        if (!strcmp(argv[i], "-c") && i + 1 < argc) { count = atoi(argv[++i]); if (count <= 0) count = 4; }
+    if (i >= argc) { outs(2, "usage: ping [-c count] host\n"); return 2; }
+    const char *host = argv[i];
+    uint32_t ip = resolve_host(host);
+    if (!ip) { outs(2, "ping: cannot resolve "); outs(2, host); outs(2, "\n"); return 1; }
+    out1("PING "); out1(host); out1(" ("); put_ip(1, ip); out1(")\n");
+    int rx = 0;
+    for (int s = 1; s <= count; s++) {
+        long us = net_ping(ip);
+        if (us >= 0) {
+            rx++;
+            out1("reply from "); put_ip(1, ip); out1(": seq="); outnum(1, s);
+            out1(" time="); outnum(1, us / 1000); write(1, ".", 1); outnum(1, (us % 1000) / 100); out1(" ms\n");
+        } else { out1("request timeout: seq="); outnum(1, s); write(1, "\n", 1); }
+        if (s < count) { struct timespec ts = { 1, 0 }; nanosleep(&ts, 0); }
+    }
+    out1("--- "); out1(host); out1(" ping statistics ---\n");
+    outnum(1, count); out1(" transmitted, "); outnum(1, rx); out1(" received\n");
+    return rx > 0 ? 0 : 1;
+}
+
+/* ifconfig [ip mask gw [dns]] — show, or set a static interface config. */
+static int ap_ifconfig(int argc, char **argv) {
+    if (argc >= 4) {                                  /* static config from dotted-quad args */
+        uint32_t ip = ntohl(inet_addr(argv[1])), mask = ntohl(inet_addr(argv[2]));
+        uint32_t gw = ntohl(inet_addr(argv[3])), dns = argc > 4 ? ntohl(inet_addr(argv[4])) : gw;
+        if (net_setcfg(ip, mask, gw, dns) != 0) { outs(2, "ifconfig: set failed\n"); return 1; }
+    }
+    struct tnet_ifcfg c;
+    if (net_ifconfig(&c) != 0) { outs(2, "ifconfig: network unavailable\n"); return 1; }
+    out1("eth0      Link encap:Ethernet  HWaddr ");
+    for (int i = 0; i < 6; i++) { if (i) write(1, ":", 1); put_hex2(1, c.mac[i]); }
+    write(1, "\n", 1);
+    out1("          inet "); put_ip(1, c.ip); out1("  netmask "); put_ip(1, c.mask);
+    out1("  gateway "); put_ip(1, c.gw); write(1, "\n", 1);
+    out1("          dns "); put_ip(1, c.dns); out1("  MTU 1500  status ");
+    out1(c.up ? "UP\n" : "DOWN\n");
+    out1("lo        Link encap:Local Loopback\n");
+    out1("          inet 127.0.0.1  netmask 255.0.0.0  status UP\n");
+    return 0;
+}
+
+/* --- text web browser: fetch HTTP and render HTML as flowing text --- */
+#define WEB_CAP  (128 * 1024)
+#define WEB_MAXL 128
+#define WEB_URLM 512
+static char web_buf[WEB_CAP];
+static char web_host[256];
+static int  web_port;
+static char web_path[WEB_URLM];
+static char web_links[WEB_MAXL][WEB_URLM];
+static int  web_nlink;
+static int  web_pnl, web_psp;          /* pending newlines / pending space (whitespace collapse) */
+
+static void web_emit(char c) {
+    if (c == '\n') { if (web_pnl < 2) web_pnl++; web_psp = 0; return; }
+    if (c == ' ' || c == '\t' || c == '\r') { web_psp = 1; return; }
+    while (web_pnl > 0) { write(1, "\n", 1); web_pnl--; }
+    if (web_psp) { write(1, " ", 1); web_psp = 0; }
+    write(1, &c, 1);
+}
+static void web_emits(const char *s) { while (*s) web_emit(*s++); }
+
+static int web_is_block(const char *n) {
+    static const char *b[] = { "p", "br", "div", "li", "tr", "ul", "ol", "hr", "h1", "h2", "h3", "h4",
+                               "h5", "h6", "table", "thead", "tbody", "section", "article", "header",
+                               "footer", "nav", "blockquote", "pre", "form", "dl", "dt", "dd", 0 };
+    for (int i = 0; b[i]; i++) if (!strcmp(n, b[i])) return 1;
+    return 0;
+}
+static void web_entity(const char *e) {
+    static const struct { const char *k, *v; } t[] = {
+        { "amp", "&" }, { "lt", "<" }, { "gt", ">" }, { "quot", "\"" }, { "apos", "'" },
+        { "nbsp", " " }, { "copy", "(c)" }, { "reg", "(r)" }, { "trade", "(tm)" }, { "mdash", "--" },
+        { "ndash", "-" }, { "hellip", "..." }, { "raquo", ">>" }, { "laquo", "<<" }, { "middot", "*" }, { 0, 0 } };
+    if (e[0] == '#') {                                     /* numeric entity */
+        long cp = (e[1] == 'x' || e[1] == 'X') ? strtol(e + 2, 0, 16) : atol(e + 1);
+        if (cp >= 32 && cp < 127) web_emit((char)cp);
+        else if (cp == 160) web_emit(' ');
+        else web_emit('?');
+        return;
+    }
+    for (int i = 0; t[i].k; i++) if (!strcmp(e, t[i].k)) { web_emits(t[i].v); return; }
+    web_emit('&'); web_emits(e); web_emit(';');           /* unknown: leave literal */
+}
+/* extract attribute `name`'s value from the tag body [s,end); 1 if found */
+static int web_attr(const char *s, const char *end, const char *name, char *out, int cap) {
+    int nl = (int)strlen(name);
+    for (const char *p = s; p + nl < end; p++) {
+        if ((p == s || !isalnum((unsigned char)p[-1])) && ncase(p, name, nl) == 0) {
+            const char *q = p + nl; while (q < end && (*q == ' ' || *q == '\t')) q++;
+            if (q < end && *q == '=') {
+                q++; while (q < end && (*q == ' ' || *q == '\t')) q++;
+                char quote = 0; if (q < end && (*q == '"' || *q == '\'')) quote = *q++;
+                int o = 0;
+                while (q < end && o < cap - 1) {
+                    if (quote) { if (*q == quote) break; } else if (*q == ' ' || *q == '\t' || *q == '>') break;
+                    out[o++] = *q++;
+                }
+                out[o] = 0; return 1;
+            }
+        }
+    }
+    return 0;
+}
+static void web_render(const char *body) {
+    web_pnl = web_psp = 0; web_nlink = 0;
+    int in_script = 0, in_style = 0, cur = -1;
+    for (const char *p = body; *p; ) {
+        if (*p == '<') {
+            const char *t = p + 1; int close = (*t == '/'); if (close) t++;
+            char name[16]; int ni = 0;
+            while (*t && isalnum((unsigned char)*t) && ni < 15) name[ni++] = (char)tolower((unsigned char)*t++);
+            name[ni] = 0;
+            const char *e = p + 1; while (*e && *e != '>') e++;
+            if (!strcmp(name, "script")) in_script = !close;
+            else if (!strcmp(name, "style")) in_style = !close;
+            else if (!in_script && !in_style && ni > 0) {
+                if (!strcmp(name, "a")) {
+                    if (!close) {
+                        char href[WEB_URLM];
+                        if (web_attr(p + 1, e, "href", href, sizeof href) && href[0] && href[0] != '#' && web_nlink < WEB_MAXL) {
+                            strncpy(web_links[web_nlink], href, WEB_URLM - 1); web_links[web_nlink][WEB_URLM - 1] = 0;
+                            cur = web_nlink++;
+                        }
+                    } else if (cur >= 0) { char m[16]; snprintf(m, sizeof m, "[%d]", cur + 1); web_emits(m); cur = -1; }
+                } else if (web_is_block(name)) {
+                    web_emit('\n');
+                    if (!strcmp(name, "li") && !close) web_emits("- ");
+                }
+            }
+            p = (*e == '>') ? e + 1 : e;
+            continue;
+        }
+        if (in_script || in_style) { p++; continue; }
+        if (*p == '&') {
+            char ent[12]; int k = 0; const char *q = p + 1;
+            while (*q && *q != ';' && *q != '<' && *q != ' ' && *q != '&' && k < 10) ent[k++] = *q++;
+            ent[k] = 0;
+            if (*q == ';' && k > 0) { web_entity(ent); p = q + 1; continue; }
+            web_emit('&'); p++; continue;
+        }
+        web_emit(*p); p++;
+    }
+    write(1, "\n", 1);
+}
+/* split a URL into web_host/web_port/web_path; -1 for https or a malformed URL */
+static int web_parse(const char *url) {
+    const char *p = url;
+    if (starts(p, "http://")) p += 7;
+    else if (starts(p, "https://")) return -1;
+    int hi = 0; web_port = 80;
+    while (*p && *p != '/' && *p != ':' && hi < 255) web_host[hi++] = *p++;
+    web_host[hi] = 0;
+    if (!web_host[0]) return -1;
+    if (*p == ':') { p++; web_port = atoi(p); while (*p && *p != '/') p++; }
+    if (*p == '/') { int pi = 0; while (*p && pi < WEB_URLM - 1) web_path[pi++] = *p++; web_path[pi] = 0; }
+    else strcpy(web_path, "/");
+    return 0;
+}
+static int web_fetch(void) {                              /* GET web_path into web_buf; body length or -1 */
+    uint32_t ip = resolve_host(web_host);
+    if (!ip) return -1;
+    int s = socket(AF_INET, SOCK_STREAM, 0); if (s < 0) return -1;
+    struct sockaddr_in a; memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = htons((unsigned short)web_port); a.sin_addr.s_addr = htonl(ip);
+    if (connect(s, (struct sockaddr *)&a, sizeof a) != 0) { close(s); return -1; }
+    char req[2048];
+    int rl = snprintf(req, sizeof req,
+                      "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: tinyos-web/1.0\r\nConnection: close\r\n\r\n",
+                      web_path, web_host);
+    if (rl < 0) { close(s); return -1; }
+    if (rl >= (int)sizeof req) rl = (int)sizeof req - 1;
+    if (write(s, req, rl) != rl) { close(s); return -1; }
+    int len = 0, n;
+    while (len < WEB_CAP - 1 && (n = read(s, web_buf + len, WEB_CAP - 1 - len)) > 0) len += n;
+    web_buf[len] = 0; close(s);
+    return len;
+}
+/* case-insensitive header lookup within [hdr,end); 1 if found */
+static int web_header(const char *hdr, const char *end, const char *name, char *out, int cap) {
+    int nl = (int)strlen(name);
+    for (const char *p = hdr; p < end; ) {
+        const char *le = p; while (le < end && *le != '\n') le++;
+        if (le - p > nl && ncase(p, name, nl) == 0 && p[nl] == ':') {
+            const char *v = p + nl + 1; while (v < le && (*v == ' ' || *v == '\t')) v++;
+            const char *ve = le; while (ve > v && (ve[-1] == '\r' || ve[-1] == ' ')) ve--;
+            int o = 0; for (const char *q = v; q < ve && o < cap - 1; q++) out[o++] = *q; out[o] = 0; return 1;
+        }
+        p = (le < end) ? le + 1 : end;
+    }
+    return 0;
+}
+/* resolve `link` (absolute, root-relative or relative) against the current page -> absolute http URL */
+static void web_abs(char *out, int cap, const char *link) {
+    if (starts(link, "http://") || starts(link, "https://")) { strncpy(out, link, cap - 1); out[cap - 1] = 0; return; }
+    int o = 0;
+    for (const char *p = "http://"; *p && o < cap - 1; p++) out[o++] = *p;
+    for (const char *p = web_host; *p && o < cap - 1; p++) out[o++] = *p;
+    if (web_port != 80) { char pb[8]; snprintf(pb, sizeof pb, ":%d", web_port); for (char *q = pb; *q && o < cap - 1; q++) out[o++] = *q; }
+    if (link[0] == '/') { for (const char *p = link; *p && o < cap - 1; p++) out[o++] = *p; }
+    else {
+        int cut = 0; for (int i = 0; web_path[i]; i++) if (web_path[i] == '/') cut = i + 1;
+        for (int i = 0; i < cut && o < cap - 1; i++) out[o++] = web_path[i];
+        for (const char *p = link; *p && o < cap - 1; p++) out[o++] = *p;
+    }
+    out[o] = 0;
+}
+/* load a URL: parse, fetch, follow http redirects, print status + rendered text */
+static int web_load(const char *url) {
+    char cur[WEB_URLM]; strncpy(cur, url, sizeof cur - 1); cur[sizeof cur - 1] = 0;
+    for (int hop = 0; hop < 5; hop++) {
+        if (web_parse(cur) != 0) { outs(2, "web: only http:// URLs are supported\n"); return -1; }
+        out1("[fetching "); out1(web_host); out1(web_path); out1("]\n");
+        if (web_fetch() < 0) { outs(2, "web: cannot fetch "); outs(2, web_host); outs(2, "\n"); return -1; }
+        char *hdr_end = strstr(web_buf, "\r\n\r\n");
+        int code = 0;
+        if (starts(web_buf, "http/")) { const char *sp = web_buf; while (*sp && *sp != ' ') sp++; code = atoi(sp); }
+        if (hdr_end) {
+            const char *nl = strchr(web_buf, '\n');       /* echo the status line */
+            if (nl) { int sl = (int)(nl - web_buf); if (sl > 0 && web_buf[sl - 1] == '\r') sl--; write(1, web_buf, sl); write(1, "\n", 1); }
+            if (code >= 300 && code < 400) {
+                char loc[WEB_URLM];
+                if (web_header(web_buf, hdr_end, "location", loc, sizeof loc) && loc[0]) {
+                    if (starts(loc, "https://")) { outs(2, "web: redirect to https (TLS unsupported): "); outs(2, loc); outs(2, "\n"); return -1; }
+                    char nx[WEB_URLM]; web_abs(nx, sizeof nx, loc);
+                    strncpy(cur, nx, sizeof cur - 1); cur[sizeof cur - 1] = 0;
+                    continue;
+                }
+            }
+            web_render(hdr_end + 4);
+        } else web_render(web_buf);
+        return 0;
+    }
+    outs(2, "web: too many redirects\n");
+    return -1;
+}
+static int ap_web(int argc, char **argv) {
+    if (argc < 2) { outs(2, "usage: web <url>   (http only, e.g. web example.com  or  web http://10.0.2.2/)\n"); return 1; }
+    char url[WEB_URLM]; strncpy(url, argv[1], sizeof url - 1); url[sizeof url - 1] = 0;
+    for (;;) {
+        out1("\n");
+        if (web_load(url) == 0 && web_nlink > 0) {
+            out1("\n---- links ----\n");
+            for (int i = 0; i < web_nlink; i++) { char n[16]; snprintf(n, sizeof n, "[%d] ", i + 1); out1(n); out1(web_links[i]); write(1, "\n", 1); }
+        }
+        out1("\n[web] number=open link, u <url>=go, r=reload, q=quit > ");
+        char line[WEB_URLM]; int li = 0;
+        for (;;) { char ch; if (read(0, &ch, 1) <= 0) { write(1, "\n", 1); return 0; } if (ch == '\n') break; if (li < (int)sizeof line - 1) line[li++] = ch; }
+        line[li] = 0;
+        char *s = line; while (*s == ' ') s++;
+        char *e = s + strlen(s); while (e > s && (e[-1] == ' ' || e[-1] == '\r')) *--e = 0;
+        if (!*s) continue;
+        if (!strcmp(s, "q")) break;
+        if (!strcmp(s, "r")) continue;
+        if ((s[0] == 'u' || s[0] == 'g') && s[1] == ' ') { char *u = s + 2; while (*u == ' ') u++; strncpy(url, u, sizeof url - 1); url[sizeof url - 1] = 0; continue; }
+        int isnum = 1; for (char *t = s; *t; t++) if (*t < '0' || *t > '9') { isnum = 0; break; }
+        if (isnum) {
+            int idx = atoi(s);
+            if (idx >= 1 && idx <= web_nlink) { char nx[WEB_URLM]; web_abs(nx, sizeof nx, web_links[idx - 1]); strncpy(url, nx, sizeof url - 1); url[sizeof url - 1] = 0; }
+            else out1("no such link\n");
+            continue;
+        }
+        strncpy(url, s, sizeof url - 1); url[sizeof url - 1] = 0;
+    }
+    return 0;
+}
+
 /* ---- dispatch ------------------------------------------------------------ */
 static const struct { const char *name; int (*fn)(int, char **); } g_applets[] = {
     { "sh", run_shell }, { "echo", ap_echo }, { "cat", ap_cat }, { "grep", ap_grep },
@@ -544,7 +845,8 @@ static const struct { const char *name; int (*fn)(int, char **); } g_applets[] =
     { "whoami", ap_whoami }, { "hostname", ap_hostname }, { "env", ap_env },
     { "clear", ap_clear }, { "free", ap_free }, { "sync", ap_sync }, { "true", ap_true },
     { "false", ap_false }, { "kill", ap_kill }, { "test", ap_test }, { "[", ap_test },
-    { "expr", ap_expr }, { "vi", ap_vi }, { "help", ap_help },
+    { "expr", ap_expr }, { "vi", ap_vi }, { "ping", ap_ping }, { "web", ap_web },
+    { "ifconfig", ap_ifconfig }, { "help", ap_help },
 };
 #define NAPPLET ((int)(sizeof g_applets / sizeof g_applets[0]))
 
@@ -702,6 +1004,33 @@ static int gfx3d_selftest(void) {
     return ok ? 0 : -2;
 }
 
+/* Headless socket check: a local server and client over the kernel TCP loopback
+ * exchange bytes both ways using the BSD socket syscalls (the N3 gate). */
+static int net_sock_selftest(void) {
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls < 0) return -1;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = htons(9100);
+    a.sin_addr.s_addr = htonl(0x0A00020Fu);          /* 10.0.2.15 -> kernel loopback */
+    if (bind(ls, (struct sockaddr *)&a, sizeof a) != 0) return -2;
+    if (listen(ls, 1) != 0) return -3;
+    int cs = socket(AF_INET, SOCK_STREAM, 0);
+    if (cs < 0) return -4;
+    if (connect(cs, (struct sockaddr *)&a, sizeof a) != 0) return -5;
+    int as = accept(ls, 0, 0);
+    if (as < 0) return -6;
+    if (write(cs, "ping", 4) != 4) return -7;
+    char b[16];
+    int n = read(as, b, sizeof b);
+    if (n != 4 || memcmp(b, "ping", 4)) return -8;
+    if (write(as, "pong!", 5) != 5) return -9;
+    n = read(cs, b, sizeof b);
+    if (n != 5 || memcmp(b, "pong!", 5)) return -10;
+    close(cs); close(as); close(ls);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *ap = base(argv[0]);
     if (applet_fn(ap)) return run_applet(ap, argc, argv);        /* invoked by applet name */
@@ -732,6 +1061,8 @@ int main(int argc, char **argv) {
                                     : "[tinygl-umd] BO self-test FAILED\n");
         outs(1, gfx3d_selftest() == 0 ? "[tinygl-umd] 3D raster + depth + cull ok\n"
                                       : "[tinygl-umd] 3D self-test FAILED\n");
+        outs(1, net_sock_selftest() == 0 ? "[net-umd] socket loopback connect+data+close ok\n"
+                                         : "[net-umd] socket self-test FAILED\n");
         return ok ? 0 : 1;
     }
     (void)ci_eq;

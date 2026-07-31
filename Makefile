@@ -22,7 +22,7 @@ BUILD    := build
 # kernel source layout: sources live in kernel/<subsystem>/, objects stay flat in
 # build/ (found via vpath), so moving a file only changes where make looks for it.
 KDIRS    := kernel kernel/boot kernel/arch kernel/mm kernel/sched kernel/fs \
-            kernel/drivers kernel/ui kernel/gfx kernel/tests kernel/legacy32
+            kernel/drivers kernel/ui kernel/gfx kernel/net kernel/tests kernel/legacy32
 vpath %.c $(KDIRS)
 vpath %.s $(KDIRS)
 
@@ -65,6 +65,11 @@ PERSIST_KB ?= 16384
 VIRTIO_BLK := -drive file=$(DATADISK),format=raw,if=none,id=vblk0 \
               -device virtio-blk-pci,drive=vblk0,disable-modern=on,disable-legacy=off
 
+# virtio-net NIC with QEMU user networking (SLIRP) — no host setup needed; the
+# legacy interface matches the port-I/O driver in kernel/drivers/vnet64.c.
+VIRTIO_NET := -netdev user,id=net0,hostfwd=tcp::8080-:80 \
+              -device virtio-net-pci,netdev=net0,disable-modern=on,disable-legacy=off
+
 # x64 UEFI app: PE32+ built with pure binutils (no mingw/gnu-efi/clang).
 #   -fPIC + --strip-all -> position-independent, no fragile HIGHLOW base relocs,
 #                          and no stray .comment section => OVMF loads it cleanly.
@@ -84,7 +89,7 @@ EFI_OBJS := $(BUILD)/efi_main.o $(BUILD)/entry64.o \
             $(BUILD)/smp64.o $(BUILD)/vmbus64.o \
             $(BUILD)/disp64.o $(BUILD)/wm64.o $(BUILD)/term64.o $(BUILD)/login64.o \
             $(BUILD)/tinygl64.o $(BUILD)/tgl3d64.o $(BUILD)/tglcomp64.o $(BUILD)/tglbo64.o \
-            $(BUILD)/arch64.o $(BUILD)/trap64.o $(BUILD)/fat64.o $(BUILD)/sched64.o $(BUILD)/sched_test64.o $(BUILD)/vblk64.o $(BUILD)/storvsc64.o
+            $(BUILD)/arch64.o $(BUILD)/trap64.o $(BUILD)/fat64.o $(BUILD)/sched64.o $(BUILD)/sched_test64.o $(BUILD)/vblk64.o $(BUILD)/storvsc64.o $(BUILD)/vnet64.o $(BUILD)/net64.o $(BUILD)/tcp64.o $(BUILD)/netvsc64.o
 
 # x64 ring-3 user programs: compiled from programs/*.cpp, embedded as blobs.
 # -mcmodel=large + link at USER_CODE_VA => absolute 64-bit addressing that is
@@ -290,11 +295,15 @@ $(BUILD)/musl-gcc.specs: $(MUSL_LIBDIR)/musl-gcc.specs | $(BUILD)
 	    -e 's|-dynamic-linker /lib/x86_64-linux-musl|-dynamic-linker $(MUSL_ROOT)/lib/x86_64-linux-musl|g' $< > $@
 $(BUILD)/musl_probe.elf: programs/musl_probe.c $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
-$(BUILD)/mbb.elf: programs/mbb.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc.specs
+$(BUILD)/mbb.elf: programs/mbb.c programs/tcc_include/tinygl.h programs/tcc_include/tnet.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/tgl_demo.elf: programs/tgl_demo.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/tgl3d_demo.elf: programs/tgl3d_demo.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/wget.elf: programs/wget.c programs/tcc_include/tnet.h $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/httpd.elf: programs/httpd.c $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/musl_probe.h: $(BUILD)/musl_probe.elf | $(BUILD)
 	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char musl_probe_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
@@ -311,7 +320,7 @@ $(BUILD)/arch64.o: $(X64PROG_HDRS) $(LINUX_TEST_HDR) $(LINUX_FORK_HDR) $(LINUX_F
 # x64 filesystem: a small FAT16 image (built from disk/ by tools/mkfatfs.py) is
 # embedded as a C blob and mounted as a writable RAM disk by kernel/fat64.c; the
 # ring-3 readdir/readfile/writefile syscalls route there.  FATFS_KB sizes it.
-FATFS_KB ?= 256
+FATFS_KB ?= 512
 $(BUILD)/fatfs.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/mbb.elf programs/tcc_hello.c | $(BUILD)
 	$(PYTHON) tools/mkfatfs.py $@ disk $(FATFS_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c MBB.BIN=$(BUILD)/mbb.elf
 $(BUILD)/fatfs.h: $(BUILD)/fatfs.img | $(BUILD)
@@ -333,22 +342,25 @@ esp: $(BUILD)/BOOTX64.EFI
 # Persistent-disk staging root: disk/ plus /lib (crt, libc.a, libtcc1.a), the full
 # musl /include header tree, and a K&R sample so on-device `./tcc.bin a.c -o a.bin`
 # resolves the standard library through TCC's built-in search paths.
-$(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h programs/tcc_kr_demo.c programs/tcc_include/tinygl.h programs/tgl_demo.c programs/tgl3d_demo.c $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
+$(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h programs/tcc_kr_demo.c programs/tcc_include/tinygl.h programs/tgl_demo.c programs/tgl3d_demo.c programs/tcc_include/tnet.h programs/wget.c programs/httpd.c $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
 	rm -rf $(BUILD)/fsroot
 	mkdir -p $(BUILD)/fsroot/lib $(BUILD)/fsroot/include
 	cp -r disk/. $(BUILD)/fsroot/
 	cp $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a $(BUILD)/fsroot/lib/
 	cp -r $(TCC_SELF)/include/. $(BUILD)/fsroot/include/
 	cp programs/tcc_include/tinygl.h $(BUILD)/fsroot/include/tinygl.h
+	cp programs/tcc_include/tnet.h $(BUILD)/fsroot/include/tnet.h
 	cp programs/tcc_kr_demo.c $(BUILD)/fsroot/kr.c
 	cp programs/tgl_demo.c $(BUILD)/fsroot/tgl.c
 	cp programs/tgl3d_demo.c $(BUILD)/fsroot/tgl3d.c
+	cp programs/wget.c $(BUILD)/fsroot/wget.c
+	cp programs/httpd.c $(BUILD)/fsroot/httpd.c
 	touch $@
 
 # persistent filesystem disk: seeded ONCE from the staging root, kept outside
 # build/ so `make clean` won't wipe it.  `rm tinyfs.img` to re-seed.
-tinyfs.img: $(BUILD)/fsroot.stamp | $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(TCC_BIN)
-	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(PERSIST_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf
+tinyfs.img: $(BUILD)/fsroot.stamp | $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf $(TCC_BIN)
+	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(PERSIST_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf
 	@echo "seeded persistent disk $@ ($(PERSIST_KB) KB) from build/fsroot/"
 
 # boot the x64 build under qemu-system-x86_64 + OVMF in a graphical window so the
@@ -360,7 +372,7 @@ run-x64: esp tinyfs.img
 	$(QEMU64) -machine q35,accel=kvm:tcg -m 512 \
 	  -drive if=pflash,format=raw,unit=0,readonly=on,file=$(OVMF_CODE) \
 	  -drive if=pflash,format=raw,unit=1,file=$(BUILD)/OVMF_VARS.fd \
-	  -drive format=raw,file=fat:rw:$(ESP) $(VIRTIO_BLK) \
+	  -drive format=raw,file=fat:rw:$(ESP) $(VIRTIO_BLK) $(VIRTIO_NET) \
 	  -vga std -serial stdio -no-reboot
 
 # same boot, but headless (no window) — for CI / sandboxes without a display.
@@ -369,15 +381,15 @@ run-x64-headless: esp tinyfs.img
 	$(QEMU64) -machine q35 -accel tcg -m 512 \
 	  -drive if=pflash,format=raw,unit=0,readonly=on,file=$(OVMF_CODE) \
 	  -drive if=pflash,format=raw,unit=1,file=$(BUILD)/OVMF_VARS.fd \
-	  -drive format=raw,file=fat:rw:$(ESP) $(VIRTIO_BLK) \
+	  -drive format=raw,file=fat:rw:$(ESP) $(VIRTIO_BLK) $(VIRTIO_NET) \
 	  -serial stdio -display none -no-reboot
 
 # ---- Hyper-V Gen 2 artifact: a GPT disk with a FAT32 ESP, packaged as VHDX ----
 # tools/mkgptesp.py writes the GPT, FAT32 ESP, and persistent FAT16 data
 # partition by hand (no mkfs.vfat/mtools needed).
 HYPER_DATA_KB ?= 16384
-$(BUILD)/hyper_data.img: tools/mkfatfs.py $(BUILD)/fsroot.stamp $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/tcc_self_probe.elf $(BUILD)/tcc2_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf programs/tcc_hello.c programs/tcc_printf_hello.c programs/tcc_printf.rsp programs/tcc_include/stdio.h $(TCC_BIN) $(TCC_SELF)/TCCSELF.I $(TCC_SELF)/BUILD.RSP $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
-	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(HYPER_DATA_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c PRINTF.RSP=programs/tcc_printf.rsp STDIO.H=programs/tcc_include/stdio.h SELFRUN.BIN=$(BUILD)/tcc_self_probe.elf TCC2RUN.BIN=$(BUILD)/tcc2_probe.elf TCCSELF.I=$(TCC_SELF)/TCCSELF.I BUILD.RSP=$(TCC_SELF)/BUILD.RSP CRT1.O=$(TCC_SELF)/lib/crt1.o CRTI.O=$(TCC_SELF)/lib/crti.o CRTN.O=$(TCC_SELF)/lib/crtn.o LIBC.A=$(TCC_SELF)/lib/libc.a LIBTCC1.A=$(TCC_SELF)/lib/libtcc1.a MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf
+$(BUILD)/hyper_data.img: tools/mkfatfs.py $(BUILD)/fsroot.stamp $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/tcc_self_probe.elf $(BUILD)/tcc2_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf programs/tcc_hello.c programs/tcc_printf_hello.c programs/tcc_printf.rsp programs/tcc_include/stdio.h $(TCC_BIN) $(TCC_SELF)/TCCSELF.I $(TCC_SELF)/BUILD.RSP $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(HYPER_DATA_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c PRINTF.RSP=programs/tcc_printf.rsp STDIO.H=programs/tcc_include/stdio.h SELFRUN.BIN=$(BUILD)/tcc_self_probe.elf TCC2RUN.BIN=$(BUILD)/tcc2_probe.elf TCCSELF.I=$(TCC_SELF)/TCCSELF.I BUILD.RSP=$(TCC_SELF)/BUILD.RSP CRT1.O=$(TCC_SELF)/lib/crt1.o CRTI.O=$(TCC_SELF)/lib/crti.o CRTN.O=$(TCC_SELF)/lib/crtn.o LIBC.A=$(TCC_SELF)/lib/libc.a LIBTCC1.A=$(TCC_SELF)/lib/libtcc1.a MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf
 $(BUILD)/tinyos.img: esp tools/mkgptesp.py $(BUILD)/hyper_data.img
 	$(PYTHON) tools/mkgptesp.py $@ $(ESP) $(BUILD)/hyper_data.img
 

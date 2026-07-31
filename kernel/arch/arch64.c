@@ -114,6 +114,10 @@ static int          g_next_pid;
 #define TGL_SYS_BO_CREATE  0x54474C01ULL
 #define TGL_SYS_PRESENT    0x54474C02ULL
 #define TGL_SYS_BO_DESTROY 0x54474C03ULL
+#define NET_SYS_RESOLVE    0x4E455400ULL      /* 'NET': userspace DNS resolve */
+#define NET_SYS_PING       0x4E455401ULL      /* 'NET'+1: userspace ICMP echo */
+#define NET_SYS_IFCONFIG   0x4E455402ULL      /* 'NET'+2: userspace interface config */
+#define NET_SYS_SETCFG     0x4E455403ULL      /* 'NET'+3: set static interface config */
 #define USER_STK_PAGES  4
 #define LINUX_LOAD_PAGES ((LINUX_LOAD_LIMIT - LINUX_LOAD_VA) / 4096)
 #define USER_ARG_OFF    (USER_CODE_PAGES * 4096 - 256)   /* argv[0] staged here */
@@ -236,6 +240,13 @@ static int linux_clock_gettime(int clock_id, void *timespec);
 static int linux_getrandom(void *buf, uint32_t len, uint32_t flags);
 static int linux_writev(int fd, const void *iov, int count);
 static int linux_ioctl(int fd, uint64_t request, void *arg);
+static int linux_socket(int domain, int type, int proto);
+static int linux_bind(int fd, const void *addr);
+static int linux_connect(int fd, const void *addr);
+static int linux_listen(int fd);
+static int linux_accept(int fd, void *addr, int *addrlen, int flags);
+static int linux_getpeername(int fd, void *addr, int *addrlen);
+static int linux_getsockname(int fd, void *addr, int *addrlen);
 static int64_t gfx_info(void *user_info);
 static int64_t gfx_bo_create(uint32_t w, uint32_t h, void *user_desc);
 static int64_t gfx_present(int handle, int x, int y);
@@ -756,6 +767,52 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
             return 0;
         case 318:                           /* getrandom                  */
             return (uint64_t)(int64_t)linux_getrandom((void *)a0, (uint32_t)a1, (uint32_t)a2);
+        case 41:                            /* socket(domain, type, proto)   */
+            return (uint64_t)(int64_t)linux_socket((int)a0, (int)a1, (int)a2);
+        case 42:                            /* connect(fd, addr, len)        */
+            return (uint64_t)(int64_t)linux_connect((int)a0, (const void *)a1);
+        case 43:                            /* accept(fd, addr, addrlen)     */
+            return (uint64_t)(int64_t)linux_accept((int)a0, (void *)a1, (int *)a2, 0);
+        case 288:                           /* accept4(fd, addr, addrlen, fl)*/
+            return (uint64_t)(int64_t)linux_accept((int)a0, (void *)a1, (int *)a2, (int)a3);
+        case 44:                            /* sendto -> connected TCP send  */
+            return (uint64_t)(int64_t)linux_write((int)a0, (const void *)a1, (uint32_t)a2);
+        case 45:                            /* recvfrom -> connected TCP recv */
+            return (uint64_t)(int64_t)linux_read((int)a0, (void *)a1, (uint32_t)a2);
+        case 49:                            /* bind(fd, addr, len)           */
+            return (uint64_t)(int64_t)linux_bind((int)a0, (const void *)a1);
+        case 50:                            /* listen(fd, backlog)           */
+            return (uint64_t)(int64_t)linux_listen((int)a0);
+        case 51:                            /* getsockname                   */
+            return (uint64_t)(int64_t)linux_getsockname((int)a0, (void *)a1, (int *)a2);
+        case 52:                            /* getpeername                   */
+            return (uint64_t)(int64_t)linux_getpeername((int)a0, (void *)a1, (int *)a2);
+        case 48:                            /* shutdown -> no-op (close tears down) */
+            return 0;
+        case 54:                            /* setsockopt -> accept as no-op */
+            return 0;
+        case 55:                            /* getsockopt -> zero the option */
+            if (a3) *(int *)a3 = 0;
+            return 0;
+        case NET_SYS_RESOLVE:               /* resolve a hostname -> IPv4 (host order) */
+            return (uint64_t)net_resolve((const char *)a0);
+        case NET_SYS_PING: {                /* one ICMP echo; >=0 = round-trip us, <0 = timeout */
+            uint32_t us = 0;
+            return net_ping((uint32_t)a0, &us) == 0 ? (uint64_t)us : (uint64_t)-1;
+        }
+        case NET_SYS_IFCONFIG: {            /* fill a user tnet_ifcfg with ip/mask/gw/dns/mac/up */
+            struct ifcfg { uint32_t ip, mask, gw, dns; uint8_t mac[6], up, pad; } *c = (struct ifcfg *)a0;
+            if (!c) return (uint64_t)-1;
+            uint32_t ip, mask, gw, dns; uint8_t mac[6]; int up;
+            net_ifconfig(&ip, &mask, &gw, &dns, mac, &up);
+            c->ip = ip; c->mask = mask; c->gw = gw; c->dns = dns;
+            for (int i = 0; i < 6; i++) c->mac[i] = mac[i];
+            c->up = (uint8_t)up; c->pad = 0;
+            return 0;
+        }
+        case NET_SYS_SETCFG:                /* static config: a0=ip a1=mask a2=gw a3=dns (host order) */
+            net_setcfg((uint32_t)a0, (uint32_t)a1, (uint32_t)a2, (uint32_t)a3);
+            return 0;
         case 60:                            /* exit(status)               */
         case 231:                           /* exit_group(status)         */
             g_user_exit_code = (int)a0;
@@ -1039,6 +1096,7 @@ static int linux_close(int fd) {
     if (fd < 0 || fd >= LINUX_FD_MAX) return -9;
     if (!g_linux_fds[fd].used) return fd < 3 ? 0 : -9;   /* default console fd: no-op */
     int k = g_linux_fds[fd].kind, idx = g_linux_fds[fd].pipe;
+    if (k == LINUX_FD_SOCKET) { if (g_linux_fds[fd].sock >= 0) tcp_close(g_linux_fds[fd].sock); g_linux_fds[fd].used = 0; return 0; }
     if (k == LINUX_FD_PIPE_R) { if (g_pipes[idx].readers > 0) g_pipes[idx].readers--; sched_wake(PIPE_WCHAN(idx)); }
     else if (k == LINUX_FD_PIPE_W) { if (g_pipes[idx].writers > 0) g_pipes[idx].writers--; sched_wake(PIPE_RCHAN(idx)); }
     if ((k == LINUX_FD_PIPE_R || k == LINUX_FD_PIPE_W) &&
@@ -1051,6 +1109,68 @@ static int linux_close(int fd) {
 static void linux_close_all_fds(void) {
     for (int fd = 0; fd < LINUX_FD_MAX; fd++)
         if (g_linux_fds[fd].used) linux_close(fd);
+}
+
+/* ---- BSD sockets over the TCP engine (Cycle 8 N3) -----------------------
+ * A socket fd wraps a TCP connection index.  sockaddr_in fields are network
+ * order on the wire, which our big-endian get/put read straight as host order. */
+static uint32_t sa_ip(const uint8_t *sa)   { return ((uint32_t)sa[4]<<24)|((uint32_t)sa[5]<<16)|((uint32_t)sa[6]<<8)|sa[7]; }
+static uint16_t sa_port(const uint8_t *sa) { return (uint16_t)((sa[2]<<8)|sa[3]); }
+static void sa_fill(uint8_t *sa, uint32_t ip, uint16_t port) {
+    sa[0] = 2; sa[1] = 0;                             /* AF_INET (native u16) */
+    sa[2] = (uint8_t)(port >> 8); sa[3] = (uint8_t)port;
+    sa[4] = (uint8_t)(ip >> 24); sa[5] = (uint8_t)(ip >> 16); sa[6] = (uint8_t)(ip >> 8); sa[7] = (uint8_t)ip;
+    for (int i = 8; i < 16; i++) sa[i] = 0;
+}
+static int sock_ok(int fd) {
+    return fd >= 3 && fd < LINUX_FD_MAX && g_linux_fds[fd].used && g_linux_fds[fd].kind == LINUX_FD_SOCKET;
+}
+static int linux_socket(int domain, int type, int proto) {
+    (void)proto;
+    if (domain != 2) return -97;                     /* AF_INET only (EAFNOSUPPORT) */
+    if ((type & 0xFF) != 1) return -93;              /* SOCK_STREAM only (EPROTONOSUPPORT) */
+    int fd = linux_fd_alloc(LINUX_FD_SOCKET, (type & 04000) ? 1 : 0, 0, 0, 0);   /* SOCK_NONBLOCK */
+    if (fd < 0) return -24;
+    g_linux_fds[fd].sock = -1;
+    return fd;
+}
+static int linux_bind(int fd, const void *addr) {
+    if (!sock_ok(fd) || !addr) return -9;
+    g_linux_fds[fd].offset = sa_port((const uint8_t *)addr);   /* remember the local port */
+    return 0;
+}
+static int linux_listen(int fd) {
+    if (!sock_ok(fd)) return -9;
+    int t = tcp_listen((uint16_t)g_linux_fds[fd].offset);
+    if (t < 0) return -98;
+    g_linux_fds[fd].sock = t;
+    return 0;
+}
+static int linux_connect(int fd, const void *addr) {
+    if (!sock_ok(fd) || !addr) return -9;
+    int t = tcp_connect(sa_ip((const uint8_t *)addr), sa_port((const uint8_t *)addr));
+    if (t < 0) return -111;                          /* ECONNREFUSED */
+    g_linux_fds[fd].sock = t;
+    return 0;
+}
+static int linux_accept(int fd, void *addr, int *addrlen, int flags) {
+    if (!sock_ok(fd) || g_linux_fds[fd].sock < 0) return -9;
+    int c = tcp_accept(g_linux_fds[fd].sock);
+    if (c < 0) return -11;
+    int nfd = linux_fd_alloc(LINUX_FD_SOCKET, (flags & 04000) ? 1 : 0, 0, 0, 0);
+    if (nfd < 0) return -24;
+    g_linux_fds[nfd].sock = c;
+    if (addr && addrlen && *addrlen >= 16) { uint32_t ip; uint16_t port; tcp_peer(c, &ip, &port); sa_fill((uint8_t *)addr, ip, port); *addrlen = 16; }
+    return nfd;
+}
+static int linux_getpeername(int fd, void *addr, int *addrlen) {
+    if (!sock_ok(fd) || g_linux_fds[fd].sock < 0 || !addr || !addrlen || *addrlen < 16) return -9;
+    uint32_t ip; uint16_t port; tcp_peer(g_linux_fds[fd].sock, &ip, &port);
+    sa_fill((uint8_t *)addr, ip, port); *addrlen = 16; return 0;
+}
+static int linux_getsockname(int fd, void *addr, int *addrlen) {
+    if (!sock_ok(fd) || !addr || !addrlen || *addrlen < 16) return -9;
+    sa_fill((uint8_t *)addr, net_local_ip(), (uint16_t)g_linux_fds[fd].offset); *addrlen = 16; return 0;
 }
 
 /* Blocking pipe read: sleep while empty (a writer wakes us); 0 (EOF) once every
@@ -1230,6 +1350,7 @@ static int linux_read(int fd, void *buf, uint32_t len) {
             return r;
         }
         if (k == LINUX_FD_NULL) return 0;
+        if (k == LINUX_FD_SOCKET) return tcp_recv(g_linux_fds[fd].sock, buf, (int)len);
         if (k != LINUX_FD_FILE) return -21;
         if ((g_linux_fds[fd].flags & LINUX_O_ACCMODE) == 1) return -9;
         int result = fat_pread(g_linux_fds[fd].path, buf, len, g_linux_fds[fd].offset);
@@ -1269,6 +1390,7 @@ static int linux_write(int fd, const void *buf, uint32_t len) {
         if (k == LINUX_FD_PIPE_W) return pipe_write(g_linux_fds[fd].pipe, buf, len);
         if (k == LINUX_FD_PIPE_R) return -9;
         if (k == LINUX_FD_NULL) return (int)len;
+        if (k == LINUX_FD_SOCKET) return tcp_send(g_linux_fds[fd].sock, buf, (int)len);
         if (k != LINUX_FD_FILE) return -21;
         if (!(g_linux_fds[fd].flags & LINUX_O_ACCMODE)) return -9;
         if (g_linux_fds[fd].flags & LINUX_O_APPEND) {

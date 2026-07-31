@@ -152,6 +152,7 @@ static void sysmon_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw
     draw_kv_hex(back, cx, y, "STOR IO  ", (uint32_t)storvsc_diag());               y += g_lineh;
     draw_kv_hex(back, cx, y, "STOR VER ", (uint32_t)storvsc_ver());                y += g_lineh;
     draw_kv(back, cx, y, "STOR BSZ ", (uint32_t)storvsc_blksz());                  y += g_lineh;
+    draw_kv(back, cx, y, "NET STG  ", (uint32_t)netvsc_stage());                   y += g_lineh;
     draw_res(back, cx, y, g_scr_w, g_scr_h);                                       y += g_lineh;
     draw_kv(back, cx, y, "GOP MODES", g_bi ? g_bi->gop_modes : 0);
 }

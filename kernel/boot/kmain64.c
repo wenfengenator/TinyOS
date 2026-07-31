@@ -90,6 +90,10 @@ void kmain64(boot_info_t *bi) {
         { int z = arch_bo_zerocopy_test();
           kputs(z == 0 ? "[tinygl] G6 BO user-mapped zero-copy (shared frames) OK\n"
                        : "[tinygl] G6 BO user-map FAILED\n"); } }
+    if (nic_init()) {
+        net_init();
+        net_selftest();
+    }
     login_run(bi);
     wm_run(bi);
 
