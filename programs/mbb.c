@@ -19,6 +19,7 @@
 #include <time.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include "tinygl.h"        /* TinyGL client library (the UMD under test) */
 
 extern char **environ;
 
@@ -652,6 +653,55 @@ static int run_shell(int argc, char **argv) {
 
 static const char *base(const char *p) { const char *b = p; for (const char *q = p; *q; q++) if (*q == '/') b = q + 1; return b; }
 
+/* Headless TinyGL check: open a zero-copy buffer object, draw into the mapped
+ * pixels, and read them back through the mapping (proving the app writes land in
+ * the kernel BO with no copy).  Does not present, so it never disturbs the boot
+ * display.  0 = ok. */
+static int gfx_selftest(void) {
+    tgl_t g;
+    if (tgl_open(&g, 64, 48) != 0) return -1;
+    tgl_clear(&g, 0x123456);
+    tgl_pixel(&g, 10, 10, 0xABCDEF);
+    uint32_t want_bg = tgl_rgb(&g, 0x123456), want_px = tgl_rgb(&g, 0xABCDEF);
+    int ok = g.px && g.px[0] == want_bg && g.px[10 * g.stride + 10] == want_px;
+    tgl_finish(&g);
+    return ok ? 0 : -2;
+}
+
+/* Headless 3D check: rasterize into a mapped BO offscreen and confirm the depth
+ * test and back-face cull select the right fragments (the G4 gate, user-side). */
+static int gfx3d_selftest(void) {
+    tgl_t g;
+    if (tgl_open(&g, 64, 64) != 0) return -1;
+    tgl3d_t r;
+    if (tgl3d_begin(&r, &g) != 0) { tgl_finish(&g); return -1; }
+    uint32_t rp = tgl_rgb(&g, 0xFF0000), gp = tgl_rgb(&g, 0x00FF00);
+    tgl_tex rtex = { &rp, 1, 1 }, gtex = { &gp, 1, 1 };
+    tgl_vert na = {2,2,TGL_FXONE,0,0}, nb = {61,2,TGL_FXONE,0,0}, nc = {30,61,TGL_FXONE,0,0};
+    tgl_vert fa = {2,2,TGL_FXONE/2,0,0}, fb2 = {61,2,TGL_FXONE/2,0,0}, fc = {30,61,TGL_FXONE/2,0,0};
+    int ci = 20 * g.stride + 30;
+
+    tgl_clear(&g, 0x000000); tgl3d_clear_depth(&r); tgl3d_cull(&r, 0);
+    tgl3d_tri(&r, &na, &nb, &nc, &rtex, 256);                /* near red */
+    int ok = g.px[ci] == rp;
+    tgl3d_tri(&r, &fa, &fb2, &fc, &gtex, 256);               /* far green loses depth */
+    ok = ok && g.px[ci] == rp;
+
+    tgl_clear(&g, 0x000000); tgl3d_clear_depth(&r);
+    tgl3d_tri(&r, &fa, &fb2, &fc, &gtex, 256);               /* far first */
+    tgl3d_tri(&r, &na, &nb, &nc, &rtex, 256);                /* near wins regardless of order */
+    ok = ok && g.px[ci] == rp;
+
+    tgl_clear(&g, 0x000000); tgl3d_clear_depth(&r); tgl3d_cull(&r, 1);
+    tgl3d_tri(&r, &nc, &nb, &na, &rtex, 256);                /* reversed winding -> culled */
+    ok = ok && g.px[ci] == 0u;
+    tgl3d_tri(&r, &na, &nb, &nc, &rtex, 256);                /* front-facing -> drawn */
+    ok = ok && g.px[ci] == rp;
+
+    tgl3d_end(&r); tgl_finish(&g);
+    return ok ? 0 : -2;
+}
+
 int main(int argc, char **argv) {
     const char *ap = base(argv[0]);
     if (applet_fn(ap)) return run_applet(ap, argc, argv);        /* invoked by applet name */
@@ -678,6 +728,10 @@ int main(int argc, char **argv) {
             }
             rmdir("/xt");
         }
+        outs(1, gfx_selftest() == 0 ? "[tinygl-umd] BO map + draw + zero-copy readback ok\n"
+                                    : "[tinygl-umd] BO self-test FAILED\n");
+        outs(1, gfx3d_selftest() == 0 ? "[tinygl-umd] 3D raster + depth + cull ok\n"
+                                      : "[tinygl-umd] 3D self-test FAILED\n");
         return ok ? 0 : 1;
     }
     (void)ci_eq;

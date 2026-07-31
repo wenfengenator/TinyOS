@@ -10,6 +10,7 @@
 #include "boot64.h"
 #include "wm64.h"
 #include "arch64.h"
+#include "tinygl.h"
 
 void kmain64(boot_info_t *bi) {
     serial_init();
@@ -74,6 +75,21 @@ void kmain64(boot_info_t *bi) {
     kputs("[tinyos64] TINYOS X64 UEFI BOOT OK\n");
     arch_user_init();
     if (disp_init() != 0) kputs("[disp] shared back buffer unavailable\n");
+    else { uint32_t dw = 0, dh = 0; disp_dims(&dw, &dh);
+        kputs("[disp] backend "); kputs(display_backend_name());
+        kputs(" ("); kput_u32dec((uint32_t)display_outputs()); kputs(" output) ");
+        kput_u32dec(dw); kputc('x'); kput_u32dec(dh); kputc('\n');
+        kputs(tgl_selftest() == 0 ? "[tinygl] G2/G3 clear+compose+2D (fill/blend/clip/line/gradient) OK\n"
+                                  : "[tinygl] G2/G3 self-test FAILED\n");
+        kputs(tgl3d_selftest() == 0 ? "[tinygl] G4 3D raster + depth + cull OK\n"
+                                    : "[tinygl] G4 3D self-test FAILED\n");
+        kputs(tglcomp_selftest() == 0 ? "[tinygl] G5 compositor z-order + alpha + damage OK\n"
+                                      : "[tinygl] G5 compositor self-test FAILED\n");
+        kputs(tglbo_selftest() == 0 ? "[tinygl] G6 BO + fence + zero-copy compose OK\n"
+                                    : "[tinygl] G6 BO self-test FAILED\n");
+        { int z = arch_bo_zerocopy_test();
+          kputs(z == 0 ? "[tinygl] G6 BO user-mapped zero-copy (shared frames) OK\n"
+                       : "[tinygl] G6 BO user-map FAILED\n"); } }
     login_run(bi);
     wm_run(bi);
 

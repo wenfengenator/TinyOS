@@ -11,6 +11,10 @@ int  arch_user_run_named(const char *name, const char *arg); /* run a built-in p
 int  arch_run_linux(const char *path, const char *arg);      /* launch a Linux ELF from the FS as a scheduled process */
 const char *arch_user_prog_name(int i);     /* iterate built-in program names (i=0..), or 0 */
 
+/* G6: map a buffer object's frames into the Linux address space (zero copy) */
+uint64_t arch_bo_map_user(void *kva, uint32_t bytes);        /* returns user VA, or 0 */
+int      arch_bo_zerocopy_test(void);       /* 0 user VA shares BO frames, -1 fail */
+
 /* ring-3 stdout sink + terminal control, provided by the tty layer (kernel/term64.c) */
 void usys_write(const char *p, unsigned long n);
 void term_clear_active(void);               /* clear the terminal running the program */

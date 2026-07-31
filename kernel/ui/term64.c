@@ -10,6 +10,7 @@
  * case; command matching is therefore case-insensitive. */
 #include "wm64.h"
 #include "arch64.h"
+#include "tinygl.h"
 
 typedef struct {
     boot_info_t *bi;
@@ -144,7 +145,7 @@ static void console_exec(terminal_t *t, char *line) {
         t_puts(t, "COMMANDS:\n");
         t_puts(t, "  SH (LINUX SHELL)  HELP  CLEAR  ECHO <T>  VER\n");
         t_puts(t, "  MEM  CPU  UPTIME  TIME\n");
-        t_puts(t, "  ASSET  WIN  RUN <P>  SPAWN <ELF>  DEMO  PONG  SCHED  USCHED  STEST  REBOOT\n");
+        t_puts(t, "  ASSET  WIN  RUN <P>  SPAWN <ELF>  DEMO  TGL  TGL3D  COMP  BO  PONG  SCHED  USCHED  STEST  REBOOT\n");
         t_puts(t, "DESKTOP: F1=FOCUS  F2=MOVE+ARROWS\n");
     } else if (t_ieq(cmd, "clear") || t_ieq(cmd, "cls")) {
         t_clear(t);
@@ -208,6 +209,18 @@ static void console_exec(terminal_t *t, char *line) {
         }
     } else if (t_ieq(cmd, "sh") || t_ieq(cmd, "shell") || t_ieq(cmd, "bash")) {
         console_run_shell(t);
+    } else if (t_ieq(cmd, "tgl")) {
+        t_puts(t, "LAUNCHING TINYGL 2D DEMO - Q/ESC RETURNS\n");
+        tgl_demo();
+    } else if (t_ieq(cmd, "tgl3d")) {
+        t_puts(t, "LAUNCHING TINYGL 3D CUBE - Q/ESC RETURNS\n");
+        tgl_mesh_demo();
+    } else if (t_ieq(cmd, "comp")) {
+        t_puts(t, "LAUNCHING TINYGL COMPOSITOR - Q/ESC RETURNS\n");
+        tgl_comp_demo();
+    } else if (t_ieq(cmd, "bo")) {
+        t_puts(t, "LAUNCHING TINYGL BUFFER-OBJECT DEMO - Q/ESC RETURNS\n");
+        tgl_bo_demo();
     } else if (t_ieq(cmd, "demo")) {
         t_puts(t, "LAUNCHING GRAPHICS DEMO - Q/ESC RETURNS\n");
         demo_run(t->bi);

@@ -12,6 +12,7 @@
 #include "arch64.h"
 #include "proc64.h"            /* struct proc + process table (Tier 1 Phase A) */
 #include "fat64.h"             /* RAM-disk FAT16: readdir/readfile/writefile */
+#include "tinygl.h"            /* buffer objects (Cycle 7 G6) for the zero-copy map test */
 #include "uhello.h"            /* static const unsigned char hello_prog[] */
 #include "ucount.h"            /* static const unsigned char count_prog[] */
 #include "ugreet.h"            /* static const unsigned char greet_prog[] */
@@ -105,6 +106,14 @@ static int          g_next_pid;
 #define LINUX_MMAP_BASE 0x0000600000000000ULL
 #define LINUX_MMAP_LIMIT 0x0000600100000000ULL
 #define USER_CODE_PAGES 16
+
+/* TinyGL graphics client ABI (Cycle 7 G7): private syscalls a userspace app
+ * uses to allocate a zero-copy buffer object and present it.  Must match
+ * programs/tcc_include/tinygl.h. */
+#define TGL_SYS_INFO       0x54474C00ULL
+#define TGL_SYS_BO_CREATE  0x54474C01ULL
+#define TGL_SYS_PRESENT    0x54474C02ULL
+#define TGL_SYS_BO_DESTROY 0x54474C03ULL
 #define USER_STK_PAGES  4
 #define LINUX_LOAD_PAGES ((LINUX_LOAD_LIMIT - LINUX_LOAD_VA) / 4096)
 #define USER_ARG_OFF    (USER_CODE_PAGES * 4096 - 256)   /* argv[0] staged here */
@@ -227,6 +236,10 @@ static int linux_clock_gettime(int clock_id, void *timespec);
 static int linux_getrandom(void *buf, uint32_t len, uint32_t flags);
 static int linux_writev(int fd, const void *iov, int count);
 static int linux_ioctl(int fd, uint64_t request, void *arg);
+static int64_t gfx_info(void *user_info);
+static int64_t gfx_bo_create(uint32_t w, uint32_t h, void *user_desc);
+static int64_t gfx_present(int handle, int x, int y);
+static int64_t gfx_bo_destroy(int handle);
 struct linux_exec_args;
 static int linux_execve(const char *path, const char *const *argv,
                         const char *const *envp);
@@ -584,6 +597,14 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
             return (uint64_t)(int64_t)linux_munmap(a0, a1);
         case 12:                            /* brk                        */
             return linux_brk(a0);
+        case TGL_SYS_INFO:                  /* TinyGL: query the display   */
+            return (uint64_t)gfx_info((void *)a0);
+        case TGL_SYS_BO_CREATE:             /* TinyGL: zero-copy buffer    */
+            return (uint64_t)gfx_bo_create((uint32_t)a0, (uint32_t)a1, (void *)a2);
+        case TGL_SYS_PRESENT:               /* TinyGL: composite + present */
+            return (uint64_t)gfx_present((int)a0, (int)a1, (int)a2);
+        case TGL_SYS_BO_DESTROY:            /* TinyGL: free a buffer       */
+            return (uint64_t)gfx_bo_destroy((int)a0);
         case 13:                            /* rt_sigaction               */
             return (uint64_t)(int64_t)linux_rt_sigaction((int)a0, (const void *)a1, (void *)a2, a3);
         case 15:                            /* rt_sigreturn               */
@@ -1538,6 +1559,123 @@ static int linux_map_page(uint64_t va, uint64_t prot) {
     void *frame = page_alloc(1);
     if (!frame) return -1;
     *pte = (uint64_t)frame | PTE_US | (prot ? PTE_P : 0) | ((prot & 2) ? PTE_RW : 0);
+    return 0;
+}
+
+/* G6: map a buffer object's existing frames into the Linux address space so a
+ * userspace client renders straight into the buffer the compositor samples —
+ * zero copy.  Returns the user VA (0 on failure). */
+uint64_t arch_bo_map_user(void *kva, uint32_t bytes) {
+    if (!g_linux_vm.pml4 || !kva || !bytes) return 0;
+    uint32_t pages = (bytes + 4095) / 4096;
+    uint64_t va = g_linux_vm.mmap_next;
+    if (va + (uint64_t)pages * 4096 > LINUX_MMAP_LIMIT) return 0;
+    uint64_t phys = (uint64_t)(uintptr_t)kva;          /* frames are identity-mapped */
+    for (uint32_t i = 0; i < pages; i++) {
+        uint64_t *pte = linux_vm_pte(va + (uint64_t)i * 4096, 1);
+        if (!pte) return 0;
+        *pte = (phys + (uint64_t)i * 4096) | PTE_P | PTE_RW | PTE_US;
+    }
+    g_linux_vm.mmap_next += (uint64_t)pages * 4096;
+    return va;
+}
+
+/* Create a BO and build a fresh user page-table hierarchy mapping a user VA to
+ * the BO's frames, then walk it back: the user VA resolves to the BO's own
+ * physical frames (= zero copy).  Self-contained (no active AS).  0 ok, -1 fail. */
+int arch_bo_zerocopy_test(void) {
+    tgl_bo_t *bo = tgl_bo_create(16, 16);
+    if (!bo) return -1;
+    uint64_t phys = (uint64_t)(uintptr_t)bo->surf.px;
+    uint64_t va = LINUX_MMAP_BASE;
+    uint64_t *pml4 = (uint64_t *)page_alloc(1), *pdpt = (uint64_t *)page_alloc(1);
+    uint64_t *pd = (uint64_t *)page_alloc(1), *pt = (uint64_t *)page_alloc(1);
+    int r = -1;
+    if (pml4 && pdpt && pd && pt) {                    /* frames are identity-mapped: VA == phys */
+        pml4[(va >> 39) & 0x1FF] = (uint64_t)pdpt | PTE_P | PTE_RW | PTE_US;
+        pdpt[(va >> 30) & 0x1FF] = (uint64_t)pd   | PTE_P | PTE_RW | PTE_US;
+        pd[(va >> 21) & 0x1FF]   = (uint64_t)pt   | PTE_P | PTE_RW | PTE_US;
+        pt[(va >> 12) & 0x1FF]   = phys | PTE_P | PTE_RW | PTE_US;
+        uint64_t *t = pml4;
+        t = (uint64_t *)(t[(va >> 39) & 0x1FF] & ~0xFFFULL);
+        t = (uint64_t *)(t[(va >> 30) & 0x1FF] & ~0xFFFULL);
+        t = (uint64_t *)(t[(va >> 21) & 0x1FF] & ~0xFFFULL);
+        r = ((t[(va >> 12) & 0x1FF] & ~0xFFFULL) == phys) ? 0 : -1;
+    }
+    if (pt) page_free(pt, 1);
+    if (pd) page_free(pd, 1);
+    if (pdpt) page_free(pdpt, 1);
+    if (pml4) page_free(pml4, 1);
+    tgl_bo_unref(bo);
+    return r;
+}
+
+/* ---- G7: graphics client (KMD) ----------------------------------------
+ * Back the TinyGL user API (programs/tcc_include/tinygl.h): allocate buffer
+ * objects, map them zero-copy into the calling process, and composite+present
+ * them through the display backend.  An app renders into the mapped BO and the
+ * compositor samples it in place — no pixel copy crosses the syscall boundary. */
+#define GFX_MAX_BO 16
+static struct gfx_slot { tgl_bo_t *bo; uint64_t uva, bytes; uint64_t *owner; } g_gfx[GFX_MAX_BO];
+
+/* Channel shifts that reproduce fb64's device packing (probed via fb_pack). */
+static void gfx_shifts(uint32_t *rsh, uint32_t *gsh, uint32_t *bsh) {
+    int bgrx = (fb_pack(0xFF0000) == 0x00FF0000u);   /* R in the high byte => BGRX */
+    *rsh = bgrx ? 16 : 0; *gsh = 8; *bsh = bgrx ? 0 : 16;
+}
+
+static int64_t gfx_info(void *user_info) {
+    if (!user_info) return -14;                      /* EFAULT */
+    struct { uint32_t w, h, stride, rsh, gsh, bsh; } inf;
+    uint32_t w = 0, h = 0;
+    disp_dims(&w, &h);
+    inf.w = w; inf.h = h; inf.stride = w;
+    gfx_shifts(&inf.rsh, &inf.gsh, &inf.bsh);
+    for (uint32_t i = 0; i < sizeof inf; i++) ((uint8_t *)user_info)[i] = ((uint8_t *)&inf)[i];
+    return 0;
+}
+
+static int64_t gfx_bo_create(uint32_t w, uint32_t h, void *user_desc) {
+    if (!user_desc || !w || !h || w > 4096 || h > 4096) return -22;   /* EINVAL */
+    int slot = -1;
+    for (int i = 0; i < GFX_MAX_BO; i++) if (!g_gfx[i].bo) { slot = i; break; }
+    if (slot < 0) return -24;                        /* EMFILE */
+    tgl_bo_t *bo = tgl_bo_create(w, h);
+    if (!bo) return -12;                             /* ENOMEM */
+    uint64_t bytes = (uint64_t)bo->pages * 4096;
+    uint64_t uva = arch_bo_map_user(bo->surf.px, (uint32_t)bytes);
+    if (!uva) { tgl_bo_unref(bo); return -12; }
+    g_gfx[slot].bo = bo; g_gfx[slot].uva = uva; g_gfx[slot].bytes = bytes;
+    g_gfx[slot].owner = current->vm.pml4;
+    struct { uint64_t va; uint32_t w, h, stride, rsh, gsh, bsh; int32_t handle; uint32_t pad; } d;
+    d.va = uva; d.w = bo->surf.w; d.h = bo->surf.h; d.stride = bo->surf.w;
+    gfx_shifts(&d.rsh, &d.gsh, &d.bsh);
+    d.handle = slot; d.pad = 0;
+    for (uint32_t i = 0; i < sizeof d; i++) ((uint8_t *)user_desc)[i] = ((uint8_t *)&d)[i];
+    return 0;
+}
+
+static int64_t gfx_present(int handle, int x, int y) {
+    if (handle < 0 || handle >= GFX_MAX_BO || !g_gfx[handle].bo) return -22;
+    tgl_bind(tgl_screen());                          /* composite BO -> back buffer -> display */
+    tgl_compose(&g_gfx[handle].bo->surf, x, y);
+    tgl_present();
+    int k = kbd64_getkey();
+    if (k < 0) k = hvkbd_getkey();
+    return k < 0 ? 0 : k;
+}
+
+static int64_t gfx_bo_destroy(int handle) {
+    if (handle < 0 || handle >= GFX_MAX_BO || !g_gfx[handle].bo) return -22;
+    if (g_gfx[handle].owner == current->vm.pml4) {   /* unmap only from the owning AS */
+        for (uint64_t o = 0; o < g_gfx[handle].bytes; o += 4096) {
+            uint64_t *pte = linux_vm_pte(g_gfx[handle].uva + o, 0);
+            if (pte) *pte = 0;
+        }
+        write_cr3((uint64_t)current->vm.pml4);       /* flush the stale TLB entries */
+    }
+    tgl_bo_unref(g_gfx[handle].bo);
+    g_gfx[handle].bo = 0; g_gfx[handle].uva = g_gfx[handle].bytes = 0; g_gfx[handle].owner = 0;
     return 0;
 }
 
