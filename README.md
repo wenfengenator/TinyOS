@@ -1,9 +1,24 @@
 # tinyos
 
-A tiny teaching OS for 32-bit x86: a **boot sector** brings the CPU into
-protected mode and loads a **kernel written in C** (ring 0) that hosts
-**user programs written in C++** (ring 3). User programs talk to the kernel only
-through `int 0x80` system calls.
+A teaching operating system built from scratch, in two editions that show its
+evolution:
+
+* a **32-bit x86 (i386)** kernel that boots from a 512-byte boot sector into
+  protected mode and hosts C++ ring-3 programs over an `int 0x80` ABI; and
+* a **64-bit (UEFI, long mode)** kernel that boots as a PE32+ EFI application,
+  brings up every CPU core, drives a framebuffer desktop, persists a FAT16
+  filesystem on Hyper-V and QEMU, and hosts a **Linux-compatible ABI** rich
+  enough to run **musl** programs and an **on-device, self-hosting C compiler**.
+
+The kernel is C; user programs are C/C++ or static Linux ELF64 binaries.
+Assembly is used only where it must be (boot shim, AP trampoline, syscall/
+interrupt/context-switch stubs).
+
+> **New here?** Read [`docs/GUIDE.md`](docs/GUIDE.md) for a beginner walkthrough
+> of the 32-bit kernel, then [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for
+> the full 64-bit system design.
+
+## The 32-bit edition
 
 It demonstrates the classic building blocks of an OS:
 
@@ -29,7 +44,7 @@ It demonstrates the classic building blocks of an OS:
 Assembly is used only where it must be: the real-mode boot sector, the
 protected-mode switch, and the entry / interrupt / context-switch stubs.
 
-## Build
+## Build (32-bit)
 
 ```bash
 make            # -> boot.bin, kernel.bin, os.img, fs.img (FAT16 disk)
@@ -87,6 +102,40 @@ Hello from a real FAT16 filesystem on a mounted disk image!
 program executes in its own paged, isolated address space. Files under `/mnt`
 come from the FAT16 disk image via the ATA driver.)
 
+## The 64-bit UEFI edition
+
+Built with `ARCH=x64`, this is a long-mode kernel packaged as a single PE32+ EFI
+application (`BOOTX64.EFI`). It boots on `qemu-system-x86_64` + OVMF and on
+**Hyper-V Gen 2**. Highlights:
+
+* **UEFI boot + GOP framebuffer**, SMP bring-up of every CPU core
+  (INIT-SIPI-SIPI), ACPI MADT discovery, a millisecond clock, and a bump heap
+  from the UEFI memory map.
+* **Ring 0/3 with SYSCALL/SYSRET**, a preemptive LAPIC-timer scheduler for
+  kernel threads, and a keyboard-driven **desktop**: a compositor (`wm64`) with
+  a terminal and live system monitor, a sign-in panel, and `pong`/graphics
+  demos — all over a shared **double-buffered display driver** (`disp64`) that
+  blits only changed scanlines.
+* **Persistent FAT16** behind a block layer: **virtio-blk** on QEMU and
+  **StorVSC over VMBus** on Hyper-V, with a read-ahead cache and a GPT data
+  partition.
+* **A Linux-compatible ABI** (~30 x86-64 syscalls, a static ELF64 loader,
+  per-process page tables, `brk`/`mmap`, a descriptor-based VFS, and `execve`)
+  that runs stock **musl** binaries and an **on-device TinyCC** — building
+  ordinary/K&R C against the full musl standard-library headers, and
+  recompiling itself.
+
+```bash
+make ARCH=x64                 # build/BOOTX64.EFI (one PE32+ image)
+make run-x64-headless         # QEMU + OVMF, serial only (CI/sandbox)
+make tinyos.vhdx              # Hyper-V Gen 2 disk (attach; Secure Boot OFF)
+make setup-tcc                # stage musl + TinyCC for the on-device compiler
+```
+
+Sign in as `root` / `root`. From the terminal, `./musl.bin`,
+`./tcc.bin file.c -o out.bin`, and `./out.bin` exercise the Linux-ABI path.
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
+
 ## Layout
 
 ```
@@ -105,6 +154,19 @@ Makefile
 concept-first walkthrough of how tinyos works, from power-on to a running app,
 written for entry-level OS developers.
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture (memory map, boot
-flow, privilege model, syscall ABI, scheduler, and how the emulator stands in
-for hardware interrupts).
+Documentation map:
+
+* [`docs/GUIDE.md`](docs/GUIDE.md) — beginner, concept-first walkthrough (32-bit).
+* [`docs/DESIGN.md`](docs/DESIGN.md) — architecture reference for the 32-bit kernel
+  (memory map, boot flow, privilege model, `int 0x80` ABI, scheduler, emulator).
+* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the full **64-bit UEFI** system
+  design (boot flow, SMP, display, storage, filesystem, Linux ABI, toolchain).
+* [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) — objectives, phases, milestones
+  across every cycle.
+* [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) / [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)
+  — how it is verified and what has passed.
+* [`docs/CYCLE2_PLAN.md`](docs/CYCLE2_PLAN.md), [`docs/CYCLE5_PLAN.md`](docs/CYCLE5_PLAN.md),
+  [`docs/CYCLE6_PLAN.md`](docs/CYCLE6_PLAN.md), [`docs/CYCLE7_PLAN.md`](docs/CYCLE7_PLAN.md),
+  [`docs/CYCLE8_PLAN.md`](docs/CYCLE8_PLAN.md) — per-cycle plans (x64/graphics;
+  compiler substrate; Tier 1 mini-Unix / busybox-static; **TinyGL** graphics
+  stack; connectivity / TCP-IP / USB).

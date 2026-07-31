@@ -352,3 +352,62 @@ Result: **VI_ARROWS_DELETE: OK**, **SHELL_LINE_EDIT: OK**.  Q7 and Q8 pass — a
 keys and Delete now work in `vi` and drive the shell's in-line editor.  (Serial and
 the emulator inject raw ASCII and don't emit `KEY_*` codes; `h j k l` still work
 there.)
+
+---
+
+## Phase 16+ — the 64-bit UEFI edition (`ARCH=x64`)
+
+The x64 kernel is verified by (a) headless boot markers over COM1 on
+`qemu-system-x86_64` + OVMF, (b) embedded boot self-test probes, (c) `qemu-img`
+validation of the VHDX, and (d) confirmation on a real 10-core **Hyper-V Gen 2**
+VM via a COM1 named pipe. `✅` = confirmed on QEMU and (where noted) Hyper-V.
+
+### Boot & platform
+| Step | Result |
+|---|---|
+| UEFI PE32+ loads; GOP framebuffer acquired; ExitBootServices; long-mode entry | ✅ |
+| Serial + framebuffer console online; TSC MHz + heap MB reported | ✅ |
+| SMP: all CPUs online (10/10 on Hyper-V) via MADT + INIT-SIPI-SIPI | ✅ |
+| GDT/TSS/IDT installed; ring 0/3 ready; `[tinyos64] … BOOT OK` | ✅ |
+
+### Storage & filesystem
+| Step | Result |
+|---|---|
+| virtio-blk persistence on QEMU (write → reboot → read) | ✅ QEMU |
+| StorVSC handshake + SCSI READ/WRITE(10) via GPA-direct; STOR STG 12 | ✅ Hyper-V |
+| GPT: FAT32 ESP + FAT16 data partition; both GPT CRCs valid (`qemu-img`) | ✅ |
+| Cross-reboot persistence on the dedicated data partition | ✅ Hyper-V |
+| FAT16 offset I/O, sector RMW, chain grow/shrink, sparse holes | ✅ |
+
+### Linux-compatible ABI (boot self-test probes)
+| Marker | Result |
+|---|---|
+| `[linux-abi] hello from static ELF64` / `ELF64 loader + SysV stack ok` | ✅ |
+| `[linux-abi] fd offset I/O ok` | ✅ |
+| `[linux-abi] stat + directory VFS ok` | ✅ |
+| `[linux-abi] ftruncate + sparse I/O ok` | ✅ |
+| `[linux-abi] auxv + TLS + libc stubs ok` | ✅ |
+| `[elf-large] >64 KiB load + execve stack verified` | ✅ |
+
+### Userland & toolchain
+| Step | Result |
+|---|---|
+| Static **musl** program: `printf` + `malloc` + file I/O verified | ✅ |
+| `execve` replacement with argv/envp transfer | ✅ |
+| On-device **TinyCC** compiles `/hello.c` → runs it (`[tcc] compile + execute cycle complete`) | ✅ |
+| TinyCC **self-host**: recompiles its own source into a working TCC2 | ✅ |
+| Bare `./tcc.bin printf.c -o printf.bin` (static by default) + run | ✅ Hyper-V |
+| K&R program vs full musl `/include` headers: compile + run on-device | ✅ |
+| `malloc`/`free`/`realloc`/`calloc` stress (host + on-device) | ✅ |
+
+### Regressions found & fixed during bring-up (notable)
+| Symptom | Root cause → fix |
+|---|---|
+| Multi-sector writes came back all zeros (QEMU) | DMA used a ring-3 user VA (VA≠PA) → bounce all block DMA through an identity-mapped kernel buffer |
+| On-device compile took > 1 min | Small synchronous StorVSC reads of `libc.a` → 4 KiB read-ahead block cache + FAT chain-position cache → ~3 s |
+| Bare `tcc a.c -o a.bin` output faulted (`[EXC] 14`) | TCC default output was dynamic (PT_INTERP/PLT) → patch TinyCC to link static by default |
+| TAB did nothing in `vi` | insert mode dropped control chars → expand TAB to spaces at the next tab stop |
+| `sched` demo `[EXC] 255` on Hyper-V only | a pending SynIC interrupt fired at `sti` → shared HW-vector stub EOIs and returns instead of halting |
+
+A healthy headless boot ends at `[login] awaiting credentials (default root/root)`
+with **zero** `[EXC]` lines.

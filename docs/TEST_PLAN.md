@@ -18,6 +18,13 @@ for execution; the boot sector's real-mode path is exercised in emulator
 stage A, and the hardware-only paths (`syscall_stub`, `irq0_stub`) are verified
 by construction + disassembly.
 
+> **This plan covers the original 32-bit (i386) kernel.** The 64-bit UEFI
+> edition is validated differently — headless boot markers over COM1 on
+> `qemu-system-x86_64` + OVMF, embedded boot self-test probes, `qemu-img` VHDX
+> validation, and confirmation on a real Hyper-V Gen 2 VM. See
+> [`TEST_RESULTS.md`](TEST_RESULTS.md) (Phase 16+) and
+> [`ARCHITECTURE.md`](ARCHITECTURE.md) §16.
+
 ## 2. Environment
 
 * Build: `make` (uses `tools/xcc`/`xcxx`, GNU `as`/`ld`/`objcopy`).

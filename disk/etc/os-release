@@ -1,0 +1,5 @@
+NAME="TinyOS"
+PRETTY_NAME="TinyOS x64 (UEFI, long mode)"
+ID=tinyos
+VERSION="0.1"
+VERSION_ID="0.1"

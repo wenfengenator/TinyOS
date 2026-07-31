@@ -10,6 +10,11 @@ If you just want to build and run it, see [`../README.md`](../README.md). For a
 terse architecture reference, see [`DESIGN.md`](DESIGN.md). *This* file is the long,
 teaching-oriented walkthrough.
 
+> This walkthrough covers the original **32-bit (i386)** kernel. For the
+> **64-bit UEFI** edition — long mode, SMP, the framebuffer desktop, persistent
+> FAT16 on Hyper-V/QEMU, the Linux-compatible ABI, musl, and the on-device
+> self-hosting compiler — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ---
 
 ## Table of contents

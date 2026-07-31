@@ -89,3 +89,57 @@ not just the emulator.
   reporting for the FAT volume (single-file write-back is implemented).
 * `exec` that replaces the caller's image (currently spawns a new task).
 * More of a libc, a pipe/IPC layer, and multiple simultaneous shells.
+
+---
+
+> Sections 1–8 above describe the original **32-bit (i386)** kernel. The project
+> then continued in cycles that grew a separate **64-bit UEFI** kernel,
+> summarized below. Full design detail is in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+## 9. The 64-bit UEFI evolution (cycles 2–5)
+
+Goal: a long-mode kernel that boots via UEFI on **Hyper-V Gen 2** and QEMU, with
+graphics, persistence, and eventually a self-hosting on-device C compiler.
+
+### Cycle 2 — x64 bring-up & graphics infrastructure
+| Deliverable | Status |
+|---|---|
+| PE32+ UEFI loader (`boot/efi_main.c`), GOP framebuffer, ExitBootServices, long-mode entry | ✅ |
+| Millisecond clock, bump heap from the UEFI map, PS/2 keyboard | ✅ |
+| SMP bring-up of all cores via ACPI MADT + INIT-SIPI-SIPI | ✅ |
+| Boots on real Hyper-V Gen 2 | ✅ |
+
+### Cycle 3 — windowing system & console
+| Deliverable | Status |
+|---|---|
+| Compositor + window manager (`wm64`), terminal widget + console (`term64`) | ✅ |
+| Fullscreen demos: moving-block (`demo64`), Pong (`pong64`) | ✅ |
+
+### Cycle 4 — ring 0/3, shell, scheduler, filesystem
+| Deliverable | Status |
+|---|---|
+| GDT/TSS/IDT, SYSCALL/SYSRET, ring-3 programs, nested `exec` | ✅ |
+| Preemptive LAPIC-timer scheduler for kernel threads | ✅ |
+| FAT16 filesystem, directories, `vi`, housekeeping shell commands | ✅ |
+| Login sign-in panel; adaptive UI scale; lowercase font | ✅ |
+
+### Cycle 4.5 — persistent storage
+| Deliverable | Status |
+|---|---|
+| virtio-blk block driver (QEMU), block layer behind FAT16 | ✅ |
+| StorVSC over VMBus (Hyper-V): channel, handshake, SCSI READ/WRITE(10) via GPA-direct | ✅ |
+| GPT layout (FAT32 ESP + FAT16 data partition); cross-reboot persistence | ✅ (Hyper-V + QEMU) |
+
+### Cycle 5 — self-hosting compiler substrate
+| Deliverable | Status |
+|---|---|
+| Linux x86-64 syscall ABI subset + static ELF64 loader + SysV init stack | ✅ |
+| Per-process page tables + `brk`/`mmap`/`mprotect`/`munmap` | ✅ |
+| Descriptor-based VFS (`openat`/`read`/`write`/`lseek`/`fstat`/`getdents64`/…) | ✅ |
+| Static **musl** program (printf/malloc/file I/O) runs from the filesystem | ✅ |
+| `execve`, argv/envp/auxv transfer, large-ELF load | ✅ |
+| On-device **TinyCC**: compile + run, then **self-host** (recompile itself) | ✅ (QEMU + Hyper-V) |
+| Direct `./tcc.bin file.c -o out.bin` against the full musl standard-library headers | ✅ |
+| Shared double-buffered display driver (`disp64`) with scanline-diff present | ✅ |
+
+Verified on both `qemu-system-x86_64` + OVMF and a real 10-core Hyper-V Gen 2 VM.

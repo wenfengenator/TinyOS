@@ -29,7 +29,7 @@ extern "C" int umain() {
         if (!cmd[0]) continue;
 
         if (eq(cmd, "help")) {
-            sys::write("  fs: pwd  cd <d>  ls  cat <f>  wr <f> <t>  mkdir <d>  rm|del <f>\n");
+            sys::write("  fs: pwd  cd <d>  ls  cat <f>  cp <s> <d>  wr <f> <t>  mkdir <d>  rm|del <f>\n");
             sys::write("  sys: ps  echo <t>  ver  exit    programs: hello  count  greet  vi <f>\n");
             sys::write("  static ELF files: ./musl.bin\n");
         } else if (eq(cmd, "echo")) {
@@ -69,6 +69,14 @@ extern "C" int umain() {
                 int w = sys::writefile(fname, text, (int)sys::strlen(text));
                 if (w < 0) sys::write("wr: write failed\n");
                 else { char nb[12]; sys::utoa((unsigned)w, nb); sys::write("wrote "); sys::write(nb); sys::write(" bytes\n"); }
+            }
+        } else if (eq(cmd, "cp")) {                 // cp <src> <dst> -> whole-file kernel copy
+            char src[64], dst[80]; split(arg, src, dst);
+            if (!src[0] || !dst[0]) { sys::write("usage: cp <src> <dst>\n"); }
+            else {
+                int w = sys::copy(src, dst);
+                if (w < 0) { sys::write("cp: cannot copy "); sys::write(src); sys::write("\n"); }
+                else { char nb[12]; sys::utoa((unsigned)w, nb); sys::write("copied "); sys::write(nb); sys::write(" bytes\n"); }
             }
         } else if (eq(cmd, "mkdir")) {
             if (!arg[0]) sys::write("usage: mkdir <name>\n");

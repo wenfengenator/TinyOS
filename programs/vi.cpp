@@ -6,7 +6,8 @@
 #include "ulib.h"
 
 #define MAXL 128
-#define MAXC 78
+#define MAXC 160              // max chars per line (longer lines were truncated at load)
+#define GUTTER 4               // line-number column width: "NNN " (right-aligned)
 
 static char buf[MAXL][MAXC + 2];
 static int  len[MAXL];
@@ -15,6 +16,10 @@ static int  cx = 0, cy = 0, top = 0;
 static char fname[128];
 static bool dirty = false;
 static int  VH = 24;                   // visible text rows (terminal height - 1 status)
+static int  VW = 74;                   // wrap width: text columns per screen row (term width - gutter)
+
+// screen rows a logical line occupies once wrapped (at least 1)
+static int line_rows(int i) { int n = (len[i] + VW - 1) / VW; return n < 1 ? 1 : n; }
 
 static void load(const char *path) {
     static char d[8192];
@@ -41,12 +46,33 @@ static void save() {
 
 static void redraw(const char *status) {
     sys::clear();
-    for (int r = 0; r < VH && top + r < nlines; r++) {
-        sys::gotoxy(r, 0);
-        sys::write_n(sys::STDOUT, buf[top + r], len[top + r]);
+    int r = 0, i = top;                          // screen row, logical line
+    while (r < VH && i < nlines) {
+        int rows = line_rows(i);
+        for (int k = 0; k < rows && r < VH; k++, r++) {
+            char num[GUTTER + 1];
+            if (k == 0) {                        // line number only on the first row
+                int ln = i + 1;
+                num[0] = (ln >= 100) ? (char)('0' + (ln / 100) % 10) : ' ';
+                num[1] = (ln >= 10)  ? (char)('0' + (ln / 10)  % 10) : ' ';
+                num[2] = (char)('0' + ln % 10);
+                num[3] = ' ';
+            } else {                             // wrapped continuation: blank gutter
+                num[0] = num[1] = num[2] = num[3] = ' ';
+            }
+            sys::gotoxy(r, 0);
+            sys::write_n(sys::STDOUT, num, GUTTER);
+            int start = k * VW, n = len[i] - start;
+            if (n > VW) n = VW;
+            if (n > 0) sys::write_n(sys::STDOUT, buf[i] + start, n);
+        }
+        i++;
     }
     sys::gotoxy(VH, 0); sys::write(status);
-    sys::gotoxy(cy - top, cx);
+    int sr = 0;                                  // cursor screen row (wrap-aware)
+    for (int j = top; j < cy; j++) sr += line_rows(j);
+    sr += cx / VW;
+    sys::gotoxy(sr, GUTTER + (cx % VW));
 }
 
 static void ins_char(char c) {
@@ -92,7 +118,7 @@ extern "C" int umain(const char *arg) {
     int i = 0; if (arg) while (arg[i] && i < 127) { fname[i] = arg[i]; i++; } fname[i] = 0;
     if (!fname[0]) { sys::write("vi: usage: vi <file>\n"); return 1; }
     load(fname);
-    { int c = 0, r = 0; sys::winsize(&c, &r); if (r > 2) VH = r - 1; }
+    { int c = 0, r = 0; sys::winsize(&c, &r); if (r > 2) VH = r - 1; if (c > GUTTER + 4) VW = c - GUTTER; }
     bool insert = false;
 
     for (;;) {
@@ -135,8 +161,8 @@ extern "C" int umain(const char *arg) {
                     for (int z = 0; z < ci; z++) line[p++] = cmd[z];
                     while (p < 80) line[p++] = ' ';
                     line[p] = 0;
-                    sys::gotoxy(24, 0); sys::write(line);
-                    sys::gotoxy(24, 1 + ci);
+                    sys::gotoxy(VH, 0); sys::write(line);
+                    sys::gotoxy(VH, 1 + ci);
                     int c = sys::getchar();
                     if (c == '\r' || c == '\n') break;
                     if (c == 27) { ci = 0; break; }
@@ -150,8 +176,14 @@ extern "C" int umain(const char *arg) {
                 if (q) { sys::clear(); sys::gotoxy(0, 0); return 0; }
             }
         }
-        if (cy < top) top = cy;
-        if (cy >= top + VH) top = cy - (VH - 1);
         if (cx > len[cy]) cx = len[cy];
+        if (cy < top) top = cy;                     // cursor above viewport -> scroll up
+        for (;;) {                                  // scroll down until the cursor is on-screen
+            int sr = 0;
+            for (int j = top; j < cy; j++) sr += line_rows(j);
+            sr += cx / VW;
+            if (sr < VH || top >= cy) break;
+            top++;
+        }
     }
 }

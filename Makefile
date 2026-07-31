@@ -19,19 +19,26 @@ CXX      := tools/xcxx
 
 BUILD    := build
 
+# kernel source layout: sources live in kernel/<subsystem>/, objects stay flat in
+# build/ (found via vpath), so moving a file only changes where make looks for it.
+KDIRS    := kernel kernel/boot kernel/arch kernel/mm kernel/sched kernel/fs \
+            kernel/drivers kernel/ui kernel/tests kernel/legacy32
+vpath %.c $(KDIRS)
+vpath %.s $(KDIRS)
+
 CWARN    := -Wall -Wextra
 CFLAGS   := -m32 -ffreestanding -fno-pic -fno-pie -fno-stack-protector \
             -fno-asynchronous-unwind-tables -fno-builtin -mno-sse -mno-mmx \
-            -O2 $(CWARN) -Wno-array-bounds -Ikernel
+            -O2 $(CWARN) -Wno-array-bounds -Ikernel/include
 CXXFLAGS := $(CFLAGS) -fno-exceptions -fno-rtti -fno-threadsafe-statics
 ASFLAGS  := --32
-LDFLAGS  := -m elf_i386 -T kernel/linker.ld -nostdlib
+LDFLAGS  := -m elf_i386 -T kernel/legacy32/linker.ld -nostdlib
 
 # object order matters: entry first (.text.boot -> 0x10000), user last (ring 3)
-# x64-only kernel sources (kernel/*64.c) belong to the ARCH=x64 path, not here.
-KSRC  := $(filter-out $(wildcard kernel/*64.c),$(wildcard kernel/*.c))
+# the 32-bit legacy edition lives in kernel/legacy32/; the x64 kernel is kernel/*64.
+KSRC  := $(wildcard kernel/legacy32/*.c)
 USRC  := $(wildcard user/*.cpp)
-KOBJS := $(BUILD)/entry.o $(patsubst kernel/%.c,$(BUILD)/k_%.o,$(KSRC))
+KOBJS := $(BUILD)/entry.o $(patsubst kernel/legacy32/%.c,$(BUILD)/k_%.o,$(KSRC))
 UOBJS := $(patsubst user/%.cpp,$(BUILD)/u_%.o,$(USRC))
 
 # standalone ramdisk programs (linked at USER_BASE, packed + embedded)
@@ -65,18 +72,18 @@ VIRTIO_BLK := -drive file=$(DATADISK),format=raw,if=none,id=vblk0 \
 #                          address references still resolve at link time.
 EFI_CFLAGS  := -m64 -ffreestanding -fshort-wchar -mno-red-zone -fno-stack-protector \
                -fPIC -fvisibility=hidden -fno-ident -fno-builtin -fno-asynchronous-unwind-tables \
-               -mno-sse -mno-mmx -O2 $(CWARN) -Ikernel -I$(BUILD)
+               -mno-sse -mno-mmx -O2 $(CWARN) -Ikernel/include -I$(BUILD)
 EFI_LDFLAGS := -mi386pep -e efi_main --subsystem=10 --image-base 0x100000 \
                -nostdlib --strip-all
 
 # x64 kernel objects linked into the single PE32+ EFI application.
-EFI_HDRS := kernel/boot64.h kernel/font8x8.h kernel/wm64.h kernel/arch64.h kernel/fat64.h
+EFI_HDRS := kernel/include/boot64.h kernel/include/font8x8.h kernel/include/wm64.h kernel/include/arch64.h kernel/include/fat64.h kernel/include/proc64.h
 EFI_OBJS := $(BUILD)/efi_main.o $(BUILD)/entry64.o \
             $(BUILD)/kmain64.o $(BUILD)/fb64.o $(BUILD)/mm64.o \
             $(BUILD)/time64.o $(BUILD)/kbd64.o $(BUILD)/demo64.o $(BUILD)/pong64.o \
             $(BUILD)/smp64.o $(BUILD)/vmbus64.o \
             $(BUILD)/disp64.o $(BUILD)/wm64.o $(BUILD)/term64.o $(BUILD)/login64.o \
-            $(BUILD)/arch64.o $(BUILD)/trap64.o $(BUILD)/fat64.o $(BUILD)/sched64.o $(BUILD)/vblk64.o $(BUILD)/storvsc64.o
+            $(BUILD)/arch64.o $(BUILD)/trap64.o $(BUILD)/fat64.o $(BUILD)/sched64.o $(BUILD)/sched_test64.o $(BUILD)/vblk64.o $(BUILD)/storvsc64.o
 
 # x64 ring-3 user programs: compiled from programs/*.cpp, embedded as blobs.
 # -mcmodel=large + link at USER_CODE_VA => absolute 64-bit addressing that is
@@ -88,6 +95,14 @@ UPROG_CXXFLAGS := -m64 -ffreestanding -fno-exceptions -fno-rtti -fno-threadsafe-
 X64PROGS     := hello count greet sh vi exec_probe
 X64PROG_HDRS := $(patsubst %,$(BUILD)/u%.h,$(X64PROGS))
 LINUX_TEST_HDR := $(BUILD)/linux_hello.h
+LINUX_FORK_HDR := $(BUILD)/linux_fork.h
+LINUX_FORKEXEC_HDR := $(BUILD)/linux_forkexec.h
+LINUX_FORKSTORM_HDR := $(BUILD)/linux_forkstorm.h
+LINUX_PIPE_HDR := $(BUILD)/linux_pipe.h
+LINUX_SIG_HDR := $(BUILD)/linux_sig.h
+LINUX_SIGH_HDR := $(BUILD)/linux_sigh.h
+LINUX_TTY_HDR := $(BUILD)/linux_tty.h
+LINUX_PROC_HDR := $(BUILD)/linux_proc.h
 MUSL_ROOT ?= /tmp/tinyos-musl
 MUSL_LIBDIR := $(MUSL_ROOT)/usr/lib/x86_64-linux-musl
 MUSL_TEST_HDR := $(BUILD)/musl_probe.h
@@ -102,24 +117,30 @@ ALL_TGT := os.img fs.img
 RUN_TGT := run-i386
 endif
 
-.PHONY: all run run-i386 run-x64 run-x64-headless run-x64-disk vhdx bootx64 esp run-emu run-emu-kernel deps setup-tcc clean
+.PHONY: all run run-i386 run-x64 run-x64-headless run-x64-disk vhdx bootx64 esp run-emu run-emu-kernel deps setup-tcc setup-busybox clean
 
 setup-tcc:
 	sh tools/setup_tcc.sh
-all: $(ALL_TGT)
+
+# Stage a busybox-style userland on the FS image.  Upstream busybox needs a
+# network fetch or source tree (absent here), so TinyOS ships a musl-static
+# mini-busybox (programs/mbb.c -> /MBB.BIN) that runs a shell + applets +
+# pipelines.  Drop a real musl-static busybox at build/busybox to swap it in.
+setup-busybox: $(BUILD)/mbb.elf
+	@echo "mini-busybox staged on the FS image as /MBB.BIN (run: spawn /MBB.BIN sh)"all: $(ALL_TGT)
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
 # ---- assembly ----
-$(BUILD)/entry.o: kernel/entry.s | $(BUILD)
+$(BUILD)/entry.o: entry.s | $(BUILD)
 	$(AS) $(ASFLAGS) -o $@ $<
 
 $(BUILD)/boot.o: boot.asm | $(BUILD)
 	$(AS) $(ASFLAGS) -o $@ $<
 
 # ---- C kernel ----
-$(BUILD)/k_%.o: kernel/%.c $(wildcard kernel/*.h) | $(BUILD)
+$(BUILD)/k_%.o: %.c $(wildcard kernel/include/*.h) | $(BUILD)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # ---- C++ user layer ----
@@ -147,7 +168,7 @@ boot.bin: $(BUILD)/boot.o
 	$(OBJCOPY) -O binary $(BUILD)/boot.elf $@
 
 # ---- kernel image (flat, loaded at 0x10000) ----
-kernel.bin: $(KOBJS) $(UOBJS) $(BUILD)/ramdisk.o kernel/linker.ld
+kernel.bin: $(KOBJS) $(UOBJS) $(BUILD)/ramdisk.o kernel/legacy32/linker.ld
 	$(LD) $(LDFLAGS) -o $(BUILD)/kernel.elf $(KOBJS) $(UOBJS) $(BUILD)/ramdisk.o
 	$(OBJCOPY) -O binary $(BUILD)/kernel.elf $@
 	nm $(BUILD)/kernel.elf > $(BUILD)/kernel.sym
@@ -186,14 +207,14 @@ run-serial: os.img fs.img
 # compiled freestanding and linked straight to one PE32+ EFI application.
 $(BUILD)/efi_main.o: boot/efi_main.c $(EFI_HDRS) | $(BUILD)
 	$(CC) $(EFI_CFLAGS) -c -o $@ $<
-$(BUILD)/%64.o: kernel/%64.c $(EFI_HDRS) | $(BUILD)
+$(BUILD)/%64.o: %64.c $(EFI_HDRS) | $(BUILD)
 	$(CC) $(EFI_CFLAGS) -c -o $@ $<
-$(BUILD)/entry64.o: kernel/entry64.s | $(BUILD)
+$(BUILD)/entry64.o: entry64.s | $(BUILD)
 	$(AS) --64 -o $@ $<
 
 # AP startup trampoline: real->protected->long mode, linked flat at 0x8000 and
 # embedded as a byte blob the BSP copies to physical 0x8000 before SIPIs.
-$(BUILD)/ap_trampoline.bin: kernel/ap_trampoline.s | $(BUILD)
+$(BUILD)/ap_trampoline.bin: ap_trampoline.s | $(BUILD)
 	$(AS) --64 -o $(BUILD)/ap_tramp_pre.o $<
 	$(LD) -m elf_x86_64 -Ttext=0x8000 -e _tramp_start -nostdlib -o $(BUILD)/ap_tramp.elf $(BUILD)/ap_tramp_pre.o
 	$(OBJCOPY) -O binary $(BUILD)/ap_tramp.elf $@
@@ -203,7 +224,7 @@ $(BUILD)/ap_tramp_array.h: $(BUILD)/ap_trampoline.bin | $(BUILD)
 $(BUILD)/smp64.o: $(BUILD)/ap_tramp_array.h
 
 # ring-0/ring-3 plumbing (trap64.s)
-$(BUILD)/trap64.o: kernel/trap64.s | $(BUILD)
+$(BUILD)/trap64.o: trap64.s | $(BUILD)
 	$(AS) --64 -o $@ $<
 
 # x64 ring-3 user programs: compile a .cpp to a flat PIC image, embed as a C blob
@@ -219,6 +240,46 @@ $(BUILD)/linux_hello.elf: programs/linux_hello.s programs/linux64.ld | $(BUILD)
 	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_hello.o
 $(BUILD)/linux_hello.h: $(BUILD)/linux_hello.elf | $(BUILD)
 	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char linux_hello_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/linux_fork.elf: programs/linux_fork.s programs/linux64.ld | $(BUILD)
+	$(AS) --64 -o $(BUILD)/linux_fork.o programs/linux_fork.s
+	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_fork.o
+$(BUILD)/linux_fork.h: $(BUILD)/linux_fork.elf | $(BUILD)
+	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char linux_fork_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/linux_forkexec.elf: programs/linux_forkexec.s programs/linux64.ld | $(BUILD)
+	$(AS) --64 -o $(BUILD)/linux_forkexec.o programs/linux_forkexec.s
+	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_forkexec.o
+$(BUILD)/linux_forkexec.h: $(BUILD)/linux_forkexec.elf | $(BUILD)
+	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char linux_forkexec_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/linux_forkstorm.elf: programs/linux_forkstorm.s programs/linux64.ld | $(BUILD)
+	$(AS) --64 -o $(BUILD)/linux_forkstorm.o programs/linux_forkstorm.s
+	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_forkstorm.o
+$(BUILD)/linux_forkstorm.h: $(BUILD)/linux_forkstorm.elf | $(BUILD)
+	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char linux_forkstorm_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/linux_pipe.elf: programs/linux_pipe.s programs/linux64.ld | $(BUILD)
+	$(AS) --64 -o $(BUILD)/linux_pipe.o programs/linux_pipe.s
+	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_pipe.o
+$(BUILD)/linux_pipe.h: $(BUILD)/linux_pipe.elf | $(BUILD)
+	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char linux_pipe_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/linux_sig.elf: programs/linux_sig.s programs/linux64.ld | $(BUILD)
+	$(AS) --64 -o $(BUILD)/linux_sig.o programs/linux_sig.s
+	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_sig.o
+$(BUILD)/linux_sig.h: $(BUILD)/linux_sig.elf | $(BUILD)
+	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char linux_sig_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/linux_sigh.elf: programs/linux_sigh.s programs/linux64.ld | $(BUILD)
+	$(AS) --64 -o $(BUILD)/linux_sigh.o programs/linux_sigh.s
+	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_sigh.o
+$(BUILD)/linux_sigh.h: $(BUILD)/linux_sigh.elf | $(BUILD)
+	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char linux_sigh_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/linux_tty.elf: programs/linux_tty.s programs/linux64.ld | $(BUILD)
+	$(AS) --64 -o $(BUILD)/linux_tty.o programs/linux_tty.s
+	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_tty.o
+$(BUILD)/linux_tty.h: $(BUILD)/linux_tty.elf | $(BUILD)
+	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char linux_tty_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/linux_proc.elf: programs/linux_proc.s programs/linux64.ld | $(BUILD)
+	$(AS) --64 -o $(BUILD)/linux_proc.o programs/linux_proc.s
+	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_proc.o
+$(BUILD)/linux_proc.h: $(BUILD)/linux_proc.elf | $(BUILD)
+	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char linux_proc_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
 $(BUILD)/linux_exec_child.elf: programs/linux_exec_child.s programs/linux64.ld | $(BUILD)
 	$(AS) --64 -o $(BUILD)/linux_exec_child.o programs/linux_exec_child.s
 	$(LD) -m elf_x86_64 -nostdlib -T programs/linux64.ld -o $@ $(BUILD)/linux_exec_child.o
@@ -227,6 +288,8 @@ $(BUILD)/musl-gcc.specs: $(MUSL_LIBDIR)/musl-gcc.specs | $(BUILD)
 	    -e 's|/usr/lib/x86_64-linux-musl|$(MUSL_LIBDIR)|g' \
 	    -e 's|-dynamic-linker /lib/x86_64-linux-musl|-dynamic-linker $(MUSL_ROOT)/lib/x86_64-linux-musl|g' $< > $@
 $(BUILD)/musl_probe.elf: programs/musl_probe.c $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/mbb.elf: programs/mbb.c $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/musl_probe.h: $(BUILD)/musl_probe.elf | $(BUILD)
 	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char musl_probe_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
@@ -238,14 +301,14 @@ $(BUILD)/tcc_self_probe.elf: programs/tcc_self_probe.c $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/tcc2_probe.elf: programs/tcc2_probe.c $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
-$(BUILD)/arch64.o: $(X64PROG_HDRS) $(LINUX_TEST_HDR) $(MUSL_TEST_HDR)
+$(BUILD)/arch64.o: $(X64PROG_HDRS) $(LINUX_TEST_HDR) $(LINUX_FORK_HDR) $(LINUX_FORKEXEC_HDR) $(LINUX_FORKSTORM_HDR) $(LINUX_PIPE_HDR) $(LINUX_SIG_HDR) $(LINUX_SIGH_HDR) $(LINUX_TTY_HDR) $(LINUX_PROC_HDR) $(MUSL_TEST_HDR)
 
 # x64 filesystem: a small FAT16 image (built from disk/ by tools/mkfatfs.py) is
 # embedded as a C blob and mounted as a writable RAM disk by kernel/fat64.c; the
 # ring-3 readdir/readfile/writefile syscalls route there.  FATFS_KB sizes it.
 FATFS_KB ?= 256
-$(BUILD)/fatfs.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf programs/tcc_hello.c | $(BUILD)
-	$(PYTHON) tools/mkfatfs.py $@ disk $(FATFS_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c
+$(BUILD)/fatfs.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/mbb.elf programs/tcc_hello.c | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ disk $(FATFS_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c MBB.BIN=$(BUILD)/mbb.elf
 $(BUILD)/fatfs.h: $(BUILD)/fatfs.img | $(BUILD)
 	$(PYTHON) -c "d=open('$(BUILD)/fatfs.img','rb').read(); open('$(BUILD)/fatfs.h','w').write('static const unsigned char fatfs_img[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
 $(BUILD)/fat64.o: $(BUILD)/fatfs.h
@@ -276,8 +339,8 @@ $(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h p
 
 # persistent filesystem disk: seeded ONCE from the staging root, kept outside
 # build/ so `make clean` won't wipe it.  `rm tinyfs.img` to re-seed.
-tinyfs.img: $(BUILD)/fsroot.stamp | $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(TCC_BIN)
-	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(PERSIST_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c
+tinyfs.img: $(BUILD)/fsroot.stamp | $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/mbb.elf $(TCC_BIN)
+	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(PERSIST_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c MBB.BIN=$(BUILD)/mbb.elf
 	@echo "seeded persistent disk $@ ($(PERSIST_KB) KB) from build/fsroot/"
 
 # boot the x64 build under qemu-system-x86_64 + OVMF in a graphical window so the
@@ -305,8 +368,8 @@ run-x64-headless: esp tinyfs.img
 # tools/mkgptesp.py writes the GPT, FAT32 ESP, and persistent FAT16 data
 # partition by hand (no mkfs.vfat/mtools needed).
 HYPER_DATA_KB ?= 16384
-$(BUILD)/hyper_data.img: tools/mkfatfs.py $(BUILD)/fsroot.stamp $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/tcc_self_probe.elf $(BUILD)/tcc2_probe.elf programs/tcc_hello.c programs/tcc_printf_hello.c programs/tcc_printf.rsp programs/tcc_include/stdio.h $(TCC_BIN) $(TCC_SELF)/TCCSELF.I $(TCC_SELF)/BUILD.RSP $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
-	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(HYPER_DATA_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c PRINTF.RSP=programs/tcc_printf.rsp STDIO.H=programs/tcc_include/stdio.h SELFRUN.BIN=$(BUILD)/tcc_self_probe.elf TCC2RUN.BIN=$(BUILD)/tcc2_probe.elf TCCSELF.I=$(TCC_SELF)/TCCSELF.I BUILD.RSP=$(TCC_SELF)/BUILD.RSP CRT1.O=$(TCC_SELF)/lib/crt1.o CRTI.O=$(TCC_SELF)/lib/crti.o CRTN.O=$(TCC_SELF)/lib/crtn.o LIBC.A=$(TCC_SELF)/lib/libc.a LIBTCC1.A=$(TCC_SELF)/lib/libtcc1.a
+$(BUILD)/hyper_data.img: tools/mkfatfs.py $(BUILD)/fsroot.stamp $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/tcc_self_probe.elf $(BUILD)/tcc2_probe.elf $(BUILD)/mbb.elf programs/tcc_hello.c programs/tcc_printf_hello.c programs/tcc_printf.rsp programs/tcc_include/stdio.h $(TCC_BIN) $(TCC_SELF)/TCCSELF.I $(TCC_SELF)/BUILD.RSP $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(HYPER_DATA_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c PRINTF.RSP=programs/tcc_printf.rsp STDIO.H=programs/tcc_include/stdio.h SELFRUN.BIN=$(BUILD)/tcc_self_probe.elf TCC2RUN.BIN=$(BUILD)/tcc2_probe.elf TCCSELF.I=$(TCC_SELF)/TCCSELF.I BUILD.RSP=$(TCC_SELF)/BUILD.RSP CRT1.O=$(TCC_SELF)/lib/crt1.o CRTI.O=$(TCC_SELF)/lib/crti.o CRTN.O=$(TCC_SELF)/lib/crtn.o LIBC.A=$(TCC_SELF)/lib/libc.a LIBTCC1.A=$(TCC_SELF)/lib/libtcc1.a MBB.BIN=$(BUILD)/mbb.elf
 $(BUILD)/tinyos.img: esp tools/mkgptesp.py $(BUILD)/hyper_data.img
 	$(PYTHON) tools/mkgptesp.py $@ $(ESP) $(BUILD)/hyper_data.img
 

@@ -3,6 +3,11 @@
 > **Looking for a gentler introduction?** [`GUIDE.md`](GUIDE.md) is a detailed,
 > concept-first walkthrough for entry-level OS developers. This document is the
 > terser architecture reference.
+>
+> **This document describes the original 32-bit (i386) edition.** For the
+> 64-bit UEFI edition — long mode, SMP, the framebuffer desktop, persistent
+> FAT16 on Hyper-V/QEMU, the Linux-compatible ABI, musl, and the on-device
+> self-hosting compiler — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## 1. Overview
 

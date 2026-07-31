@@ -85,6 +85,30 @@ typedef struct {
     void     *ConfigurationTable;             /* 112 */
 } EFI_SYSTEM_TABLE;
 
+/* ---- Runtime Services: GetTime (UEFI wall clock) ---- */
+typedef struct {
+    uint16_t Year; uint8_t Month, Day, Hour, Minute, Second, Pad1;
+    uint32_t Nanosecond; int16_t TimeZone; uint8_t Daylight, Pad2;
+} EFI_TIME;
+typedef EFI_STATUS (EFIAPI *EFI_GET_TIME)(EFI_TIME *, void *);
+typedef struct {
+    char Hdr[24];
+    EFI_GET_TIME GetTime;                     /* 24: first runtime service we use */
+    /* remaining fields unused */
+} EFI_RUNTIME_SERVICES;
+
+/* civil date -> Unix epoch seconds (proleptic Gregorian); the EFI_TIME face
+ * value is used verbatim so `date` shows the same wall clock as the host. */
+static uint64_t civil_to_epoch(int y, int m, int d, int hh, int mm, int ss) {
+    y -= (m <= 2);
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (unsigned)((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1);
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long days = (long)era * 146097 + (long)doe - 719468;
+    return (uint64_t)days * 86400ULL + (uint64_t)hh * 3600 + (uint64_t)mm * 60 + (uint64_t)ss;
+}
+
 /* ---- Graphics Output Protocol ---- */
 typedef struct {
     uint32_t Version, HorizontalResolution, VerticalResolution, PixelFormat;
@@ -270,6 +294,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 sputs("[efi] ACPI RSDP found\n");
                 break;
             }
+        }
+    }
+
+    /* 1d) UEFI wall clock (RuntimeServices GetTime; works on Hyper-V Gen2 + OVMF,
+     * where a legacy CMOS RTC may be absent) */
+    {
+        EFI_RUNTIME_SERVICES *RT = (EFI_RUNTIME_SERVICES *)SystemTable->RuntimeServices;
+        EFI_TIME t;
+        for (unsigned i = 0; i < sizeof t; i++) ((uint8_t *)&t)[i] = 0;
+        if (RT && RT->GetTime && RT->GetTime(&t, 0) == EFI_SUCCESS && t.Year >= 2000) {
+            g_bi.boot_epoch = civil_to_epoch(t.Year, t.Month, t.Day, t.Hour, t.Minute, t.Second);
+            sputs("[efi] UEFI wall-clock time acquired\n");
         }
     }
 

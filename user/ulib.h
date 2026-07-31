@@ -10,7 +10,7 @@ enum {                          // must match kernel/kernel.h
     YIELD = 7, GETPID = 8, SPAWN = 10,
     EXEC = 9, STAT = 11, LSEEK = 12, FORK = 13, WAIT = 14, READDIR = 15, TASKINFO = 16, ECHO = 17, READFILE = 18,
     GETCHAR = 19, CLEAR = 20, GOTOXY = 21, WRITEFILE = 22, MKDIR = 23, UNLINK = 24, CHDIR = 25, GETCWD = 26,
-    WINSIZE = 27,
+    WINSIZE = 27, COPY = 28,
 };
 enum { STDIN = 0, STDOUT = 1 };
 enum {                          // extended key codes from the PS/2 driver (match kernel.h)
@@ -76,6 +76,7 @@ static inline int  lseek(int fd, int off, int wh)    { return syscall(LSEEK, fd,
 static inline int  readdir(const char *dir, int i, char *name) { return syscall(READDIR, (long)dir, i, (long)name); }
 static inline int  readfile(const char *path, char *buf, int max){ return syscall(READFILE, (long)path, (long)buf, max); }
 static inline int  writefile(const char *path, const char *buf, int n){ return syscall(WRITEFILE, (long)path, (long)buf, n); }
+static inline int  copy(const char *src, const char *dst){ return syscall(COPY, (long)src, (long)dst); }
 static inline int  mkdir(const char *path)           { return syscall(MKDIR, (long)path); }
 static inline int  unlink(const char *path)          { return syscall(UNLINK, (long)path); }
 static inline int  chdir(const char *path)           { return syscall(CHDIR, (long)path); }
