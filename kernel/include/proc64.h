@@ -27,7 +27,7 @@ enum proc_state {
 
 enum user_abi { USER_ABI_TINYOS = 0, USER_ABI_LINUX, USER_ABI_DEMO };
 
-enum linux_fd_kind { LINUX_FD_FILE = 1, LINUX_FD_DIR, LINUX_FD_NULL, LINUX_FD_PIPE_R, LINUX_FD_PIPE_W, LINUX_FD_PROC, LINUX_FD_SOCKET };
+enum linux_fd_kind { LINUX_FD_FILE = 1, LINUX_FD_DIR, LINUX_FD_NULL, LINUX_FD_PIPE_R, LINUX_FD_PIPE_W, LINUX_FD_PROC, LINUX_FD_SOCKET, LINUX_FD_TTY };
 
 /* One open file / directory in a process fd table. */
 struct linux_fd {
@@ -38,7 +38,7 @@ struct linux_fd {
     uint16_t dir_cluster;           /* FAT start cluster for dirs     */
     int      pipe;                  /* pipe pool index (PIPE_R/PIPE_W) */
     int      sock;                  /* TCP connection index (SOCKET)  */
-    char     path[80];
+    char     path[256];
 };
 
 /* Per-process address-space arena (Linux ABI). */

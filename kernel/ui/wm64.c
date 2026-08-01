@@ -70,13 +70,10 @@ static void draw_kv(uint32_t *back, int x, int y, const char *label, uint32_t va
     fb_text_to_s(back, (uint32_t)(x + (int)slen(label) * g_cell), (uint32_t)y, b, 0xFFFFFF, CONTENT_BG, g_uisc);
 }
 
-/* like draw_kv but renders the value as 0x-prefixed hex (for status bitfields) */
-static void draw_kv_hex(uint32_t *back, int x, int y, const char *label, uint32_t val) {
+/* like draw_kv but renders a string value (e.g. the OS version) */
+static void draw_str(uint32_t *back, int x, int y, const char *label, const char *val) {
     fb_text_to_s(back, (uint32_t)x, (uint32_t)y, label, 0x99CCFF, CONTENT_BG, g_uisc);
-    char b[12]; int n = 0; b[n++] = '0'; b[n++] = 'x';
-    for (int s = 28; s >= 0; s -= 4) { int d = (int)((val >> s) & 0xF); b[n++] = (char)(d < 10 ? '0' + d : 'A' + d - 10); }
-    b[n] = 0;
-    fb_text_to_s(back, (uint32_t)(x + (int)slen(label) * g_cell), (uint32_t)y, b, 0xFFFFFF, CONTENT_BG, g_uisc);
+    fb_text_to_s(back, (uint32_t)(x + (int)slen(label) * g_cell), (uint32_t)y, val, 0xFFFFFF, CONTENT_BG, g_uisc);
 }
 
 /* render "RES <w>x<h>" (the live framebuffer resolution) */
@@ -139,6 +136,7 @@ static void sysmon_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw
     int y = cy;
     fb_text_to_s(back, (uint32_t)cx, (uint32_t)y, "tinyos x64 kernel", 0x66FFCC, CONTENT_BG, g_uisc);
     y += g_lineh + 4;
+    draw_str(back, cx, y, "OS VER   ", "v" TINYOS_VERSION);                        y += g_lineh;
     draw_kv(back, cx, y, "FPS      ", g_fps);                                      y += g_lineh;
     draw_kv(back, cx, y, "UPTIME S ", (uint32_t)(millis() / 1000));                y += g_lineh;
     draw_date(back, cx, y);                                                        y += g_lineh;
@@ -148,10 +146,6 @@ static void sysmon_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw
     draw_kv(back, cx, y, "CORES    ", (uint32_t)smp_online_count());               y += g_lineh;
     draw_kv(back, cx, y, "TSC MHZ  ", (uint32_t)(tsc_freq_hz() / 1000000));         y += g_lineh;
     draw_kv(back, cx, y, "HV STAGE ", (uint32_t)hvkbd_stage());                    y += g_lineh;
-    draw_kv(back, cx, y, "STOR STG ", (uint32_t)storvsc_stage());                  y += g_lineh;
-    draw_kv_hex(back, cx, y, "STOR IO  ", (uint32_t)storvsc_diag());               y += g_lineh;
-    draw_kv_hex(back, cx, y, "STOR VER ", (uint32_t)storvsc_ver());                y += g_lineh;
-    draw_kv(back, cx, y, "STOR BSZ ", (uint32_t)storvsc_blksz());                  y += g_lineh;
     draw_kv(back, cx, y, "NET STG  ", (uint32_t)netvsc_stage());                   y += g_lineh;
     draw_res(back, cx, y, g_scr_w, g_scr_h);                                       y += g_lineh;
     draw_kv(back, cx, y, "GOP MODES", g_bi ? g_bi->gop_modes : 0);

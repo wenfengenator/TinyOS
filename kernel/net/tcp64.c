@@ -36,6 +36,9 @@ enum { CLOSED, LISTEN, SYN_SENT, SYN_RCVD, ESTAB, FIN_WAIT1, FIN_WAIT2, CLOSE_WA
 #define RXCAP  8192
 #define MSS    1200
 #define GUARD  120000000u
+#define IO_TIMEOUT_MS  20000u    /* wall-clock idle timeout for blocking send/recv (slow servers) */
+#define SYN_TIMEOUT_MS 10000u    /* connect() SYN-ACK wait */
+#define RETX_MS        200u      /* retransmit interval for the single outstanding segment */
 
 struct tcb {
     int      used, state, listener, parent;
@@ -173,11 +176,12 @@ int tcp_connect(uint32_t dst, uint16_t dport) {
     t->state = SYN_SENT;
     net_drain();                                    /* clear RX backlog so the SYN-ACK isn't dropped */
     tcp_arm(t, F_SYN, 0, 0, t->snd_nxt); t->snd_nxt++;
-    for (uint32_t g = 0; g < GUARD; g++) {
+    uint64_t deadline = millis() + SYN_TIMEOUT_MS, next_retx = millis() + RETX_MS;
+    while (millis() < deadline) {
         net_poll();
         if (t->state == ESTAB) return tcb_idx(t);
         if (!t->used || t->state == CLOSED) return -1;
-        if ((g & 0x3FFFFF) == 0x3FFFFF) tcp_retx(t);
+        if (millis() >= next_retx) { tcp_retx(t); next_retx = millis() + RETX_MS; }
         __asm__ volatile("pause");
     }
     return -1;
@@ -209,22 +213,24 @@ int tcp_send(int idx, const void *data, int len) {
     net_drain();                                    /* clear backlog so ACKs aren't dropped */
     const uint8_t *p = data; int off = 0;
     while (off < len) {
-        uint32_t g = 0;
-        while (t->urpending && g < GUARD) { net_poll(); if ((g & 0x3FFFFF) == 0x3FFFFF) tcp_retx(t); g++; __asm__ volatile("pause"); }
+        uint64_t deadline = millis() + IO_TIMEOUT_MS, next_retx = millis() + RETX_MS;
+        while (t->urpending && millis() < deadline) { net_poll(); if (millis() >= next_retx) { tcp_retx(t); next_retx = millis() + RETX_MS; } __asm__ volatile("pause"); }
         if (t->urpending) return off ? off : -1;
         if (t->state != ESTAB && t->state != CLOSE_WAIT) return off ? off : -1;
         int chunk = len - off; if (chunk > MSS) chunk = MSS;
         tcp_arm(t, F_ACK | F_PSH, p + off, chunk, t->snd_nxt);
         t->snd_nxt += chunk; off += chunk;
     }
-    for (uint32_t g = 0; t->urpending && g < GUARD; g++) { net_poll(); if ((g & 0x3FFFFF) == 0x3FFFFF) tcp_retx(t); __asm__ volatile("pause"); }
+    uint64_t deadline = millis() + IO_TIMEOUT_MS, next_retx = millis() + RETX_MS;
+    while (t->urpending && millis() < deadline) { net_poll(); if (millis() >= next_retx) { tcp_retx(t); next_retx = millis() + RETX_MS; } __asm__ volatile("pause"); }
     return off;
 }
 int tcp_recv(int idx, void *buf, int max) {
     if (idx < 0 || idx >= NTCB) return -1;
     struct tcb *t = &T[idx];
     net_drain();                                    /* process pending segments + clear backlog */
-    for (uint32_t g = 0; g < GUARD; g++) {
+    uint64_t deadline = millis() + IO_TIMEOUT_MS;    /* wall-clock idle wait (slow servers != EOF) */
+    for (;;) {
         if (t->rxlen > 0) {
             int n = t->rxlen; if (n > max) n = max;
             memcpy(buf, t->rx, n);
@@ -234,10 +240,10 @@ int tcp_recv(int idx, void *buf, int max) {
         }
         if (t->finrecv) return 0;                      /* EOF */
         if (!t->used || t->state == CLOSED) return -1;
+        if (millis() >= deadline) return 0;            /* no data for the whole window: give up */
         net_poll();
         __asm__ volatile("pause");
     }
-    return 0;
 }
 int tcp_close(int idx) {
     if (idx < 0 || idx >= NTCB) return -1;

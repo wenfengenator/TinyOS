@@ -5,6 +5,9 @@
 
 #include <stdint.h>
 
+/* TinyOS product version. */
+#define TINYOS_VERSION "1.0.0"
+
 /* Handoff block: the UEFI loader fills this before ExitBootServices and passes
  * a pointer to the 64-bit kernel entry. */
 typedef struct {

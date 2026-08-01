@@ -217,24 +217,46 @@ static void name83(const uint8_t *e, char *out) {
 
 int fat_list(uint32_t dir_cluster, int which, char *name, uint8_t *attr, uint16_t *cluster, uint32_t *size) {
     uint8_t e[32]; int count = 0;
+    char lfn[256]; int have_lfn = 0; uint8_t lfn_sum = 0;                /* reconstructed VFAT long name */
     for (uint32_t i = 0; dir_raw(dir_cluster, i, e) == 0; i++) {
         if (e[0] == 0x00) break;                            /* end of directory */
-        if (e[0] == 0xE5 || e[11] == 0x0F || (e[11] & 0x08)) continue;  /* deleted/LFN/volume */
-        if (count++ != which) continue;
-        if (name) name83(e, name);
-        if (attr) *attr = e[11];
-        if (cluster) *cluster = e[26] | (e[27] << 8);
-        if (size) *size = e[28] | (e[29] << 8) | (e[30] << 16) | (e[31] << 24);
-        return 0;
+        if (e[0] == 0xE5) { have_lfn = 0; continue; }        /* deleted */
+        if (e[11] == 0x0F) {                                 /* long-filename component */
+            int ord = e[0] & 0x1F;
+            if (e[0] & 0x40) { have_lfn = 1; lfn_sum = e[13]; memset(lfn, 0, sizeof lfn); }
+            if (!have_lfn || e[13] != lfn_sum || ord < 1 || ord > 19) { have_lfn = 0; continue; }
+            static const uint8_t pos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+            int base = (ord - 1) * 13;
+            for (int k = 0; k < 13 && base + k < (int)sizeof lfn - 1; k++) {
+                uint16_t ch = (uint16_t)(e[pos[k]] | (e[pos[k] + 1] << 8));
+                lfn[base + k] = (ch == 0 || ch == 0xFFFF) ? 0 : (ch < 0x80 ? (char)ch : '_');
+            }
+            continue;
+        }
+        if (e[11] & 0x08) { have_lfn = 0; continue; }        /* volume label */
+        if (count++ == which) {                              /* the visible short entry */
+            int use_lfn = 0;
+            if (have_lfn && lfn[0]) {
+                uint8_t sum = 0;                             /* short-name checksum ties LFN to this entry */
+                for (int k = 0; k < 11; k++) sum = (uint8_t)(((sum & 1) << 7) + (sum >> 1) + e[k]);
+                if (sum == lfn_sum) use_lfn = 1;
+            }
+            if (name) { if (use_lfn) { int j = 0; while (lfn[j] && j < 255) { name[j] = lfn[j]; j++; } name[j] = 0; } else name83(e, name); }
+            if (attr) *attr = e[11];
+            if (cluster) *cluster = e[26] | (e[27] << 8);
+            if (size) *size = e[28] | (e[29] << 8) | (e[30] << 16) | (e[31] << 24);
+            return 0;
+        }
+        have_lfn = 0;
     }
     return -1;
 }
 
 int fat_lookup(uint32_t dir_cluster, const char *want, uint8_t *attr, uint16_t *cluster, uint32_t *size) {
-    char nm[16];
+    char nm[256];
     for (int i = 0; fat_list(dir_cluster, i, nm, attr, cluster, size) == 0; i++) {
-        int j = 0; while (nm[j] && lc(want[j]) == nm[j]) j++;
-        if (!nm[j] && !want[j]) return 0;
+        int j = 0; while (nm[j] && want[j] && lc(nm[j]) == lc(want[j])) j++;
+        if (!nm[j] && !want[j]) return 0;                    /* case-insensitive full match */
     }
     return -1;
 }
@@ -246,8 +268,8 @@ int fat_resolve(const char *path, uint8_t *attr, uint16_t *cluster, uint32_t *si
     while (*p == '/') p++;
     if (!*p) { if (attr) *attr = 0x10; if (cluster) *cluster = 0; if (size) *size = 0; return 0; }
     for (;;) {
-        char comp[16]; int k = 0;
-        while (*p && *p != '/' && k < 15) comp[k++] = *p++;
+        char comp[256]; int k = 0;
+        while (*p && *p != '/' && k < 255) comp[k++] = *p++;
         comp[k] = 0;
         uint8_t at; uint16_t cl; uint32_t sz;
         if (fat_lookup(cur, comp, &at, &cl, &sz) < 0) return -1;
@@ -342,8 +364,8 @@ static int fat_parent(const char *sub, uint16_t *pdir, char *name) {
     for (;;) {
         while (*sub == '/') sub++;
         if (!*sub) return -1;
-        char comp[16]; int k = 0;
-        while (*sub && *sub != '/' && k < 15) comp[k++] = *sub++;
+        char comp[256]; int k = 0;
+        while (*sub && *sub != '/' && k < 255) comp[k++] = *sub++;
         comp[k] = 0;
         const char *t = sub; while (*t == '/') t++;
         if (!*t) { *pdir = cur; int j = 0; while (comp[j]) { name[j] = comp[j]; j++; } name[j] = 0; return 0; }
@@ -354,25 +376,172 @@ static int fat_parent(const char *sub, uint16_t *pdir, char *name) {
     }
 }
 
+/* ===================== VFAT long-name write support ===================== */
+static int valid83(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+           c == '_' || c == '-' || c == '~' || c == '!' || c == '#' || c == '$' || c == '%' ||
+           c == '&' || c == '(' || c == ')' || c == '@' || c == '^' || c == '{' || c == '}';
+}
+static int is_canon83(const char *name) {          /* representable as an uppercase 8.3? */
+    int base = 0, ext = 0, dot = 0;
+    for (int i = 0; name[i]; i++) {
+        char c = name[i];
+        if (c == '.') { if (dot) return 0; dot = 1; continue; }
+        if (c >= 'a' && c <= 'z') return 0;         /* lowercase -> need LFN to keep case */
+        if (!valid83(c)) return 0;
+        if (dot) { if (++ext > 3) return 0; } else { if (++base > 8) return 0; }
+    }
+    return base > 0;
+}
+static int s_len(const char *s) { int n = 0; while (s[n]) n++; return n; }
+static uint8_t lfn_cksum(const uint8_t raw[11]) {
+    uint8_t s = 0; for (int i = 0; i < 11; i++) s = (uint8_t)(((s & 1) << 7) + (s >> 1) + raw[i]); return s;
+}
+/* build an 8.3 alias "BASE~N.EXT" (upper-cased, invalid chars -> '_') */
+static void alias83(const char *name, int tilde, uint8_t raw[11]) {
+    for (int i = 0; i < 11; i++) raw[i] = ' ';
+    const char *dot = 0; for (const char *p = name; *p; p++) if (*p == '.') dot = p;
+    int nd = 0, t = tilde ? tilde : 1; for (int u = t; u; u /= 10) nd++;
+    int blim = 8 - 1 - nd; if (blim < 1) blim = 1;
+    int k = 0;
+    for (const char *p = name; *p && (!dot || p < dot) && k < blim; p++) {
+        if (*p == ' ' || *p == '.') continue;
+        raw[k++] = (uint8_t)up(valid83(*p) ? *p : '_');
+    }
+    raw[k++] = '~';
+    char num[8]; int nn = 0; for (int u = t; u; u /= 10) num[nn++] = (char)('0' + u % 10);
+    while (nn && k < 8) raw[k++] = (uint8_t)num[--nn];
+    if (dot) { int e = 8; for (const char *p = dot + 1; *p && e < 11; p++) raw[e++] = (uint8_t)up(valid83(*p) ? *p : '_'); }
+}
+static void gen_alias(uint32_t dir, const char *name, uint8_t raw[11]) {
+    for (int t = 1; t < 100000; t++) {
+        alias83(name, t, raw);
+        uint8_t e[32]; int taken = 0;
+        for (uint32_t i = 0; dir_raw(dir, i, e) == 0; i++) {
+            if (e[0] == 0x00) break;
+            if (e[0] == 0xE5 || e[11] == 0x0F || (e[11] & 0x08)) continue;
+            int same = 1; for (int j = 0; j < 11; j++) if (e[j] != raw[j]) { same = 0; break; }
+            if (same) { taken = 1; break; }
+        }
+        if (!taken) return;
+    }
+}
+/* find an entry by long-or-short name; returns its short-entry slot in *short_i,
+ * the first LFN slot (== short_i if none) in *lfn_i, and the 32-byte entry in oe. */
+static int dir_find(uint32_t dir, const char *want, uint32_t *short_i, uint32_t *lfn_i, uint8_t oe[32]) {
+    uint8_t e[32]; char lfn[256]; int have = 0; uint8_t sum = 0; uint32_t lstart = 0;
+    for (uint32_t i = 0; dir_raw(dir, i, e) == 0; i++) {
+        if (e[0] == 0x00) break;
+        if (e[0] == 0xE5) { have = 0; continue; }
+        if (e[11] == 0x0F) {
+            int ord = e[0] & 0x1F;
+            if (e[0] & 0x40) { have = 1; sum = e[13]; for (int z = 0; z < 256; z++) lfn[z] = 0; lstart = i; }
+            if (!have || e[13] != sum || ord < 1 || ord > 19) { have = 0; continue; }
+            static const uint8_t pos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+            int base = (ord - 1) * 13;
+            for (int k = 0; k < 13 && base + k < 255; k++) {
+                uint16_t ch = (uint16_t)(e[pos[k]] | (e[pos[k] + 1] << 8));
+                lfn[base + k] = (ch == 0 || ch == 0xFFFF) ? 0 : (ch < 0x80 ? (char)ch : '_');
+            }
+            continue;
+        }
+        if (e[11] & 0x08) { have = 0; continue; }
+        char nm[256]; int use = 0;
+        if (have && lfn[0]) { uint8_t s = 0; for (int k = 0; k < 11; k++) s = (uint8_t)(((s & 1) << 7) + (s >> 1) + e[k]); if (s == sum) use = 1; }
+        if (use) { int j = 0; while (lfn[j] && j < 255) { nm[j] = lfn[j]; j++; } nm[j] = 0; } else name83(e, nm);
+        int j = 0; while (nm[j] && want[j] && lc(nm[j]) == lc(want[j])) j++;
+        if (!nm[j] && !want[j]) {
+            if (short_i) *short_i = i;
+            if (lfn_i) *lfn_i = use ? lstart : i;
+            if (oe) for (int z = 0; z < 32; z++) oe[z] = e[z];
+            return 0;
+        }
+        have = 0;
+    }
+    return -1;
+}
+/* find `need` contiguous free directory slots; 0 + *start on success. */
+static int dir_free_run(uint32_t dir, int need, uint32_t *start) {
+    uint8_t e[32]; int run = 0; uint32_t rs = 0;
+    for (uint32_t i = 0; dir_raw(dir, i, e) == 0; i++) {
+        if (e[0] == 0x00 || e[0] == 0xE5) { if (!run) rs = i; run++; } else run = 0;
+        if (run >= need) { *start = rs; return 0; }
+        if (e[0] == 0x00) {                             /* remaining slots are all free */
+            uint8_t t[32];
+            if (dir_raw(dir, rs + (uint32_t)need - 1, t) == 0) { *start = rs; return 0; }
+            return -1;
+        }
+    }
+    return -1;
+}
+/* write `nlfn` LFN entries + the short entry for `name` at slot run `start`. */
+static int dir_write_run(uint32_t dir, uint32_t start, const char *name, const uint8_t raw[11],
+                         int nlfn, uint8_t attr, uint16_t cluster, uint32_t size) {
+    static uint8_t sb[512];
+    uint8_t ck = lfn_cksum(raw); int nl = s_len(name);
+    static const uint8_t pos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+    for (int ord = nlfn; ord >= 1; ord--) {
+        uint8_t e[32]; for (int z = 0; z < 32; z++) e[z] = 0;
+        e[0] = (uint8_t)(ord | (ord == nlfn ? 0x40 : 0)); e[11] = 0x0F; e[13] = ck;
+        int base = (ord - 1) * 13;
+        for (int k = 0; k < 13; k++) {
+            uint16_t ch = (base + k < nl) ? (uint16_t)(uint8_t)name[base + k] : (base + k == nl ? 0 : 0xFFFF);
+            e[pos[k]] = (uint8_t)(ch & 0xFF); e[pos[k] + 1] = (uint8_t)(ch >> 8);
+        }
+        uint32_t lba, off; if (dirent_loc(dir, start + (uint32_t)(nlfn - ord), &lba, &off) < 0) return -1;
+        if (blk_read(lba, sb) < 0) return -1;
+        for (int z = 0; z < 32; z++) sb[off + z] = e[z];
+        if (blk_write(lba, sb) < 0) return -1;
+    }
+    uint8_t e[32]; for (int z = 0; z < 32; z++) e[z] = 0;
+    for (int j = 0; j < 11; j++) e[j] = raw[j];
+    e[11] = attr;
+    e[26] = (uint8_t)(cluster & 0xFF); e[27] = (uint8_t)(cluster >> 8);
+    e[28] = (uint8_t)(size & 0xFF); e[29] = (uint8_t)(size >> 8); e[30] = (uint8_t)(size >> 16); e[31] = (uint8_t)(size >> 24);
+    uint32_t lba, off; if (dirent_loc(dir, start + (uint32_t)nlfn, &lba, &off) < 0) return -1;
+    if (blk_read(lba, sb) < 0) return -1;
+    for (int z = 0; z < 32; z++) sb[off + z] = e[z];
+    return blk_write(lba, sb) < 0 ? -1 : 0;
+}
+/* append a zeroed cluster to a subdirectory so it can hold more entries; the
+ * FAT16 root directory is a fixed region and cannot grow (returns -1 for it).
+ * Long names cost 4+ slots each (git object dirs fill a one-cluster dir after
+ * only three 38-char entries), so directories must extend on demand. */
+static int dir_grow(uint32_t dir) {
+    if (dir == 0) return -1;                                  /* fixed FAT16 root */
+    uint16_t c = (uint16_t)dir, last = (uint16_t)dir;
+    while (c >= 2 && c < 0xFFF8) { last = c; c = fat_next(c); }
+    uint16_t nc = fat_alloc();
+    if (!nc) return -1;                                       /* disk full */
+    fat_set(last, nc); fat_set(nc, 0xFFFF);
+    static uint8_t zb[512];
+    for (int z = 0; z < 512; z++) zb[z] = 0;
+    for (uint32_t s = 0; s < f_spc; s++)
+        if (blk_write(f_data_start + (uint32_t)(nc - 2) * f_spc + s, zb) < 0) return -1;
+    return fat_cache_flush();                                 /* persist the new link */
+}
+/* create a directory entry for `name` (LFN if it isn't a plain uppercase 8.3). */
+static int dir_create(uint32_t dir, const char *name, uint8_t attr, uint16_t cluster, uint32_t size) {
+    uint8_t raw[11]; int nlfn = 0;
+    if (is_canon83(name)) to83(name, raw);
+    else { gen_alias(dir, name, raw); nlfn = (s_len(name) + 12) / 13; }
+    uint32_t start; int tries = 0;
+    while (dir_free_run(dir, nlfn + 1, &start) < 0) {         /* grow a full subdir */
+        if (tries++ >= 8 || dir_grow(dir) < 0) return -1;
+    }
+    return dir_write_run(dir, start, name, raw, nlfn, attr, cluster, size);
+}
+
 int fat_write(const char *sub, const void *buf, uint32_t len) {
     if (!f_mounted) return -1;
-    uint16_t dir; char fname[16];
+    uint16_t dir; char fname[256];
     if (fat_parent(sub, &dir, fname) < 0) return -1;
-    uint8_t raw[11]; to83(fname, raw);
 
-    uint32_t slot = 0xFFFFFFFF, freeslot = 0xFFFFFFFF;
-    uint16_t oldcluster = 0;
-    uint8_t e[32];
-    for (uint32_t i = 0; dir_raw(dir, i, e) == 0; i++) {
-        if (e[0] == 0x00) { if (freeslot == 0xFFFFFFFF) freeslot = i; break; }
-        if (e[0] == 0xE5) { if (freeslot == 0xFFFFFFFF) freeslot = i; continue; }
-        if (e[11] == 0x0F || (e[11] & 0x08)) continue;              /* LFN/volume */
-        int same = 1; for (int j = 0; j < 11; j++) if (e[j] != raw[j]) { same = 0; break; }
-        if (same) { slot = i; oldcluster = e[26] | (e[27] << 8); break; }
-    }
-    if (slot == 0xFFFFFFFF) slot = freeslot;
-    if (slot == 0xFFFFFFFF) return -1;                             /* directory full */
-    if (oldcluster >= 2) fat_free_chain(oldcluster);               /* recycle old data */
+    uint32_t si, li; uint8_t oe[32];
+    int exists = (dir_find(dir, fname, &si, &li, oe) == 0);
+    if (exists && (oe[11] & 0x10)) return -1;                     /* refuse to clobber a directory */
+    uint16_t oldcluster = exists ? (uint16_t)(oe[26] | (oe[27] << 8)) : 0;
+    if (oldcluster >= 2) fat_free_chain(oldcluster);              /* recycle old data */
 
     uint32_t bpc = (uint32_t)f_spc * 512;
     uint32_t nclus = (len + bpc - 1) / bpc;
@@ -390,37 +559,32 @@ int fat_write(const char *sub, const void *buf, uint32_t len) {
         }
         prev = c;
     }
-    memset(e, 0, 32);
-    for (int j = 0; j < 11; j++) e[j] = raw[j];
-    e[11] = 0x20;                                                  /* archive attr */
-    e[26] = (uint8_t)(first & 0xFF); e[27] = (uint8_t)((first >> 8) & 0xFF);
-    e[28] = (uint8_t)(len & 0xFF);        e[29] = (uint8_t)((len >> 8) & 0xFF);
-    e[30] = (uint8_t)((len >> 16) & 0xFF); e[31] = (uint8_t)((len >> 24) & 0xFF);
-    uint32_t lba, off;
     if (fat_cache_flush() < 0) return -1;
-    if (dirent_loc(dir, slot, &lba, &off) < 0) return -1;
-    if (blk_read(lba, sb) < 0) return -1;
-    for (int j = 0; j < 32; j++) sb[off + j] = e[j];
-    if (blk_write(lba, sb) < 0) return -1;
+    if (exists) {                                                 /* update the short entry in place */
+        uint32_t lba, off;
+        if (dirent_loc(dir, si, &lba, &off) < 0) return -1;
+        if (blk_read(lba, sb) < 0) return -1;
+        sb[off + 11] = 0x20;
+        sb[off + 26] = (uint8_t)(first & 0xFF); sb[off + 27] = (uint8_t)(first >> 8);
+        sb[off + 28] = (uint8_t)(len & 0xFF); sb[off + 29] = (uint8_t)(len >> 8);
+        sb[off + 30] = (uint8_t)(len >> 16); sb[off + 31] = (uint8_t)(len >> 24);
+        if (blk_write(lba, sb) < 0) return -1;
+    } else if (dir_create(dir, fname, 0x20, first, len) < 0) {
+        if (first) fat_free_chain(first);
+        return -1;
+    }
     return (int)len;
 }
 
 static int fat_file_entry(const char *path, uint16_t *first, uint32_t *size,
                           uint32_t *entry_lba, uint32_t *entry_off) {
-    uint16_t dir; char name[16];
+    uint16_t dir; char name[256];
     if (fat_parent(path, &dir, name) < 0) return -1;
-    uint8_t raw[11], e[32]; to83(name, raw);
-    for (uint32_t i = 0; dir_raw(dir, i, e) == 0; i++) {
-        if (e[0] == 0x00) break;
-        if (e[0] == 0xE5 || e[11] == 0x0F || (e[11] & 0x08)) continue;
-        int same = 1;
-        for (int j = 0; j < 11; j++) if (e[j] != raw[j]) { same = 0; break; }
-        if (!same || (e[11] & 0x10)) continue;
-        *first = e[26] | (e[27] << 8);
-        *size = e[28] | (e[29] << 8) | (e[30] << 16) | (e[31] << 24);
-        return dirent_loc(dir, i, entry_lba, entry_off);
-    }
-    return -1;
+    uint32_t si, li; uint8_t e[32];
+    if (dir_find(dir, name, &si, &li, e) < 0 || (e[11] & 0x10)) return -1;
+    *first = e[26] | (e[27] << 8);
+    *size = e[28] | (e[29] << 8) | (e[30] << 16) | (e[31] << 24);
+    return dirent_loc(dir, si, entry_lba, entry_off);
 }
 
 static uint16_t fat_cluster_at(uint16_t first, uint32_t index) {
@@ -624,17 +788,10 @@ int fat_pwrite(const char *path, const void *buf, uint32_t len, uint32_t offset)
 /* create the subdirectory `sub` (absolute path); 0 on success, -1 on failure */
 int fat_mkdir(const char *sub) {
     if (!f_mounted) return -1;
-    uint16_t dir; char name[16];
+    uint16_t dir; char name[256];
     if (fat_parent(sub, &dir, name) < 0) return -1;
     uint8_t at; uint16_t cl; uint32_t sz;
     if (fat_lookup(dir, name, &at, &cl, &sz) == 0) return -1;      /* already exists */
-    uint8_t raw[11]; to83(name, raw);
-
-    uint32_t slot = 0xFFFFFFFF;                                    /* free slot in parent */
-    uint8_t e[32];
-    for (uint32_t i = 0; dir_raw(dir, i, e) == 0; i++)
-        if (e[0] == 0x00 || e[0] == 0xE5) { slot = i; break; }
-    if (slot == 0xFFFFFFFF) return -1;                             /* directory full */
 
     uint16_t nc = fat_alloc();                                    /* cluster for the new dir */
     if (!nc) return -1;
@@ -650,51 +807,38 @@ int fat_mkdir(const char *sub) {
     memset(sb, 0, 512);
     for (uint32_t s = 1; s < f_spc; s++) blk_write(f_data_start + (uint32_t)(nc - 2) * f_spc + s, sb);
 
-    memset(e, 0, 32);                                             /* dir entry in parent */
-    for (int j = 0; j < 11; j++) e[j] = raw[j];
-    e[11] = 0x10;
-    e[26] = (uint8_t)(nc & 0xFF); e[27] = (uint8_t)((nc >> 8) & 0xFF);
-    uint32_t lba, off;
-    if (fat_cache_flush() < 0) return -1;
-    if (dirent_loc(dir, slot, &lba, &off) < 0) return -1;
-    if (blk_read(lba, sb) < 0) return -1;
-    for (int j = 0; j < 32; j++) sb[off + j] = e[j];
-    if (blk_write(lba, sb) < 0) return -1;
+    if (fat_cache_flush() < 0) return -1;                         /* parent entry (LFN if long) */
+    if (dir_create(dir, name, 0x10, nc, 0) < 0) { fat_free_chain(nc); return -1; }
     return 0;
 }
 
 /* delete the file `sub` (absolute path).  0 ok, -1 not found, -2 is a directory */
 int fat_unlink(const char *sub) {
     if (!f_mounted) return -1;
-    uint16_t dir; char name[16];
+    uint16_t dir; char name[256];
     if (fat_parent(sub, &dir, name) < 0) return -1;
-    uint8_t raw[11]; to83(name, raw);
-    uint8_t e[32];
-    for (uint32_t i = 0; dir_raw(dir, i, e) == 0; i++) {
-        if (e[0] == 0x00) break;
-        if (e[0] == 0xE5 || e[11] == 0x0F || (e[11] & 0x08)) continue;
-        int same = 1; for (int j = 0; j < 11; j++) if (e[j] != raw[j]) { same = 0; break; }
-        if (!same) continue;
-        if (e[11] & 0x10) return -2;                              /* directory: refuse */
-        uint16_t cl = e[26] | (e[27] << 8);
-        if (cl >= 2) fat_free_chain(cl);
+    uint32_t si, li; uint8_t e[32];
+    if (dir_find(dir, name, &si, &li, e) < 0) return -1;          /* not found */
+    if (e[11] & 0x10) return -2;                                  /* directory: refuse */
+    uint16_t cl = e[26] | (e[27] << 8);
+    if (cl >= 2) fat_free_chain(cl);
+    if (fat_cache_flush() < 0) return -1;
+    static uint8_t sb[512];
+    for (uint32_t i = li; i <= si; i++) {                         /* clear LFN entries + short */
         uint32_t lba, off;
-        if (fat_cache_flush() < 0) return -1;
         if (dirent_loc(dir, i, &lba, &off) < 0) return -1;
-        static uint8_t sb[512];
         if (blk_read(lba, sb) < 0) return -1;
-        sb[off] = 0xE5;                                           /* mark the entry deleted */
+        sb[off] = 0xE5;
         if (blk_write(lba, sb) < 0) return -1;
-        return 0;
     }
-    return -1;                                                    /* not found */
+    return 0;
 }
 
 /* remove the empty subdirectory `sub` (absolute path).
  * 0 ok, -1 not found, -2 not a directory, -3 not empty */
 int fat_rmdir(const char *sub) {
     if (!f_mounted) return -1;
-    uint16_t dir; char name[16];
+    uint16_t dir; char name[256];
     if (fat_parent(sub, &dir, name) < 0) return -1;
     uint8_t at; uint16_t cl; uint32_t sz;
     if (fat_lookup(dir, name, &at, &cl, &sz) < 0) return -1;      /* not found */
@@ -708,58 +852,54 @@ int fat_rmdir(const char *sub) {
         return -3;                                                /* has a live entry */
     }
     if (cl >= 2) fat_free_chain(cl);
-    uint8_t raw[11]; to83(name, raw);                             /* clear the parent entry */
-    for (uint32_t i = 0; dir_raw(dir, i, e) == 0; i++) {
-        if (e[0] == 0x00) break;
-        if (e[0] == 0xE5 || e[11] == 0x0F || (e[11] & 0x08)) continue;
-        int same = 1; for (int j = 0; j < 11; j++) if (e[j] != raw[j]) { same = 0; break; }
-        if (!same) continue;
+    uint32_t si, li;                                              /* clear the parent entry (+LFN) */
+    if (dir_find(dir, name, &si, &li, e) < 0) return -1;
+    if (fat_cache_flush() < 0) return -1;
+    static uint8_t sb[512];
+    for (uint32_t i = li; i <= si; i++) {
         uint32_t lba, off;
-        if (fat_cache_flush() < 0) return -1;
         if (dirent_loc(dir, i, &lba, &off) < 0) return -1;
-        static uint8_t sb[512];
         if (blk_read(lba, sb) < 0) return -1;
         sb[off] = 0xE5;
         if (blk_write(lba, sb) < 0) return -1;
-        return 0;
     }
-    return -1;
+    return 0;
 }
 
 /* ============================ current directory ========================= */
 
-static char g_cwd[80] = "/";
+static char g_cwd[256] = "/";
 
 static void s_copy(char *d, const char *s) { int i = 0; while (s[i]) { d[i] = s[i]; i++; } d[i] = 0; }
 
 /* resolve a user path against the cwd into `out` as a normalized absolute path;
  * collapses "."/".." components and duplicate slashes so "./x" and "../x" work. */
 void fs_resolve(const char *path, char *out) {
-    char raw[128]; int p = 0;
+    char raw[300]; int p = 0;
     if (!path || !path[0]) path = ".";
     if (path[0] != '/') {                                         /* make it absolute via cwd */
-        for (int i = 0; g_cwd[i] && p < 120; i++) raw[p++] = g_cwd[i];
+        for (int i = 0; g_cwd[i] && p < 298; i++) raw[p++] = g_cwd[i];
         if (p != 1 || raw[0] != '/') raw[p++] = '/';
     }
-    for (int i = 0; path[i] && p < 126; i++) raw[p++] = path[i];
+    for (int i = 0; path[i] && p < 298; i++) raw[p++] = path[i];
     raw[p] = 0;
 
-    char comp[24][16]; int nc = 0;                               /* component stack */
+    char comp[40][64]; int nc = 0;                               /* component stack (names up to 63) */
     for (int i = 0; raw[i]; ) {
         while (raw[i] == '/') i++;
         if (!raw[i]) break;
-        char c[16]; int k = 0;
-        while (raw[i] && raw[i] != '/' && k < 15) c[k++] = raw[i++];
+        char c[64]; int k = 0;
+        while (raw[i] && raw[i] != '/' && k < 63) c[k++] = raw[i++];
         c[k] = 0;
         while (raw[i] && raw[i] != '/') i++;                      /* skip an overlong tail */
         if (c[0] == '.' && c[1] == 0) continue;                   /* "."  -> drop */
         if (c[0] == '.' && c[1] == '.' && c[2] == 0) { if (nc > 0) nc--; continue; }  /* ".." pop */
-        if (nc < 24) { s_copy(comp[nc], c); nc++; }
+        if (nc < 40) { s_copy(comp[nc], c); nc++; }
     }
-    int o = 0;                                                   /* rebuild "/a/b/c" */
-    for (int ci = 0; ci < nc && o < 78; ci++) {
+    int o = 0;                                                   /* rebuild "/a/b/c" (out >= 256B) */
+    for (int ci = 0; ci < nc && o < 254; ci++) {
         out[o++] = '/';
-        for (int j = 0; comp[ci][j] && o < 78; j++) out[o++] = comp[ci][j];
+        for (int j = 0; comp[ci][j] && o < 254; j++) out[o++] = comp[ci][j];
     }
     if (o == 0) out[o++] = '/';
     out[o] = 0;
@@ -767,7 +907,7 @@ void fs_resolve(const char *path, char *out) {
 
 /* change the current directory; 0 on success, -1 if the target is not a directory */
 int fs_chdir(const char *path) {
-    char full[80]; fs_resolve(path, full);
+    char full[256]; fs_resolve(path, full);
     if (full[0] == '/' && full[1] == 0) { s_copy(g_cwd, "/"); return 0; }
     uint8_t at; uint16_t cl; uint32_t sz;
     if (fat_resolve(full, &at, &cl, &sz) < 0 || !(at & 0x10)) return -1;

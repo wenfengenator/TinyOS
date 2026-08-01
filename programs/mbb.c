@@ -74,6 +74,50 @@ static int ap_cat(int argc, char **argv) {
     }
     return rc;
 }
+/* pager prompt: one raw key from /dev/tty (space=page, Enter=line, q=quit) */
+static int more_key(int tty) {
+    struct termios old, raw;
+    tcgetattr(1, &old); raw = old; raw.c_lflag &= ~(ICANON | ECHO); tcsetattr(1, TCSANOW, &raw);
+    out1("\x1b[7m--More--\x1b[0m");
+    char c = ' '; if (read(tty, &c, 1) <= 0) c = 'q';
+    tcsetattr(1, TCSANOW, &old);
+    out1("\r\x1b[K");                              /* erase the prompt */
+    return (unsigned char)c;
+}
+/* more [file...] — page long output a screenful at a time.  Keys come from
+ * /dev/tty so pagination works even when the content is piped (`ls | more`). */
+static int ap_more(int argc, char **argv) {
+    struct winsize ws; int rows = 24;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 1) rows = ws.ws_row;
+    int tty = open("/dev/tty", O_RDONLY);
+    int nf = 0; for (int i = 1; i < argc; i++) if (argv[i][0] != '-') nf++;
+    int quit = 0, rc = 0, shown = 0;
+    for (int idx = 0; !quit; idx++) {
+        int fd;
+        if (nf) {
+            int fi = -1, seen = 0;
+            for (int i = 1; i < argc; i++) if (argv[i][0] != '-' && seen++ == idx) { fi = i; break; }
+            if (fi < 0) break;
+            fd = open(argv[fi], O_RDONLY);
+            if (fd < 0) { outs(2, "more: "); outs(2, argv[fi]); outs(2, ": not found\n"); rc = 1; continue; }
+        } else { if (idx > 0) break; fd = 0; }
+        char b[512]; int n;
+        while (!quit && (n = read(fd, b, sizeof b)) > 0) {
+            for (int j = 0; j < n; j++) {
+                write(1, &b[j], 1);
+                if (b[j] != '\n') continue;
+                if (++shown < rows - 1) continue;
+                if (tty < 0) { shown = 0; continue; }         /* no key source: keep scrolling */
+                int k = more_key(tty);
+                if (k == 'q' || k == 'Q') { quit = 1; break; }
+                shown = (k == '\n' || k == '\r') ? rows - 2 : 0;   /* Enter=one line, else a page */
+            }
+        }
+        if (fd != 0) close(fd);
+    }
+    if (tty >= 0) close(tty);
+    return rc;
+}
 static int ap_grep(int argc, char **argv) {
     int inv = 0, ic = 0, num = 0, i = 1;
     for (; i < argc && argv[i][0] == '-'; i++)
@@ -834,7 +878,7 @@ static int ap_web(int argc, char **argv) {
 
 /* ---- dispatch ------------------------------------------------------------ */
 static const struct { const char *name; int (*fn)(int, char **); } g_applets[] = {
-    { "sh", run_shell }, { "echo", ap_echo }, { "cat", ap_cat }, { "grep", ap_grep },
+    { "sh", run_shell }, { "echo", ap_echo }, { "cat", ap_cat }, { "more", ap_more }, { "grep", ap_grep },
     { "wc", ap_wc }, { "head", ap_head }, { "tail", ap_tail }, { "rev", ap_rev },
     { "tee", ap_tee }, { "nl", ap_nl }, { "yes", ap_yes }, { "seq", ap_seq },
     { "sort", ap_sort }, { "uniq", ap_uniq }, { "tr", ap_tr }, { "ls", ap_ls },
@@ -868,6 +912,23 @@ static int ap_help(int argc, char **argv) {
     return 0;
 }
 
+/* Locate and exec a command.  A name containing '/' is taken as a literal path
+ * (/abs/foo or ./rel/foo).  A bare name is resolved as a "command on the path"
+ * WITHOUT needing ./ or a cwd match: TinyOS ships programs as uppercase 8.3
+ * files at the root (/GIT.BIN, /WGET.BIN, ...) and FAT lookup is case-
+ * insensitive, so `git` -> /git.bin -> /GIT.BIN works from any directory.
+ * Returns only on failure (control returns iff no exec succeeded). */
+static void exec_command(char **argv) {
+    const char *cmd = argv[0];
+    if (strchr(cmd, '/')) { execv(cmd, argv); return; }         /* explicit path */
+    char cand[128];
+    snprintf(cand, sizeof cand, "/%s", cmd);         execv(cand, argv);  /* /git       */
+    snprintf(cand, sizeof cand, "/%s.bin", cmd);     execv(cand, argv);  /* /GIT.BIN   */
+    snprintf(cand, sizeof cand, "/bin/%s", cmd);     execv(cand, argv);  /* /bin/git   */
+    snprintf(cand, sizeof cand, "/bin/%s.bin", cmd); execv(cand, argv);  /* /bin/GIT.BIN */
+    execvp(cmd, argv);                                          /* PATH fallback */
+}
+
 /* ---- pipeline + shell ---------------------------------------------------- */
 static int run_pipeline(char *cmd) {
     char *stages[8]; int ns = 0;
@@ -895,8 +956,7 @@ static int run_pipeline(char *cmd) {
             if (prev_read >= 0) { dup2(prev_read, 0); close(prev_read); }
             if (pfd[1] >= 0) { dup2(pfd[1], 1); close(pfd[1]); close(pfd[0]); }
             if (applet_fn(argv[0])) _exit(run_applet(argv[0], argc, argv));
-            execv(argv[0], argv);               /* external ELF: ./foo, /abs/foo, cwd-relative foo */
-            execvp(argv[0], argv);              /* PATH search for a bare name */
+            exec_command(argv);                 /* /abs, ./rel, or a bare name -> /NAME.BIN on the path */
             outs(2, argv[0]); outs(2, ": not found\n");
             _exit(127);
         }

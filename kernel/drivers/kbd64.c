@@ -7,6 +7,16 @@
 
 static inline uint8_t inb(uint16_t p) { uint8_t r; __asm__ volatile("inb %1,%0" : "=a"(r) : "Nd"(p)); return r; }
 
+/* COM1 receive: lets the serial console drive login/shell when headless. */
+#define COM1 0x3F8
+static int serial_getc(void) {
+    if (!(inb(COM1 + 5) & 0x01)) return -1;    /* LSR bit0: data ready? */
+    int c = inb(COM1);
+    if (c == '\r') c = '\n';                    /* CR -> newline */
+    if (c == 0x7F) c = '\b';                    /* DEL -> backspace */
+    return c;
+}
+
 /* US scancode set 1 -> ASCII (unshifted / shifted), 0 = ignore */
 static const char sc_ascii[128] = {
     0,  27, '1','2','3','4','5','6','7','8','9','0','-','=', '\b','\t',
@@ -30,7 +40,7 @@ void kbd64_init(void) {
 }
 
 int kbd64_getkey(void) {
-    if (!(inb(0x64) & 0x01)) return -1;        /* output buffer empty */
+    if (!(inb(0x64) & 0x01)) return serial_getc();  /* PS/2 empty -> try the serial console */
     uint8_t sc = inb(0x60);
 
     if (sc == 0xE0) { s_ext = 1; return -1; }  /* extended-key prefix */

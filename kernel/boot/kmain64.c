@@ -72,7 +72,7 @@ void kmain64(boot_info_t *bi) {
     hvkbd_init();
     arch_init();
 
-    kputs("[tinyos64] TINYOS X64 UEFI BOOT OK\n");
+    kputs("[tinyos64] TinyOS v" TINYOS_VERSION " - TINYOS X64 UEFI BOOT OK\n");
     arch_user_init();
     if (disp_init() != 0) kputs("[disp] shared back buffer unavailable\n");
     else { uint32_t dw = 0, dh = 0; disp_dims(&dw, &dh);

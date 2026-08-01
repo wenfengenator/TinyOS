@@ -1,5 +1,5 @@
 NAME="TinyOS"
-PRETTY_NAME="TinyOS x64 (UEFI, long mode)"
+PRETTY_NAME="TinyOS x64 v1.0.0 (UEFI, long mode)"
 ID=tinyos
-VERSION="0.1"
-VERSION_ID="0.1"
+VERSION="1.0.0"
+VERSION_ID="1.0.0"

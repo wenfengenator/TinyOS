@@ -118,7 +118,7 @@ static int          g_next_pid;
 #define NET_SYS_PING       0x4E455401ULL      /* 'NET'+1: userspace ICMP echo */
 #define NET_SYS_IFCONFIG   0x4E455402ULL      /* 'NET'+2: userspace interface config */
 #define NET_SYS_SETCFG     0x4E455403ULL      /* 'NET'+3: set static interface config */
-#define USER_STK_PAGES  4
+#define USER_STK_PAGES  16              /* 64KB: headroom for deep crypto/TLS call chains */
 #define LINUX_LOAD_PAGES ((LINUX_LOAD_LIMIT - LINUX_LOAD_VA) / 4096)
 #define USER_ARG_OFF    (USER_CODE_PAGES * 4096 - 256)   /* argv[0] staged here */
 #define PTE_P   0x1
@@ -519,7 +519,7 @@ static int linux_uname(void *buf) {
     if (!buf) return -14;
     char *u = (char *)buf;                     /* utsname: 6 x 65-byte NUL-padded fields */
     memset(u, 0, 6 * 65);
-    const char *f[6] = { "TinyOS", "tinyos", "6.1.0-tinyos", "#1 TinyOS x64", "x86_64", "(none)" };
+    const char *f[6] = { "TinyOS", "tinyos", "6.1.0-tinyos", "#1 TinyOS " TINYOS_VERSION, "x86_64", "(none)" };
     for (int i = 0; i < 6; i++) { int j = 0; while (f[i][j] && j < 64) { u[i * 65 + j] = f[i][j]; j++; } }
     return 0;
 }
@@ -535,14 +535,14 @@ static int linux_nanosleep(const void *req, void *rem) {
 }
 
 static int linux_access(int dirfd, const char *path) {
-    char full[80]; if (linux_resolve_at(dirfd, path, full) < 0) return -2;
+    char full[256]; if (linux_resolve_at(dirfd, path, full) < 0) return -2;
     if (strpfx(full, "/proc/")) return 0;
     uint8_t attr; uint16_t cl; uint32_t sz;
     return fat_resolve(full, &attr, &cl, &sz) == 0 ? 0 : -2;
 }
 
 static int linux_readlinkat(int dirfd, const char *path, char *buf, uint32_t bufsiz) {
-    char full[80]; if (linux_resolve_at(dirfd, path, full) < 0) return -2;
+    char full[256]; if (linux_resolve_at(dirfd, path, full) < 0) return -2;
     if (name_eq(full, "/proc/self/exe")) {
         int n = g_app(buf, 0, "/bin/");
         n = g_app(buf, n, current->name);
@@ -873,14 +873,16 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
         sys_exit_resume();                    /* does not return           */
         return 0;
     case 15: {                                /* readdir(dir,i,name)       */
-        char full[80]; fs_resolve((const char *)a0, full);
+        char full[256]; fs_resolve((const char *)a0, full);
         int idx = (int)a1; char *name = (char *)a2;
         uint16_t dcl = 0; uint8_t at; uint16_t cl; uint32_t sz;
         if (!(full[0] == '/' && full[1] == 0)) {
             if (fat_resolve(full, &at, &cl, &sz) < 0 || !(at & 0x10)) return (uint64_t)-1;
             dcl = cl;
         }
-        if (fat_list(dcl, idx, name, &at, &cl, &sz) < 0) return (uint64_t)-1;
+        char lname[256];                      /* long name may exceed the 16-byte API buffer */
+        if (fat_list(dcl, idx, lname, &at, &cl, &sz) < 0) return (uint64_t)-1;
+        int j = 0; while (lname[j] && j < 14) { name[j] = lname[j]; j++; } name[j] = 0;
         return (uint64_t)((at & 0x10) ? 1 : 0);
     }
     case 16: {                                /* taskinfo(i, buf) -> ps    */
@@ -888,21 +890,21 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
         return (uint64_t)(int)proc_info((int)a0, &o->pid, &o->ring, &o->state, o->name);
     }
     case 18: {                                /* readfile(path,buf,max)    */
-        char full[80]; fs_resolve((const char *)a0, full);
+        char full[256]; fs_resolve((const char *)a0, full);
         uint8_t at; uint16_t cl; uint32_t sz;
         if (fat_resolve(full, &at, &cl, &sz) < 0 || (at & 0x10)) return (uint64_t)-1;
         return (uint64_t)(int)fat_read(cl, sz, (void *)a1, (uint32_t)a2);
     }
     case 22: {                                /* writefile(path,buf,n)     */
-        char full[80]; fs_resolve((const char *)a0, full);
+        char full[256]; fs_resolve((const char *)a0, full);
         return (uint64_t)(int)fat_write(full, (const void *)a1, (uint32_t)a2);
     }
     case 23: {                                /* mkdir(path)               */
-        char full[80]; fs_resolve((const char *)a0, full);
+        char full[256]; fs_resolve((const char *)a0, full);
         return (uint64_t)(int)fat_mkdir(full);
     }
     case 24: {                                /* unlink(path)              */
-        char full[80]; fs_resolve((const char *)a0, full);
+        char full[256]; fs_resolve((const char *)a0, full);
         return (uint64_t)(int)fat_unlink(full);
     }
     case 25:                                  /* chdir(path)               */
@@ -915,7 +917,7 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
         return (uint64_t)(((unsigned)c << 16) | (unsigned)(r & 0xFFFF));
     }
     case 28: {                                /* copy(src, dst) -> bytes/-1 */
-        char src[80], dst[80];
+        char src[256], dst[256];
         fs_resolve((const char *)a0, src);
         fs_resolve((const char *)a1, dst);
         uint8_t at; uint16_t cl; uint32_t sz;
@@ -1032,9 +1034,9 @@ static int linux_resolve_at(int dirfd, const char *path, char *full) {
     if (dirfd < 3 || dirfd >= LINUX_FD_MAX || !g_linux_fds[dirfd].used ||
         g_linux_fds[dirfd].kind != LINUX_FD_DIR) return -9;
     int n = 0;
-    while (g_linux_fds[dirfd].path[n] && n < 79) { full[n] = g_linux_fds[dirfd].path[n]; n++; }
-    if (n > 1 && n < 79) full[n++] = '/';
-    int i = 0; while (path[i] && n < 79) full[n++] = path[i++];
+    while (g_linux_fds[dirfd].path[n] && n < 255) { full[n] = g_linux_fds[dirfd].path[n]; n++; }
+    if (n > 1 && n < 255) full[n++] = '/';
+    int i = 0; while (path[i] && n < 255) full[n++] = path[i++];
     full[n] = 0;
     return path[i] ? -36 : 0;
 }
@@ -1047,7 +1049,7 @@ static int linux_fd_alloc(int kind, int flags, const char *path, uint16_t dir_cl
         g_linux_fds[fd].flags = flags;
         g_linux_fds[fd].offset = offset;
         g_linux_fds[fd].dir_cluster = dir_cluster;
-        int i = 0; while (path && path[i] && i < 79) { g_linux_fds[fd].path[i] = path[i]; i++; }
+        int i = 0; while (path && path[i] && i < 255) { g_linux_fds[fd].path[i] = path[i]; i++; }
         g_linux_fds[fd].path[i] = 0;
         return fd;
     }
@@ -1055,13 +1057,14 @@ static int linux_fd_alloc(int kind, int flags, const char *path, uint16_t dir_cl
 }
 
 static int linux_openat(int dirfd, const char *path, int flags) {
-    char full[80]; int resolved = linux_resolve_at(dirfd, path, full);
+    char full[256]; int resolved = linux_resolve_at(dirfd, path, full);
     if (resolved < 0) return resolved;
     if (strpfx(full, "/proc/")) {               /* synthetic procfs */
         char tmp[512]; if (proc_synth(full, tmp) < 0) return -2;
         return linux_fd_alloc(LINUX_FD_PROC, flags, full, 0, 0);
     }
     if (name_eq(full, "/dev/null")) return linux_fd_alloc(LINUX_FD_NULL, flags, full, 0, 0);
+    if (name_eq(full, "/dev/tty"))  return linux_fd_alloc(LINUX_FD_TTY, flags, full, 0, 0);
     uint8_t attr; uint16_t cluster; uint32_t size;
     int exists = fat_resolve(full, &attr, &cluster, &size) == 0;
     if (exists && (attr & 0x10)) {
@@ -1287,6 +1290,52 @@ static void tty_hist_push(const char *s, int n) {
     g_tty_hist[g_tty_histn][i] = 0; g_tty_histn++;
 }
 
+/* Tab completion for the canonical editor: complete the filename token ending
+ * at the cursor against its directory (cwd, or the path prefix before the last
+ * '/').  Case-sensitive prefix; inserts the longest common match plus a trailing
+ * '/' (dir) or ' ' (file) when the match is unique.  Renders in place. */
+static void tty_complete(char *line, int *plen, int *ppos, int max) {
+    int len = *plen, pos = *ppos;
+    int ws = pos; while (ws > 0 && line[ws - 1] != ' ') ws--;
+    char word[256]; int wl = 0;
+    for (int i = ws; i < pos && wl < 255; i++) word[wl++] = line[i];
+    word[wl] = 0;
+    int slash = -1; for (int i = 0; i < wl; i++) if (word[i] == '/') slash = i;
+    char dirq[256]; const char *partial;
+    if (slash < 0) { dirq[0] = '.'; dirq[1] = 0; partial = word; }
+    else { int j = 0; while (j <= slash && j < 254) { dirq[j] = word[j]; j++; } dirq[j] = 0; partial = word + slash + 1; }
+    char absdir[256]; fs_resolve(dirq, absdir);
+    uint8_t at; uint16_t cl; uint32_t sz; uint32_t dcl = 0;
+    if (!(absdir[0] == '/' && absdir[1] == 0)) {
+        if (fat_resolve(absdir, &at, &cl, &sz) < 0 || !(at & 0x10)) return;
+        dcl = cl;
+    }
+    int pl = 0; while (partial[pl]) pl++;
+    char lcp[256]; int lcp_len = -1, matches = 0, only_dir = 0;
+    char nm[256];
+    for (int i = 0; fat_list(dcl, i, nm, &at, &cl, &sz) == 0; i++) {
+        if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+        int m = 1; for (int k = 0; k < pl; k++) if (nm[k] != partial[k]) { m = 0; break; }
+        if (!m) continue;
+        matches++;
+        if (lcp_len < 0) { int n = 0; while (nm[n] && n < 255) { lcp[n] = nm[n]; n++; } lcp[n] = 0; lcp_len = n; only_dir = (at & 0x10) ? 1 : 0; }
+        else { int n = 0; while (n < lcp_len && nm[n] && lcp[n] == nm[n]) n++; lcp_len = n; lcp[n] = 0; }
+    }
+    if (matches == 0 || lcp_len < pl) return;
+    for (int c = pl; c < lcp_len && len < 255 && len < max - 2; c++) {
+        for (int i = len; i > pos; i--) line[i] = line[i - 1];
+        line[pos] = lcp[c]; len++;
+        tty_emit(&line[pos], len - pos); tty_bs(len - pos - 1); pos++;
+    }
+    if (matches == 1 && len < 255 && len < max - 2) {
+        char tail = only_dir ? '/' : ' ';
+        for (int i = len; i > pos; i--) line[i] = line[i - 1];
+        line[pos] = tail; len++;
+        tty_emit(&line[pos], len - pos); tty_bs(len - pos - 1); pos++;
+    }
+    *plen = len; *ppos = pos;
+}
+
 static int tty_read_line(char *out, int max) {
     char line[256]; int len = 0, pos = 0;
     int hidx = g_tty_histn;                                 /* == histn: a fresh (unsaved) line */
@@ -1319,6 +1368,10 @@ static int tty_read_line(char *out, int max) {
             tty_emit(line, len); pos = len;
             continue;
         }
+        if (key == '\t') {                                  /* Tab: filename completion */
+            tty_complete(line, &len, &pos, max);
+            continue;
+        }
         if (key == '\b' || key == 0x7f) {                   /* backspace: delete before cursor */
             if (pos > 0) {
                 for (int i = pos - 1; i < len - 1; i++) line[i] = line[i + 1];
@@ -1338,10 +1391,37 @@ static int tty_read_line(char *out, int max) {
     }
 }
 
+/* Shared keyboard reader for fd 0 and /dev/tty: raw keys in raw mode, else one
+ * edited canonical line at a time (Tab completion + history live in the editor). */
+static int tty_stdin_read(void *buf, uint32_t len) {
+    if (!(g_tty.lflag & TTY_ICANON)) {             /* raw mode (vi etc.): keys as they arrive, no echo */
+        char *out = (char *)buf; uint32_t count = 0;
+        while (count < len) {
+            int key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
+            if (key < 0) { if (count) break; wm_pump(); continue; }   /* block for the first byte */
+            if (key == 3 && (g_tty.lflag & TTY_ISIG)) { signal_pgrp(g_tty.fg_pgrp, 2); break; }
+            if (key > KEY_RIGHT) continue;         /* drop F-keys; keep arrows (0x80-0x83) */
+            if (key == '\r') key = '\n';
+            out[count++] = (char)key;
+        }
+        return (int)count;
+    }
+    static char cook[256]; static int cook_len, cook_pos;   /* canonical cooked line */
+    if (cook_pos >= cook_len) {                    /* buffer drained: edit a fresh line */
+        cook_pos = 0;
+        cook_len = tty_read_line(cook, sizeof cook);
+        if (cook_len <= 0) { cook_len = 0; return 0; }   /* Ctrl-D EOF */
+    }
+    char *out = (char *)buf; uint32_t count = 0;
+    while (count < len && cook_pos < cook_len) out[count++] = cook[cook_pos++];
+    return (int)count;
+}
+
 static int linux_read(int fd, void *buf, uint32_t len) {
     if (fd < 0 || fd >= LINUX_FD_MAX) return -9;
     if (g_linux_fds[fd].used) {
         int k = g_linux_fds[fd].kind;
+        if (k == LINUX_FD_TTY) return tty_stdin_read(buf, len);
         if (k == LINUX_FD_PIPE_R) return pipe_read(g_linux_fds[fd].pipe, buf, len);
         if (k == LINUX_FD_PIPE_W) return -9;
         if (k == LINUX_FD_PROC) {
@@ -1357,29 +1437,7 @@ static int linux_read(int fd, void *buf, uint32_t len) {
         if (result > 0) g_linux_fds[fd].offset += (uint32_t)result;
         return result < 0 ? -5 : result;
     }
-    if (fd == 0) {                                     /* stdin: keyboard */
-        if (!(g_tty.lflag & TTY_ICANON)) {             /* raw mode (vi etc.): keys as they arrive, no echo */
-            char *out = (char *)buf; uint32_t count = 0;
-            while (count < len) {
-                int key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
-                if (key < 0) { if (count) break; wm_pump(); continue; }   /* block for the first byte */
-                if (key == 3 && (g_tty.lflag & TTY_ISIG)) { signal_pgrp(g_tty.fg_pgrp, 2); break; }
-                if (key > KEY_RIGHT) continue;         /* drop F-keys; keep arrows (0x80-0x83) */
-                if (key == '\r') key = '\n';
-                out[count++] = (char)key;
-            }
-            return (int)count;
-        }
-        static char cook[256]; static int cook_len, cook_pos;   /* canonical cooked line */
-        if (cook_pos >= cook_len) {                    /* buffer drained: edit a fresh line */
-            cook_pos = 0;
-            cook_len = tty_read_line(cook, sizeof cook);
-            if (cook_len <= 0) { cook_len = 0; return 0; }   /* Ctrl-D EOF */
-        }
-        char *out = (char *)buf; uint32_t count = 0;
-        while (count < len && cook_pos < cook_len) out[count++] = cook[cook_pos++];
-        return (int)count;
-    }
+    if (fd == 0) return tty_stdin_read(buf, len);      /* stdin: keyboard */
     return -9;
 }
 
@@ -1390,6 +1448,7 @@ static int linux_write(int fd, const void *buf, uint32_t len) {
         if (k == LINUX_FD_PIPE_W) return pipe_write(g_linux_fds[fd].pipe, buf, len);
         if (k == LINUX_FD_PIPE_R) return -9;
         if (k == LINUX_FD_NULL) return (int)len;
+        if (k == LINUX_FD_TTY) { usys_write((const char *)buf, len); return (int)len; }
         if (k == LINUX_FD_SOCKET) return tcp_send(g_linux_fds[fd].sock, buf, (int)len);
         if (k != LINUX_FD_FILE) return -21;
         if (!(g_linux_fds[fd].flags & LINUX_O_ACCMODE)) return -9;
@@ -1466,7 +1525,7 @@ static int linux_ftruncate(int fd, uint64_t size) {
 
 static int linux_newfstatat(int dirfd, const char *path, void *statbuf, int flags) {
     (void)flags;
-    char full[80]; int result = linux_resolve_at(dirfd, path, full);
+    char full[256]; int result = linux_resolve_at(dirfd, path, full);
     if (result < 0) return result;
     return linux_stat_path(full, (struct linux_stat *)statbuf);
 }
@@ -1476,7 +1535,7 @@ static int linux_getdents64(int fd, void *buf, uint32_t len) {
     if (g_linux_fds[fd].kind != LINUX_FD_DIR) return -20;
     uint8_t *out = (uint8_t *)buf; uint32_t used = 0;
     for (;;) {
-        char name[16]; uint8_t attr; uint16_t cluster; uint32_t size;
+        char name[256]; uint8_t attr; uint16_t cluster; uint32_t size;
         if (fat_list(g_linux_fds[fd].dir_cluster, (int)g_linux_fds[fd].offset,
                      name, &attr, &cluster, &size) < 0) break;
         (void)size;
@@ -1495,14 +1554,14 @@ static int linux_getdents64(int fd, void *buf, uint32_t len) {
 }
 
 static int linux_mkdirat(int dirfd, const char *path) {
-    char full[80]; int result = linux_resolve_at(dirfd, path, full);
+    char full[256]; int result = linux_resolve_at(dirfd, path, full);
     if (result < 0) return result;
     return fat_mkdir(full) < 0 ? -17 : 0;
 }
 
 /* rmdir(84): remove an empty directory.  fat_rmdir codes -> Linux errnos. */
 static int linux_rmdir(const char *path) {
-    char full[80]; int result = linux_resolve_at(-100, path, full);
+    char full[256]; int result = linux_resolve_at(-100, path, full);
     if (result < 0) return result;
     result = fat_rmdir(full);
     return result == 0 ? 0 : result == -2 ? -20 : result == -3 ? -39 : -2;
@@ -1511,7 +1570,7 @@ static int linux_rmdir(const char *path) {
 /* rename(82): FAT has no atomic rename, so copy-then-unlink for files; refuse
  * directory renames with -EXDEV so userland can fall back to recursive copy. */
 static int linux_rename(const char *oldp, const char *newp) {
-    char fo[80], fn[80];
+    char fo[256], fn[256];
     int a = linux_resolve_at(-100, oldp, fo); if (a < 0) return a;
     int b = linux_resolve_at(-100, newp, fn); if (b < 0) return b;
     uint8_t attr; uint16_t cluster; uint32_t size;
@@ -1529,7 +1588,7 @@ static int linux_rename(const char *oldp, const char *newp) {
 
 static int linux_unlinkat(int dirfd, const char *path, int flags) {
     if (flags) return -22;
-    char full[80]; int result = linux_resolve_at(dirfd, path, full);
+    char full[256]; int result = linux_resolve_at(dirfd, path, full);
     if (result < 0) return result;
     result = fat_unlink(full);
     return result == -2 ? -21 : result < 0 ? -2 : 0;
@@ -1537,7 +1596,7 @@ static int linux_unlinkat(int dirfd, const char *path, int flags) {
 
 static uint64_t linux_getcwd(char *buf, uint64_t size) {
     if (!buf || !size) return (uint64_t)-22;
-    char cwd[80]; fs_getcwd(cwd);
+    char cwd[256]; fs_getcwd(cwd);
     uint64_t len = 0; while (cwd[len]) len++;
     if (len + 1 > size) return (uint64_t)-34;
     for (uint64_t i = 0; i <= len; i++) buf[i] = cwd[i];
@@ -2759,7 +2818,7 @@ static int find_prog(const char *name) {
 
 static int run_linux_path(const char *path, uint8_t *stk, uint8_t *kstack_top,
                           const struct linux_exec_args *args, int on_sched) {
-    char full[80];
+    char full[256];
     while (path[0] == '.' && path[1] == '/') path += 2;
     fs_resolve(path, full);
 
@@ -2803,7 +2862,7 @@ int arch_run_linux(const char *path, const char *arg) {
  * CR3, and iretq into the new entry.  Never returns on success (the image is
  * replaced); returns a negative errno on failure so the caller can report it. */
 static int do_execve_inplace(const char *path, const struct linux_exec_args *args) {
-    char full[80];
+    char full[256];
     while (path[0] == '.' && path[1] == '/') path += 2;
     fs_resolve(path, full);
     uint8_t attr; uint16_t cluster; uint32_t size;

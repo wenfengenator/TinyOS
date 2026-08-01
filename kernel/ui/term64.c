@@ -152,7 +152,7 @@ static void console_exec(terminal_t *t, char *line) {
     } else if (t_ieq(cmd, "echo")) {
         t_puts(t, args); t_putc(t, '\n');
     } else if (t_ieq(cmd, "ver") || t_ieq(cmd, "about")) {
-        t_puts(t, "TINYOS X64 - UEFI LONG MODE\n");
+        t_puts(t, "TINYOS X64 v" TINYOS_VERSION " - UEFI LONG MODE\n");
         t_puts(t, "TINY WINDOWING + TERMINAL CONSOLE\n");
     } else if (t_ieq(cmd, "mem")) {
         t_puts(t, "HEAP TOTAL "); t_u32(t, (uint32_t)(heap_total() / (1024 * 1024)));

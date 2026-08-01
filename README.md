@@ -1,5 +1,7 @@
 # tinyos
 
+**Release: v1.0.0**
+
 A teaching operating system built from scratch, in two editions that show its
 evolution:
 

@@ -301,9 +301,17 @@ $(BUILD)/tgl_demo.elf: programs/tgl_demo.c programs/tcc_include/tinygl.h $(BUILD
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/tgl3d_demo.elf: programs/tgl3d_demo.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/tetris.elf: programs/tetris.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/2048.elf: programs/2048.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/wget.elf: programs/wget.c programs/tcc_include/tnet.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/httpd.elf: programs/httpd.c $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/https.elf: programs/https.c programs/tcc_include/tnet.h programs/tcc_include/ttls.h programs/tcc_include/tcrypto.h $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/git.elf: programs/git.c programs/tcc_include/tnet.h programs/tcc_include/ttls.h programs/tcc_include/tcrypto.h programs/tcc_include/tgit.h programs/tcc_include/tinflate.h programs/tcc_include/tssh.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/musl_probe.h: $(BUILD)/musl_probe.elf | $(BUILD)
 	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char musl_probe_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
@@ -342,7 +350,7 @@ esp: $(BUILD)/BOOTX64.EFI
 # Persistent-disk staging root: disk/ plus /lib (crt, libc.a, libtcc1.a), the full
 # musl /include header tree, and a K&R sample so on-device `./tcc.bin a.c -o a.bin`
 # resolves the standard library through TCC's built-in search paths.
-$(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h programs/tcc_kr_demo.c programs/tcc_include/tinygl.h programs/tgl_demo.c programs/tgl3d_demo.c programs/tcc_include/tnet.h programs/wget.c programs/httpd.c $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
+$(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h programs/tcc_kr_demo.c programs/tcc_include/tinygl.h programs/tgl_demo.c programs/tgl3d_demo.c programs/tetris.c programs/2048.c programs/tcc_include/tnet.h programs/tcc_include/tcrypto.h programs/tcc_include/ttls.h programs/tcc_include/tinflate.h programs/tcc_include/tgit.h programs/tcc_include/tssh.h programs/wget.c programs/httpd.c programs/https.c programs/git.c $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
 	rm -rf $(BUILD)/fsroot
 	mkdir -p $(BUILD)/fsroot/lib $(BUILD)/fsroot/include
 	cp -r disk/. $(BUILD)/fsroot/
@@ -350,17 +358,26 @@ $(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h p
 	cp -r $(TCC_SELF)/include/. $(BUILD)/fsroot/include/
 	cp programs/tcc_include/tinygl.h $(BUILD)/fsroot/include/tinygl.h
 	cp programs/tcc_include/tnet.h $(BUILD)/fsroot/include/tnet.h
+	cp programs/tcc_include/tcrypto.h $(BUILD)/fsroot/include/tcrypto.h
+	cp programs/tcc_include/ttls.h $(BUILD)/fsroot/include/ttls.h
+	cp programs/tcc_include/tinflate.h $(BUILD)/fsroot/include/tinflate.h
+	cp programs/tcc_include/tgit.h $(BUILD)/fsroot/include/tgit.h
+	cp programs/tcc_include/tssh.h $(BUILD)/fsroot/include/tssh.h
 	cp programs/tcc_kr_demo.c $(BUILD)/fsroot/kr.c
 	cp programs/tgl_demo.c $(BUILD)/fsroot/tgl.c
 	cp programs/tgl3d_demo.c $(BUILD)/fsroot/tgl3d.c
+	cp programs/tetris.c $(BUILD)/fsroot/tetris.c
+	cp programs/2048.c $(BUILD)/fsroot/2048.c
 	cp programs/wget.c $(BUILD)/fsroot/wget.c
 	cp programs/httpd.c $(BUILD)/fsroot/httpd.c
+	cp programs/https.c $(BUILD)/fsroot/https.c
+	cp programs/git.c $(BUILD)/fsroot/git.c
 	touch $@
 
 # persistent filesystem disk: seeded ONCE from the staging root, kept outside
 # build/ so `make clean` won't wipe it.  `rm tinyfs.img` to re-seed.
-tinyfs.img: $(BUILD)/fsroot.stamp | $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf $(TCC_BIN)
-	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(PERSIST_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf
+tinyfs.img: $(BUILD)/fsroot.stamp | $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf $(BUILD)/https.elf $(BUILD)/tetris.elf $(BUILD)/2048.elf $(BUILD)/git.elf $(TCC_BIN)
+	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(PERSIST_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf HTTPS.BIN=$(BUILD)/https.elf TETRIS.BIN=$(BUILD)/tetris.elf 2048.BIN=$(BUILD)/2048.elf GIT.BIN=$(BUILD)/git.elf
 	@echo "seeded persistent disk $@ ($(PERSIST_KB) KB) from build/fsroot/"
 
 # boot the x64 build under qemu-system-x86_64 + OVMF in a graphical window so the
@@ -388,8 +405,8 @@ run-x64-headless: esp tinyfs.img
 # tools/mkgptesp.py writes the GPT, FAT32 ESP, and persistent FAT16 data
 # partition by hand (no mkfs.vfat/mtools needed).
 HYPER_DATA_KB ?= 16384
-$(BUILD)/hyper_data.img: tools/mkfatfs.py $(BUILD)/fsroot.stamp $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/tcc_self_probe.elf $(BUILD)/tcc2_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf programs/tcc_hello.c programs/tcc_printf_hello.c programs/tcc_printf.rsp programs/tcc_include/stdio.h $(TCC_BIN) $(TCC_SELF)/TCCSELF.I $(TCC_SELF)/BUILD.RSP $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
-	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(HYPER_DATA_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c PRINTF.RSP=programs/tcc_printf.rsp STDIO.H=programs/tcc_include/stdio.h SELFRUN.BIN=$(BUILD)/tcc_self_probe.elf TCC2RUN.BIN=$(BUILD)/tcc2_probe.elf TCCSELF.I=$(TCC_SELF)/TCCSELF.I BUILD.RSP=$(TCC_SELF)/BUILD.RSP CRT1.O=$(TCC_SELF)/lib/crt1.o CRTI.O=$(TCC_SELF)/lib/crti.o CRTN.O=$(TCC_SELF)/lib/crtn.o LIBC.A=$(TCC_SELF)/lib/libc.a LIBTCC1.A=$(TCC_SELF)/lib/libtcc1.a MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf
+$(BUILD)/hyper_data.img: tools/mkfatfs.py $(BUILD)/fsroot.stamp $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/tcc_self_probe.elf $(BUILD)/tcc2_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf $(BUILD)/https.elf $(BUILD)/tetris.elf $(BUILD)/2048.elf $(BUILD)/git.elf programs/tcc_hello.c programs/tcc_printf_hello.c programs/tcc_printf.rsp programs/tcc_include/stdio.h $(TCC_BIN) $(TCC_SELF)/TCCSELF.I $(TCC_SELF)/BUILD.RSP $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(HYPER_DATA_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c PRINTF.RSP=programs/tcc_printf.rsp STDIO.H=programs/tcc_include/stdio.h SELFRUN.BIN=$(BUILD)/tcc_self_probe.elf TCC2RUN.BIN=$(BUILD)/tcc2_probe.elf TCCSELF.I=$(TCC_SELF)/TCCSELF.I BUILD.RSP=$(TCC_SELF)/BUILD.RSP CRT1.O=$(TCC_SELF)/lib/crt1.o CRTI.O=$(TCC_SELF)/lib/crti.o CRTN.O=$(TCC_SELF)/lib/crtn.o LIBC.A=$(TCC_SELF)/lib/libc.a LIBTCC1.A=$(TCC_SELF)/lib/libtcc1.a MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf HTTPS.BIN=$(BUILD)/https.elf TETRIS.BIN=$(BUILD)/tetris.elf 2048.BIN=$(BUILD)/2048.elf GIT.BIN=$(BUILD)/git.elf
 $(BUILD)/tinyos.img: esp tools/mkgptesp.py $(BUILD)/hyper_data.img
 	$(PYTHON) tools/mkgptesp.py $@ $(ESP) $(BUILD)/hyper_data.img
 
