@@ -35,6 +35,7 @@ void kmain64(boot_info_t *bi) {
         kputs(" G="); kput_u64hex(fb_peek(bi->width - 64 + 12, 20));
         kputs(" B="); kput_u64hex(fb_peek(bi->width - 32 + 12, 20));
         kputc('\n');
+        arch_fb_mem_diag(bi->fb_base, bi->fb_size);
     } else {
         kputs("[tinyos64] WARNING: firmware provided no framebuffer\n");
     }
@@ -68,9 +69,10 @@ void kmain64(boot_info_t *bi) {
         kputs("[tinyos64] no asset loaded\n");
     }
 
+    arch_init();
+    if (bi->fb_base) arch_fb_set_wc(bi->fb_base, bi->fb_size);
     smp_init(bi);
     hvkbd_init();
-    arch_init();
 
     kputs("[tinyos64] TinyOS v" TINYOS_VERSION " - TINYOS X64 UEFI BOOT OK\n");
     arch_user_init();

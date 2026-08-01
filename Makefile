@@ -6,6 +6,8 @@
 #   make ARCH=x64        build the x64 UEFI app (build/BOOTX64.EFI)
 #   make ARCH=x64 run    boot the x64 build in a QEMU window (OVMF); needs a display
 #   make run-x64-headless boot the x64 build headless (serial only; for CI/sandbox)
+#   make usb             build tinyos-usb.img (GPT/UEFI image to dd onto a USB stick)
+#   make run-x64-disk    boot the GPT disk image itself (real-hardware path) in QEMU
 #   make clean
 #
 # Toolchain: assembly via GNU as/ld/objcopy; C via tools/xcc (gcc), C++ via
@@ -18,6 +20,9 @@ CC       := tools/xcc
 CXX      := tools/xcxx
 
 BUILD    := build
+
+# product version — single source of truth is kernel/include/boot64.h
+TINYOS_VERSION := $(shell sed -n 's/.*TINYOS_VERSION "\([^"]*\)".*/\1/p' kernel/include/boot64.h)
 
 # kernel source layout: sources live in kernel/<subsystem>/, objects stay flat in
 # build/ (found via vpath), so moving a file only changes where make looks for it.
@@ -123,7 +128,8 @@ ALL_TGT := os.img fs.img
 RUN_TGT := run-i386
 endif
 
-.PHONY: all run run-i386 run-x64 run-x64-headless run-x64-disk vhdx bootx64 esp run-emu run-emu-kernel deps setup-tcc setup-busybox clean
+.PHONY: all run run-i386 run-x64 run-x64-headless run-x64-disk usb vhdx bootx64 esp run-emu run-emu-kernel deps setup-tcc setup-busybox clean
+.DEFAULT_GOAL := all
 
 setup-tcc:
 	sh tools/setup_tcc.sh
@@ -133,7 +139,9 @@ setup-tcc:
 # mini-busybox (programs/mbb.c -> /MBB.BIN) that runs a shell + applets +
 # pipelines.  Drop a real musl-static busybox at build/busybox to swap it in.
 setup-busybox: $(BUILD)/mbb.elf
-	@echo "mini-busybox staged on the FS image as /MBB.BIN (run: spawn /MBB.BIN sh)"all: $(ALL_TGT)
+	@echo "mini-busybox staged on the FS image as /MBB.BIN (run: spawn /MBB.BIN sh)"
+
+all: $(ALL_TGT)
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -328,9 +336,9 @@ $(BUILD)/arch64.o: $(X64PROG_HDRS) $(LINUX_TEST_HDR) $(LINUX_FORK_HDR) $(LINUX_F
 # x64 filesystem: a small FAT16 image (built from disk/ by tools/mkfatfs.py) is
 # embedded as a C blob and mounted as a writable RAM disk by kernel/fat64.c; the
 # ring-3 readdir/readfile/writefile syscalls route there.  FATFS_KB sizes it.
-FATFS_KB ?= 512
-$(BUILD)/fatfs.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/mbb.elf programs/tcc_hello.c | $(BUILD)
-	$(PYTHON) tools/mkfatfs.py $@ disk $(FATFS_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c MBB.BIN=$(BUILD)/mbb.elf
+FATFS_KB ?= 1024
+$(BUILD)/fatfs.img: tools/mkfatfs.py $(wildcard disk/* disk/*/*) $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/mbb.elf $(BUILD)/tetris.elf $(BUILD)/2048.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/git.elf programs/tcc_hello.c | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ disk $(FATFS_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c MBB.BIN=$(BUILD)/mbb.elf TETRIS.BIN=$(BUILD)/tetris.elf 2048.BIN=$(BUILD)/2048.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf GIT.BIN=$(BUILD)/git.elf
 $(BUILD)/fatfs.h: $(BUILD)/fatfs.img | $(BUILD)
 	$(PYTHON) -c "d=open('$(BUILD)/fatfs.img','rb').read(); open('$(BUILD)/fatfs.h','w').write('static const unsigned char fatfs_img[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
 $(BUILD)/fat64.o: $(BUILD)/fatfs.h
@@ -416,6 +424,22 @@ tinyos.vhdx: $(BUILD)/tinyos.img
 
 vhdx: tinyos.vhdx
 
+# ---- bootable USB image for a physical UEFI PC -------------------------------
+# The raw GPT disk (protective MBR + GPT + FAT32 ESP holding /EFI/BOOT/BOOTX64.EFI
+# + a FAT16 data partition) is exactly what UEFI firmware boots off a USB stick.
+# A real PC has no virtio-blk/StorVSC, so TinyOS runs live from the RAM disk
+# embedded in the loader (no on-disk persistence yet — that needs an AHCI/NVMe
+# driver).  Write it to a USB stick and boot with Secure Boot OFF.
+tinyos-usb.img: $(BUILD)/tinyos.img
+	cp $< $@
+	@echo "TinyOS v$(TINYOS_VERSION) bootable USB image: $@ ($$(du -h $@ | cut -f1))"
+	@echo "  write it (THIS ERASES THE TARGET DISK):"
+	@echo "    sudo dd if=$@ of=/dev/sdX bs=4M conv=fsync status=progress   # Linux/macOS"
+	@echo "    (Windows: Rufus or balenaEtcher in 'DD image' mode)"
+	@echo "  then boot the PC from USB with Secure Boot DISABLED."
+
+usb: tinyos-usb.img
+
 # boot the GPT disk image itself (proxy for Hyper-V) in a QEMU window + OVMF
 run-x64-disk: $(BUILD)/tinyos.img
 	cp $(OVMF_VARS) $(BUILD)/OVMF_VARS.fd
@@ -439,4 +463,4 @@ run-emu-kernel: kernel.bin deps
 	$(EMU) --kernel kernel.bin
 
 clean:
-	rm -rf $(BUILD) boot.bin kernel.bin os.img fs.img tinyos.vhdx
+	rm -rf $(BUILD) boot.bin kernel.bin os.img fs.img tinyos.vhdx tinyos-usb.img
