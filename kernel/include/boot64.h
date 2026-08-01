@@ -99,6 +99,7 @@ void     heap_init(const boot_info_t *bi);
 void    *kmalloc(uint64_t n);
 void     kfree(void *p);
 void    *page_alloc(uint64_t pages);           /* 4KB-aligned zeroed pages         */
+void    *page_base(void);                      /* heap arena base (VA==EFI PhysStart)*/
 void     page_free(void *p, uint64_t pages);   /* return a page run for reuse      */
 void    *memset(void *d, int c, unsigned long n);
 void    *memcpy(void *d, const void *s, unsigned long n);
@@ -117,6 +118,7 @@ uint64_t tsc_freq_hz(void);
 /* ---- polled PS/2 keyboard (kernel/kbd64.c) ---- */
 void     kbd64_init(void);
 int      kbd64_getkey(void);                   /* ASCII/KEY_* code, or -1 if none  */
+void     arch_load_cpu_tables(void);           /* load shared GDT+IDT on a secondary CPU */
 
 /* ---- graphics demo (kernel/demo64.c) + pong game (kernel/pong64.c) ---- */
 void     demo_run(boot_info_t *bi);

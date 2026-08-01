@@ -88,6 +88,7 @@ void fb_present(const uint32_t *back) {
     if (!g_fb) return;
     for (uint32_t y = 0; y < g_h; y++)
         memcpy((void *)(g_fb + y * g_pitch), back + y * g_w, (unsigned long)g_w * 4);
+    __asm__ volatile("sfence" ::: "memory");   /* flush write-combining buffers to VRAM */
 }
 
 /* Present only the scanlines that differ from `shadow` (updated in place), so a
@@ -104,6 +105,7 @@ void fb_present_diff(const uint32_t *back, uint32_t *shadow, uint32_t w, uint32_
         memcpy((void *)(g_fb + (uint64_t)y * g_pitch), b, (unsigned long)w * 4);
         memcpy(s, b, (unsigned long)w * 4);
     }
+    __asm__ volatile("sfence" ::: "memory");   /* flush write-combining buffers to VRAM */
 }
 
 /* Draw a string into a tight w-pitched buffer at pixel (x,y), each 8x8 glyph

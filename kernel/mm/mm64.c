@@ -52,6 +52,7 @@ void heap_init(const boot_info_t *bi) {
 
 uint64_t heap_total(void) { return g_arena_size; }
 uint64_t heap_used(void)  { return g_arena ? (uint64_t)(g_brk - g_arena) : 0; }
+void    *page_base(void)  { return g_arena; }
 
 typedef struct page_run { struct page_run *next; uint64_t count; } page_run;
 static page_run *g_page_free;

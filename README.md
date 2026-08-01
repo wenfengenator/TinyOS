@@ -131,8 +131,25 @@ application (`BOOTX64.EFI`). It boots on `qemu-system-x86_64` + OVMF and on
 make ARCH=x64                 # build/BOOTX64.EFI (one PE32+ image)
 make run-x64-headless         # QEMU + OVMF, serial only (CI/sandbox)
 make tinyos.vhdx              # Hyper-V Gen 2 disk (attach; Secure Boot OFF)
+make usb                      # tinyos-usb.img — GPT/UEFI image to dd onto a USB stick
+make run-x64-disk             # boot the GPT image itself in QEMU (real-hardware path)
 make setup-tcc                # stage musl + TinyCC for the on-device compiler
 ```
+
+### Boot on a real PC (USB)
+
+`tinyos-usb.img` (built by `make usb`) is a raw **GPT disk** whose FAT32 **EFI
+System Partition** holds `/EFI/BOOT/BOOTX64.EFI` — exactly what UEFI firmware
+boots from a USB stick. Write it and boot with **Secure Boot disabled**:
+
+```bash
+sudo dd if=tinyos-usb.img of=/dev/sdX bs=4M conv=fsync status=progress   # ERASES /dev/sdX
+```
+
+A physical PC has no virtio-blk/StorVSC, so TinyOS runs **live from a RAM disk**
+embedded in the loader (the mbb shell + coreutils, local `git`, Tetris/2048, and
+the TinyGL demos). There is no on-disk persistence yet — that needs an AHCI/NVMe
+driver — and a **PS/2 or legacy-USB keyboard** is required (no USB-HID stack yet).
 
 Sign in as `root` / `root`. From the terminal, `./musl.bin`,
 `./tcc.bin file.c -o out.bin`, and `./out.bin` exercise the Linux-ABI path.

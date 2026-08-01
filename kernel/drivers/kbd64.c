@@ -6,6 +6,7 @@
 #include "boot64.h"
 
 static inline uint8_t inb(uint16_t p) { uint8_t r; __asm__ volatile("inb %1,%0" : "=a"(r) : "Nd"(p)); return r; }
+static inline void    outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0,%1" :: "a"(v), "Nd"(p)); }
 
 /* COM1 receive: lets the serial console drive login/shell when headless. */
 #define COM1 0x3F8
@@ -35,12 +36,18 @@ static int s_shift, s_caps, s_ext, s_ctrl;
 
 void kbd64_init(void) {
     s_shift = s_caps = s_ext = s_ctrl = 0;
+    /* disable the PS/2 aux port so touchpad/TrackPoint packets can't arrive on
+     * 0x60 and get mis-decoded as scancodes (spurious keys) */
+    for (int g = 0; g < 100000 && (inb(0x64) & 0x02); g++) { }
+    outb(0x64, 0xA7);
     /* drain any bytes the firmware left in the output buffer */
     for (int i = 0; i < 32 && (inb(0x64) & 0x01); i++) (void)inb(0x60);
 }
 
 int kbd64_getkey(void) {
-    if (!(inb(0x64) & 0x01)) return serial_getc();  /* PS/2 empty -> try the serial console */
+    uint8_t st = inb(0x64);
+    if (!(st & 0x01)) return serial_getc();  /* PS/2 empty -> try the serial console */
+    if (st & 0x20) { (void)inb(0x60); return -1; }  /* aux (touchpad/mouse) byte -> ignore */
     uint8_t sc = inb(0x60);
 
     if (sc == 0xE0) { s_ext = 1; return -1; }  /* extended-key prefix */

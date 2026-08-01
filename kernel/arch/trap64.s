@@ -53,6 +53,16 @@ arch_isr_addr:
 1:  leaq    isr_default(%rip), %rax
     ret
 
+/* NMI (vector 2): ignore on real HW (watchdog/thermal/spurious) rather than
+ * halting or (on an AP with no IDT) triple-faulting; fatal HW errors are #MC. */
+    .global isr_nmi
+isr_nmi:
+    iretq
+    .global arch_nmi_addr
+arch_nmi_addr:
+    leaq    isr_nmi(%rip), %rax
+    ret
+
 /* void arch_setup_syscall_msrs(void) — enable SYSCALL and point LSTAR at us.
  *   STAR[63:48]=0x10 (sysret base: +8=udata 0x18, +16=ucode 0x20)
  *   STAR[47:32]=0x08 (syscall CS = kcode; SS = 0x10 = kdata) */
