@@ -47,11 +47,16 @@ typedef struct { uint64_t rsp; uint8_t *stack; int state; uint64_t rsp0; int is_
 static task_t            g_tasks[MAXTASK];
 static int               g_cur;
 static volatile uint64_t g_switches;
+static volatile int      g_sched_running;          /* 1 while the LAPIC timer drives scheduling */
 
 /* Called from timer_isr (asm) with the interrupted thread's saved rsp.  Saves it,
  * round-robins to the next runnable thread, and returns that thread's rsp. */
 uint64_t sched_tick(uint64_t cur_rsp) {
     lw(LAPIC_EOI, 0);                                   /* acknowledge the IRQ */
+    if (!g_sched_running) return cur_rsp;               /* idle tick (native console): just
+                                                         * ack + resume the interrupted context;
+                                                         * used to wake wm_run's HLT when no
+                                                         * user tasks are scheduled */
     g_switches++;
     g_tasks[g_cur].rsp = cur_rsp;
     if (g_tasks[g_cur].state == T_RUNNING) g_tasks[g_cur].state = T_READY;
@@ -242,6 +247,7 @@ uint64_t sched_switches(void) { return g_switches; }
 void sched_set_current_cr3(uint64_t cr3) { g_tasks[g_cur].cr3 = cr3; }
 
 /* Calibrate the LAPIC timer against millis() and start it firing at ~100 Hz. */
+static uint32_t g_per_tick;                             /* calibrated period (idle-tick reuse) */
 static void lapic_timer_start(void) {
     lw(LAPIC_TIMER_DCR, 0x3);                           /* divide by 16 */
     lw(LAPIC_LVT_TIMER, LVT_MASKED | TIMER_VEC);        /* masked, one-shot for calibration */
@@ -252,9 +258,19 @@ static void lapic_timer_start(void) {
     lw(LAPIC_TIMER_ICR, 0);                             /* stop */
     uint32_t per_tick = ticks_50ms / 5;                 /* 10 ms => ~100 Hz */
     if (per_tick < 1000) per_tick = 1000;               /* guard against a stalled clock */
+    g_per_tick = per_tick;
     lw(LAPIC_LVT_TIMER, LVT_PERIODIC | TIMER_VEC);      /* periodic, unmasked */
     lw(LAPIC_TIMER_ICR, per_tick);
 }
+
+/* Idle-tick support for the native console loop (wm_run), which runs with the
+ * scheduler stopped.  Arm a periodic LAPIC tick just around a HLT so the CPU
+ * halts instead of spinning at 100%; the tick lands in sched_tick's guarded
+ * early-return (harmless ack).  Armed only during the HLT and disarmed on wake,
+ * so it never fires while a ring-3 program is executing. */
+int  lapic_ready(void)      { return g_per_tick != 0; }
+void lapic_idle_arm(void)   { if (g_per_tick) { lw(LAPIC_LVT_TIMER, LVT_PERIODIC | TIMER_VEC); lw(LAPIC_TIMER_ICR, g_per_tick); } }
+void lapic_idle_disarm(void){ lw(LAPIC_LVT_TIMER, LVT_MASKED | TIMER_VEC); lw(LAPIC_TIMER_ICR, 0); }
 
 void sched_init(void) {
     uint64_t base = smp_lapic_base();
@@ -269,9 +285,12 @@ void sched_init(void) {
     g_tasks[0].cr3   = rdcr3();                         /* resume in the kernel address space */
 }
 
-void sched_start(void) { vmbus_synic_set_masked(1); lapic_timer_start(); __asm__ volatile("sti"); }
+static volatile int g_sched_running;               /* 1 while the LAPIC timer is firing */
+int sched_is_running(void) { return g_sched_running; }
+void sched_start(void) { vmbus_synic_set_masked(1); lapic_timer_start(); g_sched_running = 1; __asm__ volatile("sti"); }
 void sched_stop(void)  {
     __asm__ volatile("cli");
+    g_sched_running = 0;
     lw(LAPIC_LVT_TIMER, LVT_MASKED | TIMER_VEC);
     lw(LAPIC_TIMER_ICR, 0);
     vmbus_synic_set_masked(0);                     /* restore the VMBus message interrupt */

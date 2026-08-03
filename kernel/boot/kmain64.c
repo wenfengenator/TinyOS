@@ -70,9 +70,17 @@ void kmain64(boot_info_t *bi) {
     }
 
     arch_init();
+    /* Map the framebuffer write-combining so blits run at bus speed instead of
+     * ~3 FPS uncached.  The earlier "only refreshes on a keypress" symptom was
+     * the WC buffers not reaching the panel until the next serializing/I-O event
+     * (a keypress does PS/2 port I/O, which evicts them); fb_flush() now performs
+     * that eviction (sfence + IN) after every present, so frames appear on their
+     * own.  See kernel/drivers/fb64.c. */
     if (bi->fb_base) arch_fb_set_wc(bi->fb_base, bi->fb_size);
     smp_init(bi);
     hvkbd_init();
+    acpi_init(bi->rsdp);          /* FADT/ECDT/DSDT: poweroff + EC battery state */
+    ahci_init();                  /* AHCI/SATA disk (read-only until the installer) */
 
     kputs("[tinyos64] TinyOS v" TINYOS_VERSION " - TINYOS X64 UEFI BOOT OK\n");
     arch_user_init();

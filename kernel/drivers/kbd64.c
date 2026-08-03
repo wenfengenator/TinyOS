@@ -8,10 +8,28 @@
 static inline uint8_t inb(uint16_t p) { uint8_t r; __asm__ volatile("inb %1,%0" : "=a"(r) : "Nd"(p)); return r; }
 static inline void    outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0,%1" :: "a"(v), "Nd"(p)); }
 
-/* COM1 receive: lets the serial console drive login/shell when headless. */
+/* COM1 receive: lets the serial console drive login/shell when headless.  Only
+ * usable when a real 16550 is present -- on a laptop with no serial port (the
+ * T440s) the 0x3F8 range is unclaimed and floats high, so inb() returns 0xFF and
+ * LSR bit0 (data-ready) reads as 1 forever.  Left unguarded, serial_getc() then
+ * streams phantom 0xFF "keys" that trap the cooperative input loops (login, WM,
+ * DEMO, PONG) in their `while (getkey>=0)` drain and they never render -- the
+ * "frozen until a real keypress" bug.  Probe the 16550 scratch register once and
+ * disable serial input if it is absent. */
 #define COM1 0x3F8
+static int s_serial = -1;                          /* -1 unprobed, 0 absent, 1 present */
+static int serial_present(void) {
+    if (s_serial < 0) {
+        outb(COM1 + 7, 0xAE); uint8_t a = inb(COM1 + 7);   /* 16550 scratch pad loopback */
+        outb(COM1 + 7, 0x51); uint8_t b = inb(COM1 + 7);
+        s_serial = (a == 0xAE && b == 0x51) ? 1 : 0;
+    }
+    return s_serial;
+}
 static int serial_getc(void) {
-    if (!(inb(COM1 + 5) & 0x01)) return -1;    /* LSR bit0: data ready? */
+    if (!serial_present()) return -1;
+    uint8_t lsr = inb(COM1 + 5);
+    if (lsr == 0xFF || !(lsr & 0x01)) return -1;   /* open bus / no data ready */
     int c = inb(COM1);
     if (c == '\r') c = '\n';                    /* CR -> newline */
     if (c == 0x7F) c = '\b';                    /* DEL -> backspace */

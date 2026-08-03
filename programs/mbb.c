@@ -265,14 +265,83 @@ static int ap_ls(int argc, char **argv) {
     closedir(d);
     return 0;
 }
-static int ap_cp(int argc, char **argv) {
-    if (argc < 3) { outs(2, "usage: cp SRC DST\n"); return 1; }
-    int s = open(argv[1], O_RDONLY); if (s < 0) { outs(2, "cp: cannot open source\n"); return 1; }
-    int d = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC); if (d < 0) { close(s); outs(2, "cp: cannot open dest\n"); return 1; }
-    char b[512]; int n; while ((n = read(s, b, sizeof b)) > 0) write(d, b, n);
-    close(s); close(d); return 0;
+/* join dir + '/' + name -> out (bounded) */
+static void cp_join(char *out, int cap, const char *dir, const char *name) {
+    int n = 0;
+    for (const char *p = dir; *p && n < cap - 2; p++) out[n++] = *p;
+    if (n && out[n - 1] != '/') out[n++] = '/';
+    for (const char *p = name; *p && n < cap - 1; p++) out[n++] = *p;
+    out[n] = 0;
 }
-static int ap_mv(int argc, char **argv) { if (ap_cp(argc, argv)) return 1; unlink(argv[1]); return 0; }
+static const char *cp_base(const char *p) {
+    const char *b = p;
+    for (const char *q = p; *q; q++) if (*q == '/') b = q + 1;
+    return b;
+}
+static int cp_is_dir(const char *p) {
+    struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+/* copy one regular file src -> dst (full paths); routes across /, /mnt, /usb */
+static int cp_file(const char *src, const char *dst) {
+    int s = open(src, O_RDONLY);
+    if (s < 0) { outs(2, "cp: cannot open "); outs(2, src); outs(2, "\n"); return 1; }
+    int d = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+    if (d < 0) { close(s); outs(2, "cp: cannot create "); outs(2, dst); outs(2, "\n"); return 1; }
+    char b[512]; int n, rc = 0;
+    while ((n = read(s, b, sizeof b)) > 0) if (write(d, b, n) != n) { rc = 1; break; }
+    if (n < 0) rc = 1;
+    close(s); close(d);
+    return rc;
+}
+/* copy src -> dst; recurse into directories when rflag is set */
+static int cp_tree(const char *src, const char *dst, int rflag) {
+    struct stat st;
+    if (stat(src, &st) != 0) { outs(2, "cp: "); outs(2, src); outs(2, ": not found\n"); return 1; }
+    if (!S_ISDIR(st.st_mode)) return cp_file(src, dst);
+    if (!rflag) { outs(2, "cp: omitting directory "); outs(2, src); outs(2, " (use -r)\n"); return 1; }
+    mkdir(dst, 0755);                                  /* ok if it already exists */
+    DIR *dir = opendir(src);
+    if (!dir) { outs(2, "cp: cannot read "); outs(2, src); outs(2, "\n"); return 1; }
+    struct dirent *e; int rc = 0;
+    while ((e = readdir(dir))) {
+        if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0))) continue;
+        char sp[288], dp[288];
+        cp_join(sp, sizeof sp, src, e->d_name);
+        cp_join(dp, sizeof dp, dst, e->d_name);
+        if (cp_tree(sp, dp, rflag)) rc = 1;
+    }
+    closedir(dir);
+    return rc;
+}
+/* cp [-r] SRC... DST  — like coreutils cp: recursive, multiple sources into a
+ * directory, and works across the /, /mnt and /usb filesystems. */
+static int ap_cp(int argc, char **argv) {
+    int rflag = 0, i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++)
+        for (const char *f = argv[i] + 1; *f; f++) {
+            if (*f == 'r' || *f == 'R' || *f == 'a') rflag = 1;
+            else { outs(2, "cp: unknown option -"); write(2, f, 1); outs(2, "\n"); return 1; }
+        }
+    if (argc - i < 2) { outs(2, "usage: cp [-r] SRC... DST\n"); return 1; }
+    const char *dst = argv[argc - 1];
+    int into_dir = cp_is_dir(dst);
+    if (argc - i > 2 && !into_dir) { outs(2, "cp: target '"); outs(2, dst); outs(2, "' is not a directory\n"); return 1; }
+    int rc = 0;
+    for (int k = i; k < argc - 1; k++) {
+        if (into_dir) {
+            char dp[288]; cp_join(dp, sizeof dp, dst, cp_base(argv[k]));
+            if (cp_tree(argv[k], dp, rflag)) rc = 1;
+        } else if (cp_tree(argv[k], dst, rflag)) rc = 1;
+    }
+    return rc;
+}
+/* mv [-r] SRC... DST  — copy then remove the sources (files only). */
+static int ap_mv(int argc, char **argv) {
+    if (ap_cp(argc, argv)) return 1;
+    int i = 1; for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {}
+    for (int k = i; k < argc - 1; k++) unlink(argv[k]);
+    return 0;
+}
 static int ap_rm(int argc, char **argv) {
     int rc = 0, i = 1; while (i < argc && argv[i][0] == '-') i++;
     for (; i < argc; i++) if (unlink(argv[i]) < 0) { outs(2, "rm: "); outs(2, argv[i]); outs(2, ": failed\n"); rc = 1; }

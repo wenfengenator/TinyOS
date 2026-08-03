@@ -48,7 +48,12 @@ static uint64_t do_linux_fork(void);        /* fork() for scheduled Linux procs 
 static int      linux_wait4(int wpid, int *wstatus, int options);
 static void     write_fs_base(uint64_t base);
 static uint64_t read_fs_base(void);
+static uint64_t rd_msr(uint32_t msr);              /* wrappers around rdmsr/wrmsr (defined later) */
+static void     wr_msr(uint32_t msr, uint64_t v);
+void            arch_apic_force_xapic(void);        /* force LAPIC into xAPIC (MMIO) mode */
 static void     free_user_pages(uint64_t *pml4);   /* reclaim a dead process's frames */
+static void     proc_terminate(int status);        /* kill `current` (exit/fatal signal/fault) */
+static uint64_t g_arena_va, g_arena_pa, g_arena_len;  /* heap arena VA/PA (mm_phys_init) */
 
 /* ---- GDT + TSS ---- */
 struct gdtr   { uint16_t limit; uint64_t base; } __attribute__((packed));
@@ -120,22 +125,78 @@ static int          g_next_pid;
 #define NET_SYS_PING       0x4E455401ULL      /* 'NET'+1: userspace ICMP echo */
 #define NET_SYS_IFCONFIG   0x4E455402ULL      /* 'NET'+2: userspace interface config */
 #define NET_SYS_SETCFG     0x4E455403ULL      /* 'NET'+3: set static interface config */
-#define USER_STK_PAGES  16              /* 64KB: headroom for deep crypto/TLS call chains */
+#define USER_STK_PAGES  64              /* 256KB: headroom for deep recursion (tcc) + crypto/TLS */
 #define LINUX_LOAD_PAGES ((LINUX_LOAD_LIMIT - LINUX_LOAD_VA) / 4096)
 #define USER_ARG_OFF    (USER_CODE_PAGES * 4096 - 256)   /* argv[0] staged here */
 #define PTE_P   0x1
 #define PTE_RW  0x2
 #define PTE_US  0x4
 #define PTE_PS  0x80
+/* Physical address field of a PTE/CR3 (bits 12..51).  Masking with ~0xFFF alone
+ * keeps bit 63 (NX) and the software/reserved bits 52..62, which yields a
+ * NON-CANONICAL pointer that #GPs when dereferenced on real silicon (QEMU TCG
+ * does not check) — firmware identity-map entries are routinely NX-marked. */
+#define PT_PA_MASK 0x000FFFFFFFFFF000ULL
 
-/* C dumper for the exception stubs (kernel/trap64.s). */
-void isr_c(uint64_t vec, uint64_t err, uint64_t rip) {
+/* Map a CPU exception vector to the POSIX signal a real kernel would raise, so a
+ * faulting ring-3 program is terminated with a sensible exit status (128+signo). */
+static int sig_for_vec(uint64_t vec) {
+    switch (vec) {
+        case 0:  return 8;    /* #DE -> SIGFPE  */
+        case 6:  return 4;    /* #UD -> SIGILL  */
+        case 16: case 19: return 8;   /* #MF/#XM -> SIGFPE */
+        case 5:  case 12: case 13: case 14: return 11;   /* #BR/#SS/#GP/#PF -> SIGSEGV */
+        default: return 11;   /* SIGSEGV */
+    }
+}
+
+/* C handler for the CPU exception stubs (kernel/trap64.s).  `cs` is the faulting
+ * code segment: a ring-3 (CPL 3) fault is a bug in ONE user program, so we kill
+ * just that process and return to the shell/desktop — TinyOS stays up.  A ring-0
+ * fault is a kernel bug: show it on screen (the desktop may own the console) and
+ * halt.  `rsp` is the interrupted stack, scanned for a symbol-relative backtrace
+ * so a real-HW fault can be pinpointed despite the firmware's unknown load base. */
+static volatile int g_in_panic;
+void isr_c(uint64_t vec, uint64_t err, uint64_t rip, uint64_t cs, uint64_t rsp) {
     uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+
+    if ((cs & 3) == 3 && current && current != &g_proc[0]) {
+        /* One short line so it stays readable in the WM kernel-log widget. */
+        kputs("\n[EXC] usr pid "); kput_u32dec((uint32_t)current->pid);
+        kputs(" v");    kput_u32dec((uint32_t)vec);
+        kputs(" cr2="); kput_u64hex(cr2);
+        kputs(" rip="); kput_u64hex(rip);
+        kputs(" killed\n");
+        proc_terminate(128 + sig_for_vec(vec));    /* like a fatal signal; never returns */
+    }
+
+    if (g_in_panic) for (;;) __asm__ volatile("cli; hlt");   /* nested fault: just stop */
+    g_in_panic = 1;
+
+    /* rip + return addresses reported as offsets from isr_c: the kernel is -fPIC
+     * and UEFI loads it at an unknown base, but a symboled build resolves these
+     * deltas directly. */
+    int64_t ref    = (int64_t)(uint64_t)&isr_c;
+    int64_t rip_off = (int64_t)rip - ref;
+    int64_t mapoff  = (int64_t)(g_arena_pa - g_arena_va);
+    int64_t bt[6]; int nbt = 0;
+    const uint64_t *sp = (const uint64_t *)rsp;
+    for (int i = 0; i < 160 && nbt < 6; i++) {
+        int64_t d = (int64_t)sp[i] - ref;
+        if (d > -0x2000000 && d < 0x2000000) bt[nbt++] = d;   /* looks like kernel code */
+    }
+
     kputs("\n[EXC] vector "); kput_u32dec((uint32_t)vec);
-    kputs(" err ");  kput_u64hex(err);
-    kputs(" rip ");  kput_u64hex(rip);
-    kputs(" cr2 ");  kput_u64hex(cr2);
+    kputs(" err ");    kput_u64hex(err);
+    kputs(" rip ");    kput_u64hex(rip);
+    kputs(" cs ");     kput_u64hex(cs);
+    kputs(" cr2 ");    kput_u64hex(cr2);
+    kputs(" ripoff "); kput_u64hex((uint64_t)rip_off);
+    kputs(" mapoff "); kput_u64hex((uint64_t)mapoff); kputc('\n');
+    kputs("[EXC] bt:");
+    for (int i = 0; i < nbt; i++) { kputc(' '); kput_u64hex((uint64_t)bt[i]); }
     kputs("\n[EXC] halted.\n");
+    fb_panic(vec, err, rip, cr2, cs, rip_off, bt, nbt, mapoff);
     for (;;) __asm__ volatile("cli; hlt");
 }
 
@@ -213,6 +274,36 @@ void arch_init(void) {
     __asm__ volatile("lidt %0" :: "m"(g_idtr));
 
     kputs("[arch] gdt + tss + idt installed (ring 0/3 ready)\n");
+
+    arch_apic_force_xapic();
+}
+
+/* Normalize the local APIC into xAPIC (MMIO) mode.  Real Haswell/Broadwell UEFI
+ * (the T440s included) frequently hands the OS a local APIC already switched to
+ * x2APIC mode.  In x2APIC mode the MMIO window at 0xFEE00000 is dead, so every
+ * lapic_w()/lw() in smp64.c and sched64.c is a silent no-op: the scheduler's
+ * LAPIC timer is never programmed, it never fires, and the first sched_block()/
+ * sched_wait() ("sti; hlt") halts the CPU forever with no panic -- exactly the
+ * "runs, then freezes with nothing on screen" the demos/tcc/shell show on real
+ * hardware.  QEMU and Hyper-V default to xAPIC, which is why it only bites the
+ * laptop.  A direct x2APIC->xAPIC switch #GPs, so pass through the disabled state
+ * first (Intel SDM Vol.3, "x2APIC State Transitions").  Printed to the boot
+ * console so the mode is visible on a serial-less panel. */
+void arch_apic_force_xapic(void) {
+    uint64_t base = rd_msr(0x1B);                          /* IA32_APIC_BASE */
+    kputs("[apic] IA32_APIC_BASE="); kput_u64hex(base);
+    kputs((base & (1ull << 10)) ? " x2APIC\n"
+        : (base & (1ull << 11)) ? " xAPIC\n" : " disabled\n");
+    if (base & (1ull << 10)) {                             /* x2APIC: transition out */
+        wr_msr(0x1B, base & ~((1ull << 10) | (1ull << 11)));   /* -> fully disabled */
+        wr_msr(0x1B, 0xFEE00000ull | (1ull << 11));            /* -> xAPIC, enabled  */
+        kputs("[apic] switched x2APIC -> xAPIC; IA32_APIC_BASE=");
+        kput_u64hex(rd_msr(0x1B)); kputc('\n');
+    } else if (!(base & (1ull << 11))) {                   /* disabled: enable xAPIC */
+        wr_msr(0x1B, (base & ~0xFFFull) | 0xFEE00000ull | (1ull << 11));
+        kputs("[apic] enabled xAPIC; IA32_APIC_BASE=");
+        kput_u64hex(rd_msr(0x1B)); kputc('\n');
+    }                                                      /* already xAPIC: leave as-is */
 }
 
 /* Install an interrupt gate at runtime.  The IDT is already loaded (arch_init),
@@ -244,6 +335,7 @@ static uint64_t linux_mmap(uint64_t addr, uint64_t len, uint64_t prot,
 static int linux_mprotect(uint64_t addr, uint64_t len, uint64_t prot);
 static int linux_munmap(uint64_t addr, uint64_t len);
 static int linux_openat(int dirfd, const char *path, int flags);
+static int linux_chdir(const char *path);
 static int linux_resolve_at(int dirfd, const char *path, char *full);
 static int linux_close(int fd);
 static void linux_close_all_fds(void);
@@ -282,6 +374,31 @@ static int64_t gfx_bo_destroy(int handle);
 struct linux_exec_args;
 static int linux_execve(const char *path, const char *const *argv,
                         const char *const *envp);
+
+/* Idle the CPU until the next interrupt instead of spinning at 100%.  Only halts
+ * when the scheduler's LAPIC timer is live (guaranteeing a wake within ~10ms);
+ * otherwise falls back to a cheap pause.  Safe mid-syscall: sched_tick() repoints
+ * the SYSCALL kernel stack per task (kernel/sched64.c:68), so a timer preemption
+ * during the HLT saves/restores this task correctly.  This is what lets an idle
+ * shell prompt draw almost no power instead of pegging a core (weeks on battery).
+ * The halted time is accumulated so the system monitor can show CPU-busy %. */
+static volatile uint64_t g_cpu_idle_ms;
+uint64_t cpu_idle_ms(void) { return g_cpu_idle_ms; }
+void cpu_idle_add_ms(uint64_t ms) { g_cpu_idle_ms += ms; }   /* for HLT paths outside idle_wait */
+static inline void idle_wait(void) {
+    if (sched_is_running()) {
+        uint64_t t0 = millis();
+        __asm__ volatile("sti; hlt; cli");
+        g_cpu_idle_ms += millis() - t0;
+    } else {
+        __asm__ volatile("pause");
+    }
+}
+
+/* VFS path resolution/IO (defined below) — forward-declared so the early Linux
+ * syscalls (access, exec) route /mnt and /usb like the later fd layer does. */
+static int vfs_resolve(const char *full, uint8_t *attr, uint32_t *cluster, uint32_t *size);
+static int vfs_pread(const char *full, void *buf, uint32_t len, uint32_t off);
 static int run_linux_path(const char *path, uint8_t *stk, uint8_t *kstack_top,
                           const struct linux_exec_args *args, int on_sched);
 static int arch_user_run(const char *name, const uint8_t *img, uint64_t size,
@@ -298,6 +415,17 @@ struct linux_exec_args {
 };
 
 static void write_fs_base(uint64_t base) {
+    /* Real Intel silicon #GPs on a WRMSR of a non-canonical FS base (QEMU's TCG
+     * does not check); doing that from the context-switch path would halt the
+     * whole kernel.  Canonicalize (sign-extend bit 47) so a bogus TLS pointer at
+     * worst mislocates a user's TLS instead of taking down the OS. */
+    uint64_t hi16 = base >> 48;
+    int noncanon = (base & (1ULL << 47)) ? (hi16 != 0xFFFF) : (hi16 != 0);
+    if (noncanon) {
+        kputs("[fsbase] non-canonical "); kput_u64hex(base); kputc('\n');
+        base = (base & (1ULL << 47)) ? (base | 0xFFFF000000000000ULL)
+                                     : (base & 0x0000FFFFFFFFFFFFULL);
+    }
     uint32_t lo = (uint32_t)base, hi = (uint32_t)(base >> 32);
     __asm__ volatile("wrmsr" :: "c"(0xC0000100U), "a"(lo), "d"(hi));
     g_linux_fs_base = base;
@@ -565,8 +693,8 @@ static int linux_nanosleep(const void *req, void *rem) {
 static int linux_access(int dirfd, const char *path) {
     char full[256]; if (linux_resolve_at(dirfd, path, full) < 0) return -2;
     if (strpfx(full, "/proc/")) return 0;
-    uint8_t attr; uint16_t cl; uint32_t sz;
-    return fat_resolve(full, &attr, &cl, &sz) == 0 ? 0 : -2;
+    uint8_t attr; uint32_t cl; uint32_t sz;
+    return vfs_resolve(full, &attr, &cl, &sz) == 0 ? 0 : -2;
 }
 
 static int linux_readlinkat(int dirfd, const char *path, char *buf, uint32_t bufsiz) {
@@ -749,7 +877,7 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
         case 79:                            /* getcwd                     */
             return linux_getcwd((char *)a0, a1);
         case 80:                            /* chdir                      */
-            return (uint64_t)(int64_t)fs_chdir((const char *)a0);
+            return (uint64_t)(int64_t)linux_chdir((const char *)a0);
         case 158:                           /* arch_prctl                 */
             return (uint64_t)(int64_t)linux_arch_prctl((int)a0, a1);
         case 218:                           /* set_tid_address            */
@@ -875,6 +1003,7 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
                 else if (k >= 0x20 && k < 0x7F && n < max) { char c = (char)k; buf[n++] = c; usys_write(&c, 1); }
             }
             wm_pump();                        /* keep the desktop live while blocked */
+            if (k < 0) idle_wait();
         }
         return (uint64_t)n;
     }
@@ -886,6 +1015,7 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
             if (k < 0) k = hvkbd_getkey();
             if (k >= 0) return (uint64_t)k;
             wm_pump();                        /* keep the desktop live      */
+            idle_wait();
         }
     }
     case 20:                                  /* clear() the terminal grid */
@@ -981,7 +1111,6 @@ static void wp_restore(uint64_t cr0) { __asm__ volatile("mov %0, %%cr0" :: "r"(c
  * base, so page-table entries -- which must hold TRUE physical addresses -- need
  * the arena's remap offset (measured once in mm_phys_init).  Under an identity
  * map g_arena_pa==g_arena_va and both helpers are pass-throughs (QEMU path). */
-static uint64_t g_arena_va, g_arena_pa, g_arena_len;
 static uint64_t mm_v2p(uint64_t va) {                  /* arena VA -> physical */
     uint64_t off = va - g_arena_va;
     return (g_arena_len && off < g_arena_len) ? g_arena_pa + off : va;
@@ -1001,7 +1130,7 @@ static uint64_t *next_level(uint64_t *tbl, int i) {
         return n;
     }
     tbl[i] |= PTE_US;                                  /* open the path to ring 3 */
-    return (uint64_t *)mm_p2v(tbl[i] & ~0xFFFULL);
+    return (uint64_t *)mm_p2v(tbl[i] & PT_PA_MASK);
 }
 
 static void map_user_page(uint64_t pml4_phys, uint64_t va, uint64_t phys, uint64_t flags) {
@@ -1009,25 +1138,25 @@ static void map_user_page(uint64_t pml4_phys, uint64_t va, uint64_t phys, uint64
     uint64_t *pdpt = next_level(pml4, (int)((va >> 39) & 0x1FF));
     uint64_t *pd   = next_level(pdpt, (int)((va >> 30) & 0x1FF));
     uint64_t *pt   = next_level(pd,   (int)((va >> 21) & 0x1FF));
-    pt[(va >> 12) & 0x1FF] = (mm_v2p(phys) & ~0xFFFULL) | flags | PTE_P;
+    pt[(va >> 12) & 0x1FF] = (mm_v2p(phys) & PT_PA_MASK) | flags | PTE_P;
 }
 
 /* DIAGNOSTIC (real-HW bring-up): resolve `va` through the live firmware page
  * tables to its physical address, reporting the mapping granularity.  Used to
  * check the identity-map assumption (page_alloc VA must == PA) on real firmware. */
 static uint64_t diag_resolve(uint64_t va, const char **gran) {
-    uint64_t *pml4 = (uint64_t *)(read_cr3() & ~0xFFFULL);
+    uint64_t *pml4 = (uint64_t *)(read_cr3() & PT_PA_MASK);
     uint64_t e = pml4[(va >> 39) & 0x1FF];
     if (!(e & PTE_P)) { *gran = "unmapped"; return ~0ULL; }
-    uint64_t *pdpt = (uint64_t *)(e & ~0xFFFULL);
+    uint64_t *pdpt = (uint64_t *)(e & PT_PA_MASK);
     e = pdpt[(va >> 30) & 0x1FF];
     if (!(e & PTE_P)) { *gran = "unmapped"; return ~0ULL; }
     if (e & PTE_PS) { *gran = "1GB"; return (e & 0x000FFFFFC0000000ULL) | (va & 0x3FFFFFFFULL); }
-    uint64_t *pd = (uint64_t *)(e & ~0xFFFULL);
+    uint64_t *pd = (uint64_t *)(e & PT_PA_MASK);
     e = pd[(va >> 21) & 0x1FF];
     if (!(e & PTE_P)) { *gran = "unmapped"; return ~0ULL; }
     if (e & PTE_PS) { *gran = "2MB"; return (e & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFFULL); }
-    uint64_t *pt = (uint64_t *)(e & ~0xFFFULL);
+    uint64_t *pt = (uint64_t *)(e & PT_PA_MASK);
     e = pt[(va >> 12) & 0x1FF];
     if (!(e & PTE_P)) { *gran = "unmapped"; return ~0ULL; }
     *gran = "4KB"; return (e & 0x000FFFFFFFFFF000ULL) | (va & 0xFFFULL);
@@ -1045,6 +1174,21 @@ static void mm_phys_init(void) {
     g_arena_len = len;
 }
 
+/* True if `va` is mapped writable AND user-accessible in the CURRENT address
+ * space.  Guards kernel writes into a user pointer so a bad/unmapped pointer
+ * degrades to a skipped write instead of a fatal kernel #PF (walks CR3 by
+ * physical address, valid under the identity map firmware hands us). */
+static int user_va_writable(uint64_t va) {
+    uint64_t *t = (uint64_t *)(read_cr3() & PT_PA_MASK);
+    uint64_t e = t[(va >> 39) & 0x1FF]; if (!(e & PTE_P) || !(e & PTE_US)) return 0;
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 30) & 0x1FF]; if (!(e & PTE_P) || !(e & PTE_US)) return 0;
+    if (e & PTE_PS) return (e & PTE_RW) != 0;
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 21) & 0x1FF]; if (!(e & PTE_P) || !(e & PTE_US)) return 0;
+    if (e & PTE_PS) return (e & PTE_RW) != 0;
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 12) & 0x1FF];
+    return (e & PTE_P) && (e & PTE_US) && (e & PTE_RW);
+}
+
 /* DIAGNOSTIC (real-HW perf): report the framebuffer's effective memory type so
  * we can tell whether it is uncached (UC) -- which makes blits ~3 FPS -- and
  * program write-combining (WC) correctly.  Read-only (MSRs + page-table bits). */
@@ -1053,13 +1197,13 @@ static uint64_t rd_msr(uint32_t msr) {
     return ((uint64_t)hi << 32) | lo;
 }
 static uint64_t fw_leaf(uint64_t va, const char **gran) {
-    uint64_t *t = (uint64_t *)(read_cr3() & ~0xFFFULL);
+    uint64_t *t = (uint64_t *)(read_cr3() & PT_PA_MASK);
     uint64_t e = t[(va >> 39) & 0x1FF]; if (!(e & PTE_P)) { *gran = "unmapped"; return 0; }
-    t = (uint64_t *)(e & ~0xFFFULL); e = t[(va >> 30) & 0x1FF]; if (!(e & PTE_P)) { *gran = "unmapped"; return 0; }
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 30) & 0x1FF]; if (!(e & PTE_P)) { *gran = "unmapped"; return 0; }
     if (e & PTE_PS) { *gran = "1GB"; return e; }
-    t = (uint64_t *)(e & ~0xFFFULL); e = t[(va >> 21) & 0x1FF]; if (!(e & PTE_P)) { *gran = "unmapped"; return 0; }
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 21) & 0x1FF]; if (!(e & PTE_P)) { *gran = "unmapped"; return 0; }
     if (e & PTE_PS) { *gran = "2MB"; return e; }
-    t = (uint64_t *)(e & ~0xFFFULL); e = t[(va >> 12) & 0x1FF]; if (!(e & PTE_P)) { *gran = "unmapped"; return 0; }
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 12) & 0x1FF]; if (!(e & PTE_P)) { *gran = "unmapped"; return 0; }
     *gran = "4KB"; return e;
 }
 void arch_fb_mem_diag(uint64_t base, uint64_t size) {
@@ -1080,10 +1224,10 @@ void arch_fb_mem_diag(uint64_t base, uint64_t size) {
     for (int i = 0; i < n; i++) {
         uint64_t mb = rd_msr(0x200 + 2 * i), mk = rd_msr(0x201 + 2 * i);
         if (!(mk & 0x800)) continue;
-        if ((base & (mk & ~0xFFFULL)) == (mb & (mk & ~0xFFFULL))) {
+        if ((base & (mk & PT_PA_MASK)) == (mb & (mk & PT_PA_MASK))) {
             kputs("[fb] MTRR"); kputc((char)('0' + i));
-            kputs(" base="); kput_u64hex(mb & ~0xFFFULL);
-            kputs(" mask="); kput_u64hex(mk & ~0xFFFULL);
+            kputs(" base="); kput_u64hex(mb & PT_PA_MASK);
+            kputs(" mask="); kput_u64hex(mk & PT_PA_MASK);
             kputs(" type="); kput_u64hex(mb & 0xFF); kputc('\n');
         }
     }
@@ -1093,13 +1237,13 @@ static void wr_msr(uint32_t msr, uint64_t v) {
     __asm__ volatile("wrmsr" :: "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
 }
 static uint64_t *fw_leaf_ptr(uint64_t va, int *huge) {
-    uint64_t *t = (uint64_t *)(read_cr3() & ~0xFFFULL);
+    uint64_t *t = (uint64_t *)(read_cr3() & PT_PA_MASK);
     uint64_t e = t[(va >> 39) & 0x1FF]; if (!(e & PTE_P)) return 0;
-    t = (uint64_t *)(e & ~0xFFFULL); int i3 = (int)((va >> 30) & 0x1FF); e = t[i3]; if (!(e & PTE_P)) return 0;
+    t = (uint64_t *)(e & PT_PA_MASK); int i3 = (int)((va >> 30) & 0x1FF); e = t[i3]; if (!(e & PTE_P)) return 0;
     if (e & PTE_PS) { *huge = 1; return &t[i3]; }
-    t = (uint64_t *)(e & ~0xFFFULL); int i2 = (int)((va >> 21) & 0x1FF); e = t[i2]; if (!(e & PTE_P)) return 0;
+    t = (uint64_t *)(e & PT_PA_MASK); int i2 = (int)((va >> 21) & 0x1FF); e = t[i2]; if (!(e & PTE_P)) return 0;
     if (e & PTE_PS) { *huge = 1; return &t[i2]; }
-    t = (uint64_t *)(e & ~0xFFFULL); int i1 = (int)((va >> 12) & 0x1FF); if (!(t[i1] & PTE_P)) return 0;
+    t = (uint64_t *)(e & PT_PA_MASK); int i1 = (int)((va >> 12) & 0x1FF); if (!(t[i1] & PTE_P)) return 0;
     *huge = 0; return &t[i1];
 }
 /* Mark the framebuffer write-combining (PAT PA4=WC) so blits are not UC-slow on
@@ -1141,9 +1285,9 @@ static int       g_depth;                      /* 0 primary, 1 child running    
 
 static uint64_t *walk_pt(uint64_t pml4_phys, uint64_t va) {
     uint64_t *pml4 = (uint64_t *)pml4_phys;
-    uint64_t *pdpt = (uint64_t *)mm_p2v(pml4[(va >> 39) & 0x1FF] & ~0xFFFULL);
-    uint64_t *pd   = (uint64_t *)mm_p2v(pdpt[(va >> 30) & 0x1FF] & ~0xFFFULL);
-    return (uint64_t *)mm_p2v(pd[(va >> 21) & 0x1FF] & ~0xFFFULL);
+    uint64_t *pdpt = (uint64_t *)mm_p2v(pml4[(va >> 39) & 0x1FF] & PT_PA_MASK);
+    uint64_t *pd   = (uint64_t *)mm_p2v(pdpt[(va >> 30) & 0x1FF] & PT_PA_MASK);
+    return (uint64_t *)mm_p2v(pd[(va >> 21) & 0x1FF] & PT_PA_MASK);
 }
 
 /* point the code+stack window at a given pair of physical frame runs */
@@ -1151,9 +1295,9 @@ static void map_region(uint8_t *code, uint8_t *stk) {
     int ci = (int)((USER_CODE_VA >> 12) & 0x1FF);
     int si = (int)((USER_STK_TOP  >> 12) & 0x1FF);
     for (int i = 0; i < USER_CODE_PAGES; i++)
-        g_pt[ci + i]     = (mm_v2p((uint64_t)(code + (uint64_t)i * 4096)) & ~0xFFFULL) | PTE_P | PTE_RW | PTE_US;
+        g_pt[ci + i]     = (mm_v2p((uint64_t)(code + (uint64_t)i * 4096)) & PT_PA_MASK) | PTE_P | PTE_RW | PTE_US;
     for (int i = 0; i < USER_STK_PAGES; i++)
-        g_pt[si - 1 - i] = (mm_v2p((uint64_t)(stk  + (uint64_t)i * 4096)) & ~0xFFFULL) | PTE_P | PTE_RW | PTE_US;
+        g_pt[si - 1 - i] = (mm_v2p((uint64_t)(stk  + (uint64_t)i * 4096)) & PT_PA_MASK) | PTE_P | PTE_RW | PTE_US;
     flush_tlb();
 }
 
@@ -1218,6 +1362,127 @@ static int linux_fd_alloc(int kind, int flags, const char *path, uint16_t dir_cl
     return -24;
 }
 
+/* ============================ /mnt + /usb VFS routing ======================
+ * Absolute paths under /mnt (internal SATA data partition) and /usb (USB stick)
+ * are served by the persistent FAT32 volumes (kernel/fs/datavol64.c) so that
+ * files created in the `sh` shell survive reboots, exactly like a real OS mount.
+ * Everything else stays on the RAM-disk FAT (kernel/fs/fat64.c).  The /mnt and
+ * /usb directories also exist as empty RAM placeholders so they show up in
+ * `ls /`; the routing here shadows them with the real volume contents. */
+
+/* If `full` is at or under mount point `mp`, return 1 and point *rel at the
+ * path relative to the mount root ("/" for the mount root itself). */
+static int under_mount(const char *full, const char *mp, const char **rel) {
+    int i = 0; while (mp[i]) { if (full[i] != mp[i]) return 0; i++; }
+    if (full[i] == 0)   { *rel = "/"; return 1; }
+    if (full[i] == '/') { *rel = full + i; return 1; }
+    return 0;
+}
+/* Map an absolute path to its volume: 1=/mnt, 2=/usb, 0=RAM fat.  *vol is the
+ * mounted fatvol, or 0 if that mount is not currently available. */
+static int fs_mount_of(const char *full, const char **rel, fatvol_t **vol) {
+    if (under_mount(full, "/mnt", rel)) { *vol = dv_vol(); return 1; }
+    if (under_mount(full, "/usb", rel)) { *vol = uv_vol(); return 2; }
+    *rel = full; *vol = 0; return 0;
+}
+static int is_mount_root(const char *rel) { return rel[0] == '/' && rel[1] == 0; }
+
+/* resolve metadata for a path (attr bit 0x10 = directory). 0 ok, <0 not found. */
+static int vfs_resolve(const char *full, uint8_t *attr, uint32_t *cluster, uint32_t *size) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) {
+        if (!v) return -1;
+        if (is_mount_root(rel)) { if (attr)*attr=0x10; if (cluster)*cluster=v->root; if (size)*size=0; return 0; }
+        uint32_t c, s; int isd;
+        if (!fv_resolve(v, rel, &c, &s, &isd)) return -1;
+        if (attr) *attr = isd ? 0x10 : 0x20;
+        if (cluster) *cluster = c;
+        if (size) *size = s;
+        return 0;
+    }
+    uint8_t a; uint16_t c16; uint32_t s;
+    if (fat_resolve(full, &a, &c16, &s) < 0) return -1;
+    if (attr) *attr = a;
+    if (cluster) *cluster = c16;
+    if (size) *size = s;
+    return 0;
+}
+static int vfs_pread(const char *full, void *buf, uint32_t len, uint32_t off) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) { if (!v || is_mount_root(rel)) return -1; return fv_pread(v, rel, buf, len, off); }
+    return fat_pread(full, buf, len, off);
+}
+static int vfs_pwrite(const char *full, const void *buf, uint32_t len, uint32_t off) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) { if (!v || is_mount_root(rel)) return -1; return fv_pwrite(v, rel, buf, len, off); }
+    return fat_pwrite(full, buf, len, off);
+}
+static int vfs_create(const char *full) {              /* create empty / truncate to 0 */
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) { if (!v || is_mount_root(rel)) return -1; return fv_write(v, rel, "", 0); }
+    return fat_write(full, "", 0);
+}
+static int vfs_truncate(const char *full, uint32_t size) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) { if (!v || is_mount_root(rel)) return -1; return fv_truncate(v, rel, size); }
+    return fat_truncate(full, size);
+}
+static int vfs_mkdir(const char *full) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) { if (!v) return -1; if (is_mount_root(rel)) return -17; return fv_mkdir(v, rel); }
+    return fat_mkdir(full);
+}
+static int vfs_unlink(const char *full) {          /* -> 0 or Linux errno */
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) {
+        if (!v || is_mount_root(rel)) return -2;
+        int r = fv_unlink(v, rel);
+        return r == 0 ? 0 : r == -21 ? -21 : -2;   /* EISDIR | ENOENT */
+    }
+    int r = fat_unlink(full);
+    return r == 0 ? 0 : r == -2 ? -21 : -2;         /* fat: -2 = is-a-dir */
+}
+static int vfs_rmdir(const char *full) {           /* -> 0 or Linux errno */
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) {
+        if (!v || is_mount_root(rel)) return -2;
+        int r = fv_rmdir(v, rel);
+        return r == 0 ? 0 : r == -20 ? -20 : r == -39 ? -39 : -2;
+    }
+    int r = fat_rmdir(full);
+    return r == 0 ? 0 : r == -2 ? -20 : r == -3 ? -39 : -2;  /* fat: -2 notdir, -3 notempty */
+}
+/* list the idx-th entry of directory `dirfull`; 0 ok, <0 at end. */
+static int vfs_list(const char *dirfull, int idx, char *name, uint8_t *attr, uint32_t *cluster, uint32_t *size) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(dirfull, &rel, &v)) {
+        if (!v) return -1;
+        uint32_t dcl;
+        if (is_mount_root(rel)) dcl = v->root;
+        else { uint32_t sz; int isd; if (!fv_resolve(v, rel, &dcl, &sz, &isd) || !isd) return -1; if (!dcl) dcl = v->root; }
+        return fv_readdir_m(v, dcl, idx, name, attr, cluster, size);
+    }
+    uint32_t dcl = 0;
+    if (!(dirfull[0]=='/' && dirfull[1]==0)) {
+        uint8_t a; uint16_t c16; uint32_t sz;
+        if (fat_resolve(dirfull, &a, &c16, &sz) < 0 || !(a & 0x10)) return -1;
+        dcl = c16;
+    }
+    uint16_t c16; int r = fat_list(dcl, idx, name, attr, &c16, size);
+    if (cluster) *cluster = c16;
+    return r;
+}
+
+/* chdir routed through the VFS so `cd /mnt`, `cd /usb`, and their subdirs work. */
+static int linux_chdir(const char *path) {
+    char full[256]; fs_resolve(path, full);
+    if (full[0] == '/' && full[1] == 0) { fs_setcwd("/"); return 0; }
+    uint8_t attr; uint32_t cl, sz;
+    if (vfs_resolve(full, &attr, &cl, &sz) < 0 || !(attr & 0x10)) return -20;
+    fs_setcwd(full);
+    return 0;
+}
+
 static int linux_openat(int dirfd, const char *path, int flags) {
     char full[256]; int resolved = linux_resolve_at(dirfd, path, full);
     if (resolved < 0) return resolved;
@@ -1227,24 +1492,23 @@ static int linux_openat(int dirfd, const char *path, int flags) {
     }
     if (name_eq(full, "/dev/null")) return linux_fd_alloc(LINUX_FD_NULL, flags, full, 0, 0);
     if (name_eq(full, "/dev/tty"))  return linux_fd_alloc(LINUX_FD_TTY, flags, full, 0, 0);
-    uint8_t attr; uint16_t cluster; uint32_t size;
-    int exists = fat_resolve(full, &attr, &cluster, &size) == 0;
+    uint8_t attr; uint32_t cluster; uint32_t size;
+    int exists = vfs_resolve(full, &attr, &cluster, &size) == 0;
     if (exists && (attr & 0x10)) {
         if (flags & LINUX_O_ACCMODE) return -21;
-        return linux_fd_alloc(LINUX_FD_DIR, flags, full, cluster, 0);
+        return linux_fd_alloc(LINUX_FD_DIR, flags, full, (uint16_t)cluster, 0);
     }
     if (flags & LINUX_O_DIRECTORY) return -20;
     if (!exists) {
         if (!(flags & LINUX_O_CREAT)) return -2;
-        if (fat_write(full, "", 0) < 0) return -28;
+        if (vfs_create(full) < 0) return -28;
         size = 0;
     } else if ((flags & LINUX_O_TRUNC) && (flags & LINUX_O_ACCMODE)) {
-        if (fat_write(full, "", 0) < 0) return -5;
+        if (vfs_create(full) < 0) return -5;
         size = 0;
     }
     return linux_fd_alloc(LINUX_FD_FILE, flags, full, 0, (flags & LINUX_O_APPEND) ? size : 0);
 }
-
 /* ---- pipes (Phase D): a kernel ring buffer with reference-counted ends ------
  * A pipe is shared between its read and write fds (which may live in different
  * processes after fork), so pipes are a small global pool; each fd holds the
@@ -1467,15 +1731,11 @@ static void tty_complete(char *line, int *plen, int *ppos, int max) {
     if (slash < 0) { dirq[0] = '.'; dirq[1] = 0; partial = word; }
     else { int j = 0; while (j <= slash && j < 254) { dirq[j] = word[j]; j++; } dirq[j] = 0; partial = word + slash + 1; }
     char absdir[256]; fs_resolve(dirq, absdir);
-    uint8_t at; uint16_t cl; uint32_t sz; uint32_t dcl = 0;
-    if (!(absdir[0] == '/' && absdir[1] == 0)) {
-        if (fat_resolve(absdir, &at, &cl, &sz) < 0 || !(at & 0x10)) return;
-        dcl = cl;
-    }
+    uint8_t at; uint32_t cl; uint32_t sz;
     int pl = 0; while (partial[pl]) pl++;
     char lcp[256]; int lcp_len = -1, matches = 0, only_dir = 0;
     char nm[256];
-    for (int i = 0; fat_list(dcl, i, nm, &at, &cl, &sz) == 0; i++) {
+    for (int i = 0; vfs_list(absdir, i, nm, &at, &cl, &sz) == 0; i++) {
         if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
         int m = 1; for (int k = 0; k < pl; k++) if (nm[k] != partial[k]) { m = 0; break; }
         if (!m) continue;
@@ -1503,7 +1763,8 @@ static int tty_read_line(char *out, int max) {
     int hidx = g_tty_histn;                                 /* == histn: a fresh (unsaved) line */
     for (;;) {
         int key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
-        if (key < 0) { wm_pump(); continue; }
+        if (key < 0) { wm_pump(); power_poll(); idle_wait(); continue; }
+        if (wm_hotkey(key)) { wm_pump(); continue; }        /* F1/F2/log-scroll while shell owns stdin */
         if (key == 3 && (g_tty.lflag & TTY_ISIG)) {         /* Ctrl-C: discard line, reprompt */
             signal_pgrp(g_tty.fg_pgrp, 2);
             tty_emit("\n", 1); out[0] = '\n'; return 1;
@@ -1560,7 +1821,8 @@ static int tty_stdin_read(void *buf, uint32_t len) {
         char *out = (char *)buf; uint32_t count = 0;
         while (count < len) {
             int key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
-            if (key < 0) { if (count) break; wm_pump(); continue; }   /* block for the first byte */
+            if (key < 0) { if (count) break; wm_pump(); power_poll(); idle_wait(); continue; }   /* block for the first byte */
+            if (wm_hotkey(key)) { wm_pump(); continue; }   /* F1/F2/log-scroll even in raw mode */
             if (key == 3 && (g_tty.lflag & TTY_ISIG)) { signal_pgrp(g_tty.fg_pgrp, 2); break; }
             if (key > KEY_RIGHT) continue;         /* drop F-keys; keep arrows (0x80-0x83) */
             if (key == '\r') key = '\n';
@@ -1595,7 +1857,7 @@ static int linux_read(int fd, void *buf, uint32_t len) {
         if (k == LINUX_FD_SOCKET) return tcp_recv(g_linux_fds[fd].sock, buf, (int)len);
         if (k != LINUX_FD_FILE) return -21;
         if ((g_linux_fds[fd].flags & LINUX_O_ACCMODE) == 1) return -9;
-        int result = fat_pread(g_linux_fds[fd].path, buf, len, g_linux_fds[fd].offset);
+        int result = vfs_pread(g_linux_fds[fd].path, buf, len, g_linux_fds[fd].offset);
         if (result > 0) g_linux_fds[fd].offset += (uint32_t)result;
         return result < 0 ? -5 : result;
     }
@@ -1615,11 +1877,11 @@ static int linux_write(int fd, const void *buf, uint32_t len) {
         if (k != LINUX_FD_FILE) return -21;
         if (!(g_linux_fds[fd].flags & LINUX_O_ACCMODE)) return -9;
         if (g_linux_fds[fd].flags & LINUX_O_APPEND) {
-            uint8_t attr; uint16_t cluster; uint32_t size;
-            if (fat_resolve(g_linux_fds[fd].path, &attr, &cluster, &size) < 0) return -5;
+            uint8_t attr; uint32_t cluster; uint32_t size;
+            if (vfs_resolve(g_linux_fds[fd].path, &attr, &cluster, &size) < 0) return -5;
             g_linux_fds[fd].offset = size;
         }
-        int result = fat_pwrite(g_linux_fds[fd].path, buf, len, g_linux_fds[fd].offset);
+        int result = vfs_pwrite(g_linux_fds[fd].path, buf, len, g_linux_fds[fd].offset);
         if (result > 0) g_linux_fds[fd].offset += (uint32_t)result;
         return result < 0 ? -5 : result;
     }
@@ -1635,8 +1897,8 @@ static int64_t linux_lseek(int fd, int64_t offset, int whence) {
     if (whence == 0) base = 0;
     else if (whence == 1) base = g_linux_fds[fd].offset;
     else if (whence == 2) {
-        uint8_t attr; uint16_t cluster; uint32_t size;
-        if (fat_resolve(g_linux_fds[fd].path, &attr, &cluster, &size) < 0) return -5;
+        uint8_t attr; uint32_t cluster; uint32_t size;
+        if (vfs_resolve(g_linux_fds[fd].path, &attr, &cluster, &size) < 0) return -5;
         base = size;
     } else return -22;
     if (offset < -base || base + offset > 0xFFFFFFFFLL) return -22;
@@ -1664,9 +1926,9 @@ static void linux_fill_stat(struct linux_stat *st, int kind, uint16_t cluster, u
 
 static int linux_stat_path(const char *path, struct linux_stat *st) {
     if (name_eq(path, "/dev/null")) { linux_fill_stat(st, LINUX_FD_NULL, 0, 0); return 0; }
-    uint8_t attr; uint16_t cluster; uint32_t size;
-    if (fat_resolve(path, &attr, &cluster, &size) < 0) return -2;
-    linux_fill_stat(st, (attr & 0x10) ? LINUX_FD_DIR : LINUX_FD_FILE, cluster, size);
+    uint8_t attr; uint32_t cluster; uint32_t size;
+    if (vfs_resolve(path, &attr, &cluster, &size) < 0) return -2;
+    linux_fill_stat(st, (attr & 0x10) ? LINUX_FD_DIR : LINUX_FD_FILE, (uint16_t)cluster, size);
     return 0;
 }
 
@@ -1682,7 +1944,7 @@ static int linux_ftruncate(int fd, uint64_t size) {
     if (g_linux_fds[fd].kind != LINUX_FD_FILE) return -22;
     if (!(g_linux_fds[fd].flags & LINUX_O_ACCMODE)) return -22;
     if (size > 0xFFFFFFFFULL) return -27;
-    return fat_truncate(g_linux_fds[fd].path, (uint32_t)size) < 0 ? -5 : 0;
+    return vfs_truncate(g_linux_fds[fd].path, (uint32_t)size) < 0 ? -5 : 0;
 }
 
 static int linux_newfstatat(int dirfd, const char *path, void *statbuf, int flags) {
@@ -1697,8 +1959,8 @@ static int linux_getdents64(int fd, void *buf, uint32_t len) {
     if (g_linux_fds[fd].kind != LINUX_FD_DIR) return -20;
     uint8_t *out = (uint8_t *)buf; uint32_t used = 0;
     for (;;) {
-        char name[256]; uint8_t attr; uint16_t cluster; uint32_t size;
-        if (fat_list(g_linux_fds[fd].dir_cluster, (int)g_linux_fds[fd].offset,
+        char name[256]; uint8_t attr; uint32_t cluster; uint32_t size;
+        if (vfs_list(g_linux_fds[fd].path, (int)g_linux_fds[fd].offset,
                      name, &attr, &cluster, &size) < 0) break;
         (void)size;
         uint32_t name_len = 0; while (name[name_len]) name_len++;
@@ -1718,42 +1980,43 @@ static int linux_getdents64(int fd, void *buf, uint32_t len) {
 static int linux_mkdirat(int dirfd, const char *path) {
     char full[256]; int result = linux_resolve_at(dirfd, path, full);
     if (result < 0) return result;
-    return fat_mkdir(full) < 0 ? -17 : 0;
+    return vfs_mkdir(full) < 0 ? -17 : 0;
 }
 
-/* rmdir(84): remove an empty directory.  fat_rmdir codes -> Linux errnos. */
+/* rmdir(84): remove an empty directory. */
 static int linux_rmdir(const char *path) {
     char full[256]; int result = linux_resolve_at(-100, path, full);
     if (result < 0) return result;
-    result = fat_rmdir(full);
-    return result == 0 ? 0 : result == -2 ? -20 : result == -3 ? -39 : -2;
+    return vfs_rmdir(full);                          /* already a Linux errno */
 }
 
 /* rename(82): FAT has no atomic rename, so copy-then-unlink for files; refuse
- * directory renames with -EXDEV so userland can fall back to recursive copy. */
+ * directory renames with -EXDEV so userland can fall back to recursive copy.
+ * Works across mounts too (e.g. /usb/a -> /mnt/b). */
 static int linux_rename(const char *oldp, const char *newp) {
     char fo[256], fn[256];
     int a = linux_resolve_at(-100, oldp, fo); if (a < 0) return a;
     int b = linux_resolve_at(-100, newp, fn); if (b < 0) return b;
-    uint8_t attr; uint16_t cluster; uint32_t size;
-    if (fat_resolve(fo, &attr, &cluster, &size) < 0) return -2;   /* ENOENT */
+    uint8_t attr; uint32_t cluster; uint32_t size;
+    if (vfs_resolve(fo, &attr, &cluster, &size) < 0) return -2;   /* ENOENT */
     if (attr & 0x10) return -18;                                  /* EXDEV: dir rename n/a */
     uint8_t *buf = (uint8_t *)kmalloc(size ? size : 1);
     if (!buf) return -12;
-    int r = size ? fat_read(cluster, size, buf, size) : 0;
-    int w = (r == (int)size) ? fat_write(fn, buf, size) : -1;
+    int r = size ? vfs_pread(fo, buf, size, 0) : 0;
+    int w = -1;
+    if (r == (int)size && vfs_create(fn) >= 0) w = size ? vfs_pwrite(fn, buf, size, 0) : 0;
     kfree(buf);
     if (w < 0) return -5;
-    fat_unlink(fo);
+    vfs_unlink(fo);
     return 0;
 }
 
 static int linux_unlinkat(int dirfd, const char *path, int flags) {
-    if (flags) return -22;
     char full[256]; int result = linux_resolve_at(dirfd, path, full);
     if (result < 0) return result;
-    result = fat_unlink(full);
-    return result == -2 ? -21 : result < 0 ? -2 : 0;
+    if (flags & 0x200) return vfs_rmdir(full);      /* AT_REMOVEDIR */
+    if (flags) return -22;
+    return vfs_unlink(full);                          /* already a Linux errno */
 }
 
 static uint64_t linux_getcwd(char *buf, uint64_t size) {
@@ -1886,7 +2149,7 @@ static uint64_t *linux_vm_pt(uint64_t va, int create) {
         } else if (table[index] & PTE_PS) {
             return 0;
         }
-        table = (uint64_t *)(table[index] & ~0xFFFULL);
+        table = (uint64_t *)(table[index] & PT_PA_MASK);
     }
     return table;
 }
@@ -1898,7 +2161,7 @@ static uint64_t *linux_vm_pte(uint64_t va, int create) {
 
 static int linux_map_page(uint64_t va, uint64_t prot) {
     uint64_t *pte = linux_vm_pte(va, 1);
-    if (!pte || (*pte & ~0xFFFULL)) return -1;
+    if (!pte || (*pte & PT_PA_MASK)) return -1;
     void *frame = page_alloc(1);
     if (!frame) return -1;
     *pte = (uint64_t)frame | PTE_US | (prot ? PTE_P : 0) | ((prot & 2) ? PTE_RW : 0);
@@ -1940,10 +2203,10 @@ int arch_bo_zerocopy_test(void) {
         pd[(va >> 21) & 0x1FF]   = (uint64_t)pt   | PTE_P | PTE_RW | PTE_US;
         pt[(va >> 12) & 0x1FF]   = phys | PTE_P | PTE_RW | PTE_US;
         uint64_t *t = pml4;
-        t = (uint64_t *)(t[(va >> 39) & 0x1FF] & ~0xFFFULL);
-        t = (uint64_t *)(t[(va >> 30) & 0x1FF] & ~0xFFFULL);
-        t = (uint64_t *)(t[(va >> 21) & 0x1FF] & ~0xFFFULL);
-        r = ((t[(va >> 12) & 0x1FF] & ~0xFFFULL) == phys) ? 0 : -1;
+        t = (uint64_t *)(t[(va >> 39) & 0x1FF] & PT_PA_MASK);
+        t = (uint64_t *)(t[(va >> 30) & 0x1FF] & PT_PA_MASK);
+        t = (uint64_t *)(t[(va >> 21) & 0x1FF] & PT_PA_MASK);
+        r = ((t[(va >> 12) & 0x1FF] & PT_PA_MASK) == phys) ? 0 : -1;
     }
     if (pt) page_free(pt, 1);
     if (pd) page_free(pd, 1);
@@ -2090,7 +2353,7 @@ static int linux_mprotect(uint64_t addr, uint64_t len, uint64_t prot) {
     if (!linux_vm_range_owned(addr, len)) return -12;
     for (uint64_t va = addr; va < addr + len; va += 4096) {
         uint64_t *pte = linux_vm_pte(va, 0);
-        if (!pte || !(*pte & ~0xFFFULL)) return -12;
+        if (!pte || !(*pte & PT_PA_MASK)) return -12;
         *pte = (*pte & ~(PTE_P | PTE_RW)) | (prot ? PTE_P : 0) |
                ((prot & 2) ? PTE_RW : 0) | PTE_US;
     }
@@ -2121,7 +2384,7 @@ static uint64_t *linux_address_space(const uint64_t code_pte[LINUX_LOAD_PAGES],
     int l4 = (int)((LINUX_LOAD_VA >> 39) & 0x1FF);
     int l3 = (int)((LINUX_LOAD_VA >> 30) & 0x1FF);
     int l2 = (int)((LINUX_LOAD_VA >> 21) & 0x1FF);
-    uint64_t *old_pdpt = (uint64_t *)(kpml4[l4] & ~0xFFFULL);
+    uint64_t *old_pdpt = (uint64_t *)(kpml4[l4] & PT_PA_MASK);
     if (!(kpml4[l4] & PTE_P) || (kpml4[l4] & PTE_PS)) return 0;
     uint64_t *pdpt = copy_page_table(old_pdpt);
     if (!pdpt || !(old_pdpt[l3] & PTE_P)) return 0;
@@ -2135,7 +2398,7 @@ static uint64_t *linux_address_space(const uint64_t code_pte[LINUX_LOAD_PAGES],
         uint64_t gfl   = (old_pdpt[l3] & 0xFFFULL) | PTE_PS;
         for (int i = 0; i < 512; i++) pd[i] = (gbase + (uint64_t)i * 0x200000ULL) | gfl;
     } else {
-        pd = copy_page_table((uint64_t *)(old_pdpt[l3] & ~0xFFFULL));
+        pd = copy_page_table((uint64_t *)(old_pdpt[l3] & PT_PA_MASK));
         if (!pd) return 0;
     }
     uint64_t *code_pt = copy_page_table(0);
@@ -2388,7 +2651,7 @@ void arch_user_init(void) {
     g_ccode = (uint8_t *)page_alloc(USER_CODE_PAGES); g_cstk = (uint8_t *)page_alloc(USER_STK_PAGES);
     if (!g_ucode || !g_ustk || !g_ccode || !g_cstk) { kputs("[user] region alloc failed\n"); g_ucode = 0; return; }
 
-    uint64_t pml4 = read_cr3() & ~0xFFFULL;
+    uint64_t pml4 = read_cr3() & PT_PA_MASK;
     g_kernel_cr3 = pml4;
     uint64_t cr0  = wp_disable();
     for (int i = 0; i < USER_CODE_PAGES; i++)
@@ -2419,7 +2682,11 @@ void arch_user_init(void) {
       kputs(" heap MB="); kput_u32dec((uint32_t)(heap_total() / (1024 * 1024))); kputc('\n'); }
 
     blk_init();
-    if (fat_mount() == 0) kputs("[fs] fat16 ram disk mounted\n");
+    if (fat_mount() == 0) {
+        kputs("[fs] fat16 ram disk mounted\n");
+        fat_mkdir("/mnt");           /* mount-point placeholders: I/O under these */
+        fat_mkdir("/usb");           /* is routed to the persistent FAT32 volumes */
+    }
     else                  kputs("[fs] fat16 mount failed\n");
 
     void *pf_a = page_alloc(1); page_free(pf_a, 1);
@@ -2701,14 +2968,14 @@ static uint64_t clone_pt(uint64_t src_phys, int level) {
             if (e & PTE_US) {
                 uint8_t *f = (uint8_t *)page_alloc(1);
                 if (!f) { dst[i] = 0; continue; }
-                const uint8_t *s = (const uint8_t *)(e & ~0xFFFULL);
+                const uint8_t *s = (const uint8_t *)(e & PT_PA_MASK);
                 for (int b = 0; b < 4096; b++) f[b] = s[b];
                 dst[i] = (uint64_t)f | (e & 0xFFFULL);
             } else dst[i] = e;                          /* share kernel page      */
         } else if (e & PTE_PS) {
             dst[i] = e;                                 /* share large kernel page */
         } else {
-            uint64_t sub = clone_pt(e & ~0xFFFULL, level - 1);
+            uint64_t sub = clone_pt(e & PT_PA_MASK, level - 1);
             if (!sub) { dst[i] = 0; continue; }
             dst[i] = sub | (e & 0xFFFULL);
         }
@@ -2727,7 +2994,7 @@ static uint64_t *fork_clone_as(uint64_t parent_pml4) {
         int slot = (int)((user_va[k] >> 39) & 0x1FF);
         uint64_t e = ((uint64_t *)parent_pml4)[slot];
         if (!(e & PTE_P)) continue;
-        uint64_t sub = clone_pt(e & ~0xFFFULL, 3);       /* clone the PDPT subtree */
+        uint64_t sub = clone_pt(e & PT_PA_MASK, 3);       /* clone the PDPT subtree */
         if (!sub) return 0;
         dst[slot] = sub | (e & 0xFFFULL);
     }
@@ -2742,8 +3009,8 @@ static void free_pt(uint64_t phys, int level) {
     for (int i = 0; i < 512; i++) {
         uint64_t e = t[i];
         if (!(e & PTE_P)) continue;
-        if (level == 1) { if (e & PTE_US) page_free((void *)(e & ~0xFFFULL), 1); }
-        else if (!(e & PTE_PS)) free_pt(e & ~0xFFFULL, level - 1);
+        if (level == 1) { if (e & PTE_US) page_free((void *)(e & PT_PA_MASK), 1); }
+        else if (!(e & PTE_PS)) free_pt(e & PT_PA_MASK, level - 1);
     }
     page_free((void *)phys, 1);
 }
@@ -2755,8 +3022,8 @@ static void free_pt_pages(uint64_t phys, int level) {
     for (int i = 0; i < 512; i++) {
         uint64_t e = t[i];
         if (!(e & PTE_P)) continue;
-        if (level == 1) { if (e & PTE_US) page_free((void *)(e & ~0xFFFULL), 1); }
-        else if (!(e & PTE_PS)) free_pt_pages(e & ~0xFFFULL, level - 1);
+        if (level == 1) { if (e & PTE_US) page_free((void *)(e & PT_PA_MASK), 1); }
+        else if (!(e & PTE_PS)) free_pt_pages(e & PT_PA_MASK, level - 1);
     }
 }
 
@@ -2768,10 +3035,10 @@ static void free_user_pages(uint64_t *pml4) {
     const uint64_t priv_va[3] = { LINUX_STK_TOP, LINUX_BRK_BASE, LINUX_MMAP_BASE };
     for (int k = 0; k < 3; k++) {
         int slot = (int)((priv_va[k] >> 39) & 0x1FF);
-        if (pml4[slot] & PTE_P) { free_pt(pml4[slot] & ~0xFFFULL, 3); pml4[slot] = 0; }
+        if (pml4[slot] & PTE_P) { free_pt(pml4[slot] & PT_PA_MASK, 3); pml4[slot] = 0; }
     }
     int lslot = (int)((LINUX_LOAD_VA >> 39) & 0x1FF);
-    if (pml4[lslot] & PTE_P) free_pt_pages(pml4[lslot] & ~0xFFFULL, 3);
+    if (pml4[lslot] & PTE_P) free_pt_pages(pml4[lslot] & PT_PA_MASK, 3);
     page_free(pml4, 1);
 }
 
@@ -2785,8 +3052,9 @@ static uint64_t do_linux_fork(void) {
     struct proc *ch = proc_alloc();
     if (!ch) return (uint64_t)-11;                       /* -EAGAIN */
     uint64_t *cas  = fork_clone_as((uint64_t)par->vm.pml4);
+    if (!cas) { proc_free(ch); return (uint64_t)-12; }
     uint8_t  *ckstk = (uint8_t *)page_alloc(4);
-    if (!cas || !ckstk) { proc_free(ch); return (uint64_t)-12; }
+    if (!ckstk) { free_user_pages(cas); proc_free(ch); return (uint64_t)-12; }
     ch->ppid = par->pid;
     ch->abi  = USER_ABI_LINUX;
     ch->on_sched = 1;
@@ -2794,13 +3062,6 @@ static uint64_t do_linux_fork(void) {
     ch->vm.pml4 = cas;
     ch->vm.brk  = par->vm.brk;
     ch->vm.mmap_next = par->vm.mmap_next;
-    for (int i = 0; i < PROC_FD_MAX; i++) {                           /* clone fd table */
-        ch->fds[i] = par->fds[i];
-        if (par->fds[i].used) {
-            if (par->fds[i].kind == LINUX_FD_PIPE_R) g_pipes[par->fds[i].pipe].readers++;
-            else if (par->fds[i].kind == LINUX_FD_PIPE_W) g_pipes[par->fds[i].pipe].writers++;
-        }
-    }
     ch->sigmask = par->sigmask;                                      /* inherit signal disposition */
     ch->sigrestorer = par->sigrestorer;
     for (int i = 0; i <= 64; i++) ch->sighandler[i] = par->sighandler[i];
@@ -2809,8 +3070,22 @@ static uint64_t do_linux_fork(void) {
     ch->kstack_top = ckstk + 16384;
     ch->state = PROC_RUNNING;
     const uint64_t *callee = (const uint64_t *)syscall_user_callee();
-    usched_spawn_forked(syscall_user_rip(), syscall_user_rsp(), ckstk, 16384,
-                        (uint64_t)cas, ch, callee);      /* child frame: rax=0 */
+    /* Secure the scheduler slot BEFORE taking any references — a fork that is
+     * published (PROC_RUNNING) without a task would make the parent's wait4 block
+     * forever (MAXTASK is finite). */
+    if (usched_spawn_forked(syscall_user_rip(), syscall_user_rsp(), ckstk, 16384,
+                            (uint64_t)cas, ch, callee) < 0) {
+        free_user_pages(cas); page_free(ckstk, 4);
+        ch->vm.pml4 = 0; proc_free(ch);
+        return (uint64_t)-11;                            /* -EAGAIN */
+    }
+    for (int i = 0; i < PROC_FD_MAX; i++) {                           /* clone fd table */
+        ch->fds[i] = par->fds[i];
+        if (par->fds[i].used) {
+            if (par->fds[i].kind == LINUX_FD_PIPE_R) g_pipes[par->fds[i].pipe].readers++;
+            else if (par->fds[i].kind == LINUX_FD_PIPE_W) g_pipes[par->fds[i].pipe].writers++;
+        }
+    }
     return (uint64_t)ch->pid;                            /* parent's fork() returns child pid */
 }
 
@@ -2832,12 +3107,17 @@ static int linux_wait4(int wpid, int *wstatus, int options) {
         if (!have) { __asm__ volatile("sti"); return -10; }          /* -ECHILD */
         if (zombie) {
             int pid = zombie->pid, st = (zombie->exit_status & 0xFF) << 8;
+            /* Store the status into the caller's user stack FIRST — while its
+             * address space is fully intact and interrupts are still masked.
+             * Doing it after the reap + sti raced with the scheduler reusing a
+             * just-freed page (real-HW #PF writing to the parent's own stack).
+             * Guard the pointer so a bogus wstatus can't fault the kernel. */
+            if (wstatus && user_va_writable((uint64_t)wstatus)) *wstatus = st;
             if (zombie->kstack_top) page_free((void *)(zombie->kstack_top - 16384), 4);
             free_user_pages(zombie->vm.pml4); /* reclaim frames (interrupts still off) */
             zombie->vm.pml4 = 0;
             proc_free(zombie);                 /* reap the zombie slot */
             __asm__ volatile("sti");
-            if (wstatus) *wstatus = st;
             return pid;
         }
         if (options & 1) { __asm__ volatile("sti"); return 0; }      /* WNOHANG */
@@ -2864,11 +3144,11 @@ static uint64_t do_demo_fork(void) {
     uint64_t pml4 = (uint64_t)par->vm.pml4;
     uint64_t *pt;
     pt = walk_pt(pml4, UDEMO_CODE_VA);
-    const uint8_t *pcode = (const uint8_t *)(pt[(UDEMO_CODE_VA >> 12) & 0x1FF] & ~0xFFFULL);
+    const uint8_t *pcode = (const uint8_t *)(pt[(UDEMO_CODE_VA >> 12) & 0x1FF] & PT_PA_MASK);
     pt = walk_pt(pml4, UDEMO_DATA_VA);
-    const uint8_t *pdata = (const uint8_t *)(pt[(UDEMO_DATA_VA >> 12) & 0x1FF] & ~0xFFFULL);
+    const uint8_t *pdata = (const uint8_t *)(pt[(UDEMO_DATA_VA >> 12) & 0x1FF] & PT_PA_MASK);
     pt = walk_pt(pml4, UDEMO_STK_VA);
-    const uint8_t *pstk = (const uint8_t *)(pt[(UDEMO_STK_VA >> 12) & 0x1FF] & ~0xFFFULL);
+    const uint8_t *pstk = (const uint8_t *)(pt[(UDEMO_STK_VA >> 12) & 0x1FF] & PT_PA_MASK);
     for (int i = 0; i < 4096; i++) { ccode[i] = pcode[i]; cdata[i] = pdata[i]; cstk[i] = pstk[i]; }
     uint64_t cr0 = wp_disable();
     map_user_page((uint64_t)cas, UDEMO_CODE_VA, (uint64_t)ccode, PTE_US);
@@ -3021,14 +3301,14 @@ static int run_linux_path(const char *path, uint8_t *stk, uint8_t *kstack_top,
     fs_resolve(path, full);
 
     uint8_t attr;
-    uint16_t cluster;
+    uint32_t cluster;
     uint32_t size;
-    if (fat_resolve(full, &attr, &cluster, &size) < 0 || (attr & 0x10) || !size)
+    if (vfs_resolve(full, &attr, &cluster, &size) < 0 || (attr & 0x10) || !size)
         return -1;
 
     uint8_t *image = (uint8_t *)kmalloc(size);
     if (!image) return -5;
-    int read = fat_read(cluster, size, image, size);
+    int read = vfs_pread(full, image, size, 0);
     int result = read == (int)size
         ? run_linux_elf_frames(image, size, stk, kstack_top, args, on_sched) : -1;
     kfree(image);
@@ -3063,11 +3343,11 @@ static int do_execve_inplace(const char *path, const struct linux_exec_args *arg
     char full[256];
     while (path[0] == '.' && path[1] == '/') path += 2;
     fs_resolve(path, full);
-    uint8_t attr; uint16_t cluster; uint32_t size;
-    if (fat_resolve(full, &attr, &cluster, &size) < 0 || (attr & 0x10) || !size) return -2;
+    uint8_t attr; uint32_t cluster; uint32_t size;
+    if (vfs_resolve(full, &attr, &cluster, &size) < 0 || (attr & 0x10) || !size) return -2;
     uint8_t *image = (uint8_t *)kmalloc(size);
     if (!image) return -12;
-    int ok = fat_read(cluster, size, image, size) == (int)size;
+    int ok = vfs_pread(full, image, size, 0) == (int)size;
     uint8_t *stk = ok ? (uint8_t *)page_alloc(USER_STK_PAGES) : 0;
     struct linux_image im;
     int r = (ok && stk) ? linux_load_image(image, size, stk, args, &im) : -12;
