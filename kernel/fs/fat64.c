@@ -916,3 +916,7 @@ int fs_chdir(const char *path) {
 }
 
 void fs_getcwd(char *out) { s_copy(out, g_cwd); }
+
+/* set the cwd to an already-absolute, normalized path (validated by the caller);
+ * used by the /mnt + /usb VFS routing in kernel/arch64.c. */
+void fs_setcwd(const char *abs) { if (abs && abs[0] == '/') s_copy(g_cwd, abs); }

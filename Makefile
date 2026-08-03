@@ -93,6 +93,7 @@ EFI_OBJS := $(BUILD)/efi_main.o $(BUILD)/entry64.o \
             $(BUILD)/time64.o $(BUILD)/kbd64.o $(BUILD)/demo64.o $(BUILD)/pong64.o \
             $(BUILD)/smp64.o $(BUILD)/vmbus64.o \
             $(BUILD)/disp64.o $(BUILD)/wm64.o $(BUILD)/term64.o $(BUILD)/login64.o \
+            $(BUILD)/acpi64.o $(BUILD)/ahci64.o $(BUILD)/esp64.o $(BUILD)/install64.o $(BUILD)/datavol64.o $(BUILD)/usb64.o \
             $(BUILD)/tinygl64.o $(BUILD)/tgl3d64.o $(BUILD)/tglcomp64.o $(BUILD)/tglbo64.o \
             $(BUILD)/arch64.o $(BUILD)/trap64.o $(BUILD)/fat64.o $(BUILD)/sched64.o $(BUILD)/sched_test64.o $(BUILD)/vblk64.o $(BUILD)/storvsc64.o $(BUILD)/vnet64.o $(BUILD)/net64.o $(BUILD)/tcp64.o $(BUILD)/netvsc64.o
 

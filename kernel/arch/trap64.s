@@ -121,6 +121,10 @@ syscall_entry:
     movq    %rax, (%rsp)
     movq    %rax, %rdi                     /* signal_check(retval) -> handler or 0  */
     call    signal_check
+    cli                                    /* close the SYSRET/IRETQ window: a timer IRQ
+                                            * between `popq %rsp` and sysretq would push a
+                                            * CPL0 frame onto the USER stack.  IF is restored
+                                            * from r11 (sysret) / the frame (iretq) below. */
     testq   %rax, %rax
     jz      .Lsyscall_ret
     movq    %rax, %rdi                     /* deliver a custom handler (never returns) */
@@ -507,6 +511,8 @@ isr_common:
     movq    0(%rsp), %rdi                  /* vector    */
     movq    8(%rsp), %rsi                  /* err code  */
     movq    16(%rsp), %rdx                 /* fault rip */
+    movq    24(%rsp), %rcx                 /* fault cs (CPL: ring-3 faults recover) */
+    movq    40(%rsp), %r8                  /* interrupted rsp (for the panic backtrace) */
     call    isr_c
 1:  cli
     hlt

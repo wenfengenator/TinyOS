@@ -130,6 +130,59 @@ static void draw_date(uint32_t *back, int x, int y) {
     fb_text_to_s(back, (uint32_t)(x + 9 * g_cell), (uint32_t)y, b, 0xFFFFFF, CONTENT_BG, g_uisc);
 }
 
+/* battery/AC for the system monitor.  The EC is polled at most every ~3 s (bounded
+ * reads, safe even on an unfamiliar EC).  Percent/AC/voltage offsets were
+ * calibrated from plugged-vs-unplugged EC dumps on the T440s; the raw 0xA0-0xA7
+ * block is still shown to help locate the second (Power Bridge) battery. */
+static acpi_batt_t g_batt;
+static uint64_t g_batt_ms;
+static void batt_refresh(void) {
+    if (g_batt_ms && millis() - g_batt_ms < 1000) return;   /* 1s: AC/charging updates promptly */
+    g_batt_ms = millis();
+    acpi_battery(&g_batt);
+}
+/* Temporary diagnostic removed: AC confirmed at EC 0x46 bit4 on GJHT25WW. */
+static const char *batt_text(char *b) {
+    int n = 0;
+    if (g_batt.percent >= 0) {
+        int p = g_batt.percent; char t[4]; int m = 0;
+        if (!p) t[m++] = '0'; else while (p) { t[m++] = (char)('0' + p % 10); p /= 10; }
+        while (m) b[n++] = t[--m];
+        b[n++] = '%';
+    } else { b[n++] = '?'; b[n++] = '?'; }
+    b[n++] = ' ';
+    const char *st = !g_batt.present ? "NO BATT" : g_batt.charging ? "CHG" : g_batt.ac_online ? "AC" : "BAT";
+    while (*st) b[n++] = *st++;
+    b[n] = 0;
+    return b;
+}
+static const char *volt_text(char *b) {
+    int mv = g_batt.voltage_mv, n = 0;
+    if (mv <= 0) { b[0] = '-'; b[1] = 0; return b; }
+    int whole = mv / 1000, cents = (mv % 1000) / 10;
+    char t[6]; int m = 0;
+    if (!whole) t[m++] = '0'; else while (whole) { t[m++] = (char)('0' + whole % 10); whole /= 10; }
+    while (m) b[n++] = t[--m];
+    b[n++] = '.'; b[n++] = (char)('0' + cents / 10); b[n++] = (char)('0' + cents % 10); b[n++] = 'V';
+    b[n] = 0;
+    return b;
+}
+
+/* CPU-busy % over the last ~second, derived from the accumulated HLT-idle time
+ * (kernel/arch64.c).  Recomputed twice a second; 0 % at an idle shell prompt. */
+static uint32_t cpu_busy_pct(void) {
+    static uint64_t last_ms, last_idle; static uint32_t pct;
+    uint64_t now = millis(), idle = cpu_idle_ms();
+    uint64_t dt = now - last_ms;
+    if (dt >= 500) {
+        uint64_t didle = idle - last_idle;
+        if (didle > dt) didle = dt;
+        pct = (uint32_t)(100 * (dt - didle) / (dt ? dt : 1));
+        last_ms = now; last_idle = idle;
+    }
+    return pct;
+}
+
 /* live system-stats window (content callback) */
 static void sysmon_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw, int ch) {
     (void)win; (void)cw; (void)ch;
@@ -137,6 +190,7 @@ static void sysmon_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw
     fb_text_to_s(back, (uint32_t)cx, (uint32_t)y, "tinyos x64 kernel", 0x66FFCC, CONTENT_BG, g_uisc);
     y += g_lineh + 4;
     draw_str(back, cx, y, "OS VER   ", "v" TINYOS_VERSION);                        y += g_lineh;
+    draw_kv(back, cx, y, "CPU %    ", cpu_busy_pct());                             y += g_lineh;
     draw_kv(back, cx, y, "FPS      ", g_fps);                                      y += g_lineh;
     draw_kv(back, cx, y, "UPTIME S ", (uint32_t)(millis() / 1000));                y += g_lineh;
     draw_date(back, cx, y);                                                        y += g_lineh;
@@ -148,7 +202,11 @@ static void sysmon_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw
     draw_kv(back, cx, y, "HV STAGE ", (uint32_t)hvkbd_stage());                    y += g_lineh;
     draw_kv(back, cx, y, "NET STG  ", (uint32_t)netvsc_stage());                   y += g_lineh;
     draw_res(back, cx, y, g_scr_w, g_scr_h);                                       y += g_lineh;
-    draw_kv(back, cx, y, "GOP MODES", g_bi ? g_bi->gop_modes : 0);
+    draw_kv(back, cx, y, "GOP MODES", g_bi ? g_bi->gop_modes : 0);                 y += g_lineh;
+    batt_refresh();
+    { char b[24]; draw_str(back, cx, y, "BATT     ", batt_text(b)); }              y += g_lineh;
+    { char b[12]; draw_str(back, cx, y, "VOLT     ", volt_text(b)); }              y += g_lineh;
+    draw_str(back, cx, y, "LID      ", acpi_lid_open() ? "OPEN" : "CLOSED");
 }
 
 /* kernel log / trace window: renders the scrollback ring (kernel/fb64.c) with a
@@ -251,15 +309,43 @@ static void clamp_window(wm_window_t *w) {
     if (w->y < g_taskh) w->y = g_taskh;
 }
 
+/* Window-manager hotkeys, usable both from the desktop loop and from a blocking
+ * foreground app's keyboard reader (so F1/F2 + kernel-log scrolling keep working
+ * while the linux shell owns stdin).  Returns 1 if the key was consumed by the
+ * WM; 0 means "pass it to the focused window's content". */
+int wm_hotkey(int key) {
+    if (wm_is_sleeping()) { wm_sleep_set(0); return 1; }   /* any key wakes from sleep */
+    if (g_nwin <= 0) return 0;
+    ui_note_activity();                        /* any hotkey (focus/move/scroll) redraws */
+    if (key == KEY_F3) { wm_sleep_set(1); return 1; }  /* F3: sleep now (screen off + deep idle) */
+    if (key == KEY_F1) { g_focus = (g_focus + 1) % g_nwin; g_move = 0; return 1; }
+    if (key == KEY_F2) { g_move = !g_move; return 1; }
+    wm_window_t *wf = &g_wins[g_focus];
+    if (g_move) {
+        switch (key) {
+            case KEY_LEFT:  wf->x -= MOVE_STEP; break;
+            case KEY_RIGHT: wf->x += MOVE_STEP; break;
+            case KEY_UP:    wf->y -= MOVE_STEP; break;
+            case KEY_DOWN:  wf->y += MOVE_STEP; break;
+            case '\n': case '\r': case KEY_ESC: g_move = 0; break;
+            default: break;
+        }
+        clamp_window(wf);
+        return 1;
+    }
+    if (wf->kind == WIN_LOG) { log_key(key); return 1; }   /* log focused: keys scroll it */
+    return 0;                                              /* terminal focused: content gets it */
+}
+
 static void setup_windows(boot_info_t *bi) {
     g_nwin = g_focus = g_move = 0;
     int top = g_taskh + MARGIN;
     int wh  = (int)g_scr_h - top - MARGIN;                /* both windows full height */
 
-    /* system monitor: just wide enough for its longest line (~26 cols); give the
-     * rest to the terminal so code lines are far less likely to clip. */
-    int sw = 26 * g_cell;
-    if (sw > (int)g_scr_w * 40 / 100) sw = (int)g_scr_w * 40 / 100;
+    /* system monitor / kernel-log column.  With the compact 8px font the terminal
+     * has spare width, so give the right column a comfortable ~44 cols. */
+    int sw = 44 * g_cell;
+    if (sw > (int)g_scr_w * 45 / 100) sw = (int)g_scr_w * 45 / 100;
 
     int tw = (int)g_scr_w - sw - 3 * MARGIN; if (tw < 20 * g_cell) tw = 20 * g_cell;
     int cols = (tw - 12) / g_cell, rows = (wh - g_titleh - 12) / g_lineh;
@@ -269,7 +355,7 @@ static void setup_windows(boot_info_t *bi) {
     tm->kind = WIN_TERMINAL;
 
     int rx = MARGIN + tw + MARGIN;                       /* shared right-column x     */
-    int smh = g_titleh + 17 * g_lineh + 12;              /* system monitor height (16 rows) */
+    int smh = g_titleh + 20 * g_lineh + 12;              /* system monitor height */
     int minlog = g_titleh + 6 * g_lineh;                 /* keep the log usable        */
     if (smh > wh - minlog - MARGIN) smh = wh - minlog - MARGIN;
 
@@ -282,14 +368,66 @@ static void setup_windows(boot_info_t *bi) {
     lg->title = "kernel log"; lg->user = 0; lg->kind = WIN_LOG;
 }
 
+/* UI activity timestamp: bumped on keypress / terminal output so the compositor
+ * repaints at the full 30 FPS briefly, then idles.  Lets the desktop go quiet
+ * (a couple of blits/second) when nothing is happening — the other half of the
+ * weeks-on-battery goal alongside the CPU HLT in the read loops. */
+static volatile uint64_t g_ui_activity_ms;
+void ui_note_activity(void) { g_ui_activity_ms = millis(); }
+
+/* ---- low-power sleep (lid close / manual) --------------------------------
+ * When asleep the compositor stops (screen held black, deepest HLT idle) and,
+ * on the real T440s, the EC has already cut the panel backlight in hardware.
+ * Any keypress or a lid-open transition wakes it. */
+static volatile int g_sleeping;
+int wm_is_sleeping(void) { return g_sleeping; }
+void wm_sleep_set(int on) {
+    if (on == g_sleeping) return;
+    g_sleeping = on ? 1 : 0;
+    if (!g_back) return;
+    if (on) {                                           /* blank the framebuffer once */
+        for (uint32_t i = 0, n = g_scr_w * g_scr_h; i < n; i++) g_back[i] = 0;
+        disp_present();
+    } else {                                            /* wake: force a fresh full frame */
+        ui_note_activity();
+        compositor(g_back);
+        disp_present();
+    }
+}
+
+/* Sample the lid ~4x/s and sleep/wake on an open<->closed *transition* only, so
+ * a wrong/static EC reading can never spuriously blank the screen — only a real
+ * lid movement acts.  Called from the shell's input-wait loops. */
+void power_poll(void) {
+    static uint64_t last;
+    static int prev_open = -1;
+    uint64_t t = millis();
+    if (t - last < 250) return;
+    last = t;
+    if (acpi_power_button()) wm_sleep_set(!wm_is_sleeping());   /* press toggles sleep/wake */
+    int open = acpi_lid_open();
+    if (prev_open < 0) { prev_open = open; return; }    /* seed without acting */
+    if (prev_open && !open) wm_sleep_set(1);            /* lid just closed */
+    else if (!prev_open && open) wm_sleep_set(0);       /* lid just opened */
+    prev_open = open;
+}
+
 /* Composite + present one rate-limited frame.  Called from a blocking syscall
  * (e.g. SYS_READ) so the desktop stays live — cursor blink, system monitor, and
- * the line being typed — while a ring-3 program waits for keyboard input. */
+ * the line being typed — while a ring-3 program waits for keyboard input.
+ * Render-on-change: after ~300 ms of no activity it only repaints on the 500 ms
+ * cursor-blink / clock boundary (~2 FPS) instead of blitting 30 full frames/s. */
 void wm_pump(void) {
     static uint64_t pump_last;
-    if (!g_back) return;
+    static uint64_t idle_slot = (uint64_t)-1;
+    if (!g_back || g_sleeping) return;                  /* asleep: hold the black screen */
     uint64_t t = millis();
-    if (t - pump_last < 33) return;
+    if (t - pump_last < 33) return;                     /* 30 FPS hard cap */
+    if (t - g_ui_activity_ms > 300) {                   /* idle: skip redundant blits */
+        uint64_t slot = t / 500;                        /* cursor blink + clock tick */
+        if (slot == idle_slot) return;
+        idle_slot = slot;
+    }
     pump_last = t;
     compositor(g_back);
     disp_present();
@@ -300,11 +438,11 @@ void wm_run(boot_info_t *bi) {
     fb_get(&g_scr_w, &g_scr_h);
     if (!g_scr_w || !g_scr_h) { kputs("[wm] no framebuffer\n"); return; }
 
-    g_uisc   = (g_scr_w >= 1440) ? 2 : 1;            /* 8px font on small panels (Hyper-V 1024) */
-    g_cell   = 8 * g_uisc;
-    g_titleh = g_cell + 8;
-    g_taskh  = g_cell + 10;
-    g_lineh  = g_cell + g_cell / 2;
+    g_uisc   = (g_scr_w >= 2560) ? 2 : 1;            /* 8x16 VGA font; scale up only on 4K+ panels */
+    g_cell   = 8 * g_uisc;                           /* glyph / column width  */
+    g_lineh  = 16 * g_uisc;                          /* glyph / row height    */
+    g_titleh = g_lineh + 8;
+    g_taskh  = g_lineh + 10;
 
     disp_init();
     g_back = disp_back();
@@ -318,41 +456,35 @@ void wm_run(boot_info_t *bi) {
         term_autostart_shell(g_wins[0].user);
 
     uint64_t last = millis();
-    uint64_t last_frame = 0;
     uint32_t acc = 0;
 
     for (;;) {
         int k;
         while ((k = kbd64_getkey()) >= 0 || (k = hvkbd_getkey()) >= 0) {
-            if (k == KEY_F1) { g_focus = (g_focus + 1) % g_nwin; g_move = 0; continue; }
-            if (k == KEY_F2) { g_move = !g_move; continue; }
-            if (g_move) {
-                wm_window_t *wf = &g_wins[g_focus];
-                switch (k) {
-                    case KEY_LEFT:  wf->x -= MOVE_STEP; break;
-                    case KEY_RIGHT: wf->x += MOVE_STEP; break;
-                    case KEY_UP:    wf->y -= MOVE_STEP; break;
-                    case KEY_DOWN:  wf->y += MOVE_STEP; break;
-                    case '\n': case '\r': case KEY_ESC: g_move = 0; break;
-                    default: break;
-                }
-                clamp_window(wf);
-                continue;
-            }
+            ui_note_activity();                             /* any key: repaint at full rate */
+            if (wm_hotkey(k)) continue;                     /* F1/F2/move/log-scroll */
             wm_window_t *wf = &g_wins[g_focus];
             if (wf->kind == WIN_TERMINAL) term_key(wf, k);
-            else if (wf->kind == WIN_LOG)  log_key(k);
         }
 
-        /* cap the compositor to ~30 FPS so the full-frame blit doesn't flood
-         * Hyper-V's synthetic video channel (which stalls the VMConnect console). */
+        wm_pump();                                          /* composite on change (respects sleep) */
+        power_poll();                                       /* lid / power-button sleep triggers */
+
+        /* Idle without pegging a core.  The native console runs with the
+         * scheduler stopped, so briefly arm a LAPIC tick around the HLT (it
+         * lands in sched_tick's guarded ack) and disarm on wake.  Falls back to
+         * a short sleep only before the timer has ever been calibrated. */
+        if (lapic_ready()) {
+            uint64_t t0 = millis();
+            lapic_idle_arm();
+            __asm__ volatile("sti; hlt");
+            lapic_idle_disarm();
+            cpu_idle_add_ms(millis() - t0);                 /* count the halt toward CPU-idle %% */
+        } else {
+            sleep_ms(3);
+        }
+
         uint64_t t = millis();
-        if (t - last_frame < 33) { sleep_ms(3); continue; }
-        last_frame = t;
-
-        compositor(g_back);
-        disp_present();
-
         acc++;
         if (t - last >= 1000) { g_fps = acc; acc = 0; last = t; }
     }
