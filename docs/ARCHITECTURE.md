@@ -394,7 +394,8 @@ unmodified — the full C standard library is present because `libc.a` *is* the
 complete library.
 
 **On-device C compiler (TinyCC).** `make setup-tcc` (`tools/setup_tcc.sh`)
-cross-builds **TinyCC 0.9.28** and stages a self-contained toolchain root:
+builds **TinyCC** and **musl** from source vendored in `third_party/` (no
+network access or distro packages) and stages a self-contained toolchain root:
 
 - `/tcc.bin` — the compiler, a static musl ELF.
 - `/lib/{crt1.o,crti.o,crtn.o,libc.a,libtcc1.a}` — CRT objects and libraries at
@@ -454,13 +455,15 @@ make run-x64-headless         # QEMU + OVMF, serial only (CI/sandbox)
 # Hyper-V Gen 2 artifact (attach as the VM's disk; Secure Boot OFF)
 make tinyos.vhdx              # -> tinyos.vhdx (GPT: FAT32 ESP + FAT16 data)
 
-# On-device toolchain inputs (musl + TinyCC), staged under /tmp
+# One-time: build musl + TinyCC from vendored source (third_party/) into /tmp
 make setup-tcc
 ```
 
 Requirements: `gcc`/`g++` + binutils (`ld` supporting `-mi386pep`, `objcopy`
 supporting `pei-x86-64`), Python 3, `qemu-system-x86_64` + OVMF for local runs,
-and `qemu-img` to package the VHDX. No mingw, gnu-efi, or clang required.
+and `qemu-img` to package the VHDX. No mingw, gnu-efi, or clang required. The
+target toolchain (musl libc + TinyCC) is built from source vendored in
+`third_party/`, so **no network access or distro packages are required**.
 
 At the sign-in panel log in with `root` / `root`. From the terminal, `help`
 lists commands; `./musl.bin`, `./printf.bin`, and `./tcc.bin file.c -o out.bin`

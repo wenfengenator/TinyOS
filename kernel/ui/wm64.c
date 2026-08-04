@@ -302,7 +302,7 @@ static void compositor(uint32_t *back) {
     fill_rect(back, 0, 0, (int)g_scr_w, (int)g_scr_h, 0x0A1830);      /* desktop  */
     fill_rect(back, 0, 0, (int)g_scr_w, g_taskh, 0x102A4A);           /* task bar */
     fb_text_to_s(back, 8, 5,
-               "tinyos desktop    F1 focus    F2 move    terminal: type help",
+               "tinyos desktop   F1 focus  F2 move  F3 sleep  F4 pane  F5 split   terminal: type help",
                0xEAF2FF, 0x102A4A, g_uisc);
     for (int i = 0; i < g_nwin; i++) if (i != g_focus) draw_window(&g_wins[i], back, 0);
     if (g_nwin) draw_window(&g_wins[g_focus], back, 1);

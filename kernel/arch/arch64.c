@@ -3395,8 +3395,14 @@ struct pane_ring { volatile int r, w; unsigned char b[128]; };
 static struct pane_ring g_pin[PANE_MAX];
 static struct proc     *g_pane_proc[PANE_MAX];
 static void            *g_pane_term[PANE_MAX];
+static void            *g_pane0_term;          /* the WM-owned terminal (pane 0); never term_free'd here */
 static int              g_pane_n, g_pane_focus;
 #define PANE_CHAN(i)    (0x50000000 + (i))
+/* All pane readers block on ONE shared wait channel and re-check their own ring
+ * on wake.  A shared channel (vs per-pane) is immune to the renumber race: a
+ * shell whose pane index changed under it still wakes and reads the right ring.
+ * The cost is a few spurious wakeups per key (<=4 panes), which is negligible. */
+#define PANE_CHAN_ALL   0x5000BEEF
 
 void *term_make(void);                                 /* term64.c pane-terminal primitives */
 void  term_free(void *t);
@@ -3417,15 +3423,20 @@ static void pane_push(int i, int k) {
     struct pane_ring *q = &g_pin[i];
     int nw = (q->w + 1) & 127;
     if (nw != q->r) { q->b[q->w] = (unsigned char)k; q->w = nw; }
-    sched_wake(PANE_CHAN(i));
+    sched_wake(PANE_CHAN_ALL);
 }
 static int pane_getkey(void) {
     for (;;) {
         int i = current ? current->pane : g_pane_focus;   /* re-read every iteration: a reap can */
         if (i < 0 || i >= PANE_MAX) i = 0;                 /* renumber this shell to a new pane   */
         struct pane_ring *q = &g_pin[i];
-        if (q->r != q->w) { int k = q->b[q->r]; q->r = (q->r + 1) & 127; return k; }
-        sched_block(PANE_CHAN(i));
+        /* Atomically check the ring and block: disabling interrupts closes the
+         * lost-wakeup window between the emptiness test and sched_block (which
+         * re-enables interrupts only at its hlt).  A pane_push that raced us
+         * either shows up here (ring non-empty) or finds us already BLOCKED. */
+        __asm__ volatile("cli");
+        if (q->r != q->w) { int k = q->b[q->r]; q->r = (q->r + 1) & 127; __asm__ volatile("sti"); return k; }
+        sched_block(PANE_CHAN_ALL);
     }
 }
 static int pane_trykey(void) {
@@ -3468,7 +3479,7 @@ static void reap_pane(int i) {
         if (p->vm.pml4) { free_user_pages(p->vm.pml4); p->vm.pml4 = 0; }
         proc_free(p);
     }
-    if (g_pane_term[i]) term_free(g_pane_term[i]);
+    if (g_pane_term[i] && g_pane_term[i] != g_pane0_term) term_free(g_pane_term[i]);  /* never free the WM's pane-0 terminal */
     for (int j = i; j < g_pane_n - 1; j++) {           /* compact: shift the survivors down */
         g_pane_term[j] = g_pane_term[j + 1];
         g_pane_proc[j] = g_pane_proc[j + 1];
@@ -3478,10 +3489,7 @@ static void reap_pane(int i) {
     }
     g_pane_n--;
     if (g_pane_focus >= g_pane_n) g_pane_focus = g_pane_n > 0 ? g_pane_n - 1 : 0;
-    /* Wake EVERY pane channel, not just the survivors': a renumbered shell is
-     * still blocked on its old channel index and must re-run pane_getkey to pick
-     * up its new pane number (else it is orphaned and stops receiving keys). */
-    for (int j = 0; j < PANE_MAX; j++) sched_wake(PANE_CHAN(j));
+    sched_wake(PANE_CHAN_ALL);   /* wake all readers so renumbered shells re-check their ring */
 }
 
 /* Launch the split-pane shell system.  Runs as task 0 (the router) until every
@@ -3496,7 +3504,7 @@ int arch_run_panes(void *pane0_term) {
 
     struct proc *parent = current;
     for (int i = 0; i < PANE_MAX; i++) { g_pin[i].r = g_pin[i].w = 0; g_pane_proc[i] = 0; g_pane_term[i] = 0; }
-    g_pane_term[0] = pane0_term; g_pane_n = 1; g_pane_focus = 0;
+    g_pane_term[0] = pane0_term; g_pane0_term = pane0_term; g_pane_n = 1; g_pane_focus = 0;
 
     sched_init();
     g_pane_proc[0] = spawn_pane_shell(img, size, 0, parent);

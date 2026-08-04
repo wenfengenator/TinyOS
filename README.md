@@ -128,13 +128,19 @@ application (`BOOTX64.EFI`). It boots on `qemu-system-x86_64` + OVMF and on
   recompiling itself.
 
 ```bash
+make setup-tcc                # one-time: build musl + TinyCC from vendored source (third_party/)
 make ARCH=x64                 # build/BOOTX64.EFI (one PE32+ image)
 make run-x64-headless         # QEMU + OVMF, serial only (CI/sandbox)
 make tinyos.vhdx              # Hyper-V Gen 2 disk (attach; Secure Boot OFF)
 make usb                      # tinyos-usb.img — GPT/UEFI image to dd onto a USB stick
 make run-x64-disk             # boot the GPT image itself in QEMU (real-hardware path)
-make setup-tcc                # stage musl + TinyCC for the on-device compiler
 ```
+
+`make setup-tcc` is a **one-time prerequisite** that builds the musl libc and
+TinyCC entirely from source vendored under [`third_party/`](third_party/) — no
+network access or distro packages, just a standard host toolchain (`gcc`,
+`make`, binutils, Python). It stages the result under `/tmp`, so re-run it if
+`/tmp` is cleared (e.g. after a reboot).
 
 ### Boot on a real PC (USB)
 
