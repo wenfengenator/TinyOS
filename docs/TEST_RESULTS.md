@@ -411,3 +411,52 @@ VM via a COM1 named pipe. `✅` = confirmed on QEMU and (where noted) Hyper-V.
 
 A healthy headless boot ends at `[login] awaiting credentials (default root/root)`
 with **zero** `[EXC]` lines.
+
+## Phase 17 — v2.0.0: multi-pane terminal, power, and real hardware
+
+Bring-up target was a **ThinkPad T440s** (Haswell, Intel HD 4400, 4 cores, AHCI
+SSD, xHCI USB). `✅` = confirmed on QEMU + OVMF; `✅ HW` = additionally confirmed
+on the T440s.
+
+### Multi-pane terminal
+| Step | Result |
+|---|---|
+| F5 splits up to 4 concurrent shells (grid fill L→R, then top→bottom) | ✅ ✅ HW |
+| F4 cycles focus; focused pane shows bright border + blinking cursor | ✅ ✅ HW |
+| Per-pane line discipline: `vi` raw mode in one pane, others keep echo | ✅ |
+| Concurrent commands route correctly (no cross-pane leak) | ✅ |
+| Close a *middle* pane → survivors renumber and still take input (no orphan) | ✅ |
+| Open/close churn (4-pane cycles) → kernel log clean, no `[mm]`/`[EXC]` | ✅ |
+
+### Power management
+| Step | Result |
+|---|---|
+| Idle CPU drops from ~100% to ~0% (shell + native console HLT idle) | ✅ ✅ HW |
+| Compositor renders on change; live **CPU %** meter in system monitor | ✅ ✅ HW |
+| F3 / lid-close / power-button → sleep (screen off); wake on key/lid-open | F3+lid ✅; power-button ✅ HW |
+| Battery percent / voltage / AC-present / charging from EC `0x46` | ✅ HW |
+
+### Storage & file bridge (real hardware)
+| Step | Result |
+|---|---|
+| AHCI internal disk mounted read/write at `/mnt`, persistent across reboot | ✅ HW |
+| xHCI USB stick mounted at `/usb`; `cp`/`cat`/`vi` write and persist | ✅ HW |
+| USB raw round-trip (`usb wtest`) proves the driver; FAT cache fixes write hang | ✅ HW |
+| exec / tab-completion / `access` resolve via VFS in `/mnt` and `/usb` | ✅ ✅ HW |
+
+### Graphics-app takeover
+| Step | Result |
+|---|---|
+| Full-screen TinyGL app owns the screen; terminal freezes behind (no overdraw) | ✅ ✅ HW |
+| App reads input via the pane router; `q` quits it; desktop resumes cleanly | ✅ ✅ HW |
+
+### Regressions found & fixed (v2.0.0)
+| Symptom | Root cause → fix |
+|---|---|
+| `#PF` double-free / `#GP` on the T440s after a process exits + F5 | firmware sets `US`+available bit on its kernel identity map (aliasing the heap); teardown freed live kernel pages → tag our own entries with `PTE_OWN`, strip it on every copy, gate free/clone walks on it |
+| `cp kr.c /usb/kr.c` hung ~8 s and left the file empty | FAT allocator re-read the same FAT sector hundreds of times, blowing the I/O watchdog → one-sector FAT cache + batched, no-zero-fill cluster writes |
+| Typing invisible in other panes while `vi` ran | single shared line discipline → per-pane termios/echo/history |
+| Battery CHG/AC stopped updating on plug/unplug | wrong EC register/bit → AC and lid both live in EC `0x46` (bits 4 and 2) |
+| Native console pegged a core at 100% | scheduler stopped, so no timer tick to break `hlt` → scoped one-shot LAPIC idle-tick around the halt |
+| `?ELF` binary garbage in the terminal + panic after closing all panes and relaunching (`sh`) | `reap_pane` freed pane-0's WM-owned terminal; the relaunch's ELF `kmalloc` reused it → never free the pane-0 terminal in the pane teardown |
+| A pane (often `vi`) stops receiving input after cycling panes and can't be closed | non-atomic check-then-`sched_block` (lost wakeup) + per-pane wait channels (renumbered shell orphaned) → one shared wait channel + `cli`-atomic check-and-block |

@@ -29,9 +29,10 @@
 12. [The Linux-compatible ABI](#12-the-linux-compatible-abi)
 13. [Userland: musl and the on-device toolchain](#13-userland-musl-and-the-on-device-toolchain)
 14. [Design principles and rationale](#14-design-principles-and-rationale)
-15. [Building and running](#15-building-and-running)
-16. [Testing and verification](#16-testing-and-verification)
-17. [Known limitations and future work](#17-known-limitations-and-future-work)
+15. [Multi-pane terminal, power, and real hardware](#15-multi-pane-terminal-power-and-real-hardware)
+16. [Building and running](#16-building-and-running)
+17. [Testing and verification](#17-testing-and-verification)
+18. [Known limitations and future work](#18-known-limitations-and-future-work)
 
 ---
 
@@ -133,12 +134,19 @@ relocations; a low image base keeps 32-bit address references resolvable.
   address (see the storage stack).
 - **Heap.** `mm64.c` provides `heap_init`, `kmalloc`, and `page_alloc`
   (4 KiB-aligned) carved out of the largest conventional-memory region from the
-  UEFI map. It is a **bump allocator**: `kmalloc`/`page_alloc` never reclaim.
-  This is deliberate for a teaching kernel — it removes a whole class of bugs —
-  but it means long-running allocation churn leaks (a documented limitation).
+  UEFI map. `kmalloc` is a bump/free-list allocator; `page_alloc`/`page_free`
+  manage a 4 KiB frame free-list, so **dead processes return their frames**
+  (see [§12](#12-the-linux-compatible-abi)). `page_free` rejects out-of-arena,
+  misaligned, and double/overlapping frees as defense-in-depth.
 - **User address spaces.** Linux ELF programs get their **own** 4-level page
   tables (a private PML4) cloned from the kernel's, with only the user regions
-  replaced. See [§12](#12-the-linux-compatible-abi).
+  replaced. Because the kernel runs on the *firmware's* identity map — and real
+  UEFI firmware sets `US` and even an available software bit on those entries —
+  the teardown/fork walks cannot use the hardware `US` bit to tell "a page we
+  allocated" from "a shared firmware page". Instead every table entry **we**
+  create carries a software-owned bit (`PTE_OWN`, bit 9) that is stripped from
+  all copied entries, and the free/clone walks key off it. See
+  [§12](#12-the-linux-compatible-abi).
 
 ---
 
@@ -240,13 +248,19 @@ wm64 / login64 / games ── draw into ──▶ disp64 back buffer ──▶ f
   software double buffer is the practical maximum; true tear-free flipping would
   need a real GPU driver (virtio-gpu / Hyper-V synthvid).
 - **`wm64.c`** is a keyboard-driven compositor: a desktop background, a task
-  bar, and windows (a **terminal** and a live **system monitor**), with the
-  focused window drawn last. Keys: **F1** cycle focus, **F2** move mode + arrows.
-- **`term64.c`** is the terminal widget and command console that hosts the
-  ring-3 shell and routes program stdout to the active terminal grid.
+  bar, and windows (a **terminal** and a live **system monitor** with CPU %,
+  battery, and lid state), with the focused window drawn last. Keys: **F1**
+  cycle focus, **F2** move mode + arrows, **F3** sleep. It renders **on change**
+  (and at the ~2 FPS cursor-blink/clock cadence when idle) rather than a fixed
+  30 FPS, so an idle desktop costs almost nothing. When a full-screen graphics
+  app is presenting, `wm_pump` **stands down** so the compositor does not
+  overdraw it — see [§15](#15-multi-pane-terminal-power-and-real-hardware).
+- **`term64.c`** is the terminal widget and command console. It hosts the
+  ring-3 shell and can split into a **multi-pane** grid of concurrent shells
+  (F5/F4); program stdout is routed to the pane owned by the writing process.
 - Full-screen apps — **`login64.c`** (sign-in panel), **`pong64.c`**,
-  **`demo64.c`**, and the **`sched`** demo — all render into the same shared
-  `disp64` buffer and present through the diff path.
+  **`demo64.c`**, the **`sched`** demo, and the **TinyGL** graphics apps — all
+  render into the same shared `disp64` buffer and present through the diff path.
 
 UI metrics adapt to resolution: an 8-px font on a small (1024×768 Hyper-V)
 screen, 16-px on large screens, so the desktop is neither cramped nor blurry.
@@ -357,8 +371,10 @@ isolated high user stack. Reserved arenas back the memory syscalls:
 
 - `brk` (heap) and anonymous `mmap`/`munmap`/`mprotect` over private arenas.
 - VM operations walk/create the 4-level tables, allocate zeroed pages, enforce
-  process-owned ranges, and roll back on partial failure. (Frames are not yet
-  reclaimed on unmap — the bump-allocator limitation.)
+  process-owned ranges, and roll back on partial failure. Every entry we map
+  carries the `PTE_OWN` software bit, so **process exit reclaims all private
+  frames and page-table pages** (`free_user_pages`) without ever touching the
+  shared firmware/kernel identity map ([§4](#4-memory-model)).
 
 **Filesystem syscalls.** A per-process fd table (tty on 0/1/2, regular files
 from 3) backs `openat`, `close`, `read`, `write`, `writev`, `lseek`,
@@ -372,11 +388,15 @@ success. Getting the nested syscall-stack lifecycle right (a dedicated
 replacement stack) was the subtle part.
 
 **The full implemented set (~30 syscalls):** `read, write, open, openat, close,
-lseek, fstat, newfstatat, mmap, mprotect, munmap, brk, rt_sigprocmask, ioctl,
-writev, getpid, gettid, execve, ftruncate, getcwd, arch_prctl, set_tid_address,
+lseek, fstat, newfstatat, mmap, mprotect, munmap, brk, rt_sigprocmask,
+rt_sigaction, rt_sigreturn, ioctl, writev, getpid, gettid, fork, execve, wait4,
+pipe, dup2, kill, clone, ftruncate, getcwd, arch_prctl, set_tid_address,
 set_robust_list, getdents64, clock_gettime, mkdirat, unlinkat, getrandom, exit,
-exit_group`. Anything else returns `-ENOSYS`. Notable gaps: `fork`/`clone`/
-`wait4`, `dup`/`pipe`, `poll`/`select`, real signal delivery.
+exit_group`. Anything else returns `-ENOSYS`. Since v2.0.0 the process
+primitives — **`fork`, `execve`, `wait4`, `pipe`, and signal delivery** — run
+through the preemptive scheduler with per-task syscall stacks, which is what
+lets the mbb shell pipe commands and the multi-pane terminal host concurrent
+shells.
 
 The shell reaches all of this: an unknown command is tokenized into `argv` and
 run through `execve`, so `./musl.bin`, `./tcc.bin foo.c -o foo.bin`, and
@@ -444,7 +464,78 @@ This closes the north-star loop: the OS can build native executables for itself.
 
 ---
 
-## 15. Building and running
+## 15. Multi-pane terminal, power, and real hardware
+
+v2.0.0 turned the x64 desktop from a demo into something usable for long
+sessions on a laptop. Three threads of work: a concurrent terminal, power
+efficiency, and hardening on a real machine (a **ThinkPad T440s** — Haswell,
+Intel HD 4400, 4 cores, AHCI SSD, xHCI USB).
+
+### Multi-pane terminal
+
+The terminal splits into up to **four concurrent shells** in a 2-column grid
+(filled left→right, then top→bottom). **F5** spawns a pane, **F4** cycles focus,
+`exit`/Ctrl-D closes one and the survivors re-flow and renumber.
+
+- **One process per pane.** Each pane runs the mbb shell as its own scheduled
+  task. A **router** (the pane-0 task) owns the keyboard: it reads a key, applies
+  window hotkeys (F1–F5), and otherwise pushes it into the **focused pane's input
+  ring**; each shell blocks on `pane_getkey` for its own ring. A process's
+  `stdout` (`usys_write`) is routed to the terminal grid of *its* pane via
+  `current->pane`.
+- **Per-pane line discipline.** Canonical/raw mode, echo, the foreground process
+  group, the cooked input line, and command history are all **per pane**. This
+  was essential: a single shared line discipline let a raw-mode program (`vi`)
+  in one pane silently disable echo in the others.
+- **Robust teardown.** Closing a *middle* pane renumbers the higher shells;
+  `pane_getkey` re-reads its pane index on every wait and `reap_pane` wakes all
+  channels, so a renumbered shell is never orphaned on a stale ring.
+
+### Power management
+
+The original desktop and shell loops spun at 100% CPU. They now **idle on
+`HLT`**:
+
+- `idle_wait()` runs `sti; hlt` (gated on the scheduler) in the shell read
+  loops; the scheduler-stopped native console arms a scoped one-shot LAPIC tick
+  around the halt. Idle cores drop from ~100% to ~0%.
+- The compositor renders **on change** (plus the 500 ms cursor-blink/clock
+  cadence), so a quiet screen blits nothing.
+- The system monitor gained a **CPU %** meter (halted-time accounting), battery,
+  voltage, and **LID** rows.
+- **Sleep** — framebuffer blanked, deepest idle — triggers on **F3**, **lid
+  close** (EC), or the **power button** (ACPI PM1 `PWRBTN_STS`), and wakes on
+  lid-open or any key. `power_poll()` samples the lid ~4×/s and acts only on a
+  real open⇄closed *transition*, so a wrong static reading can never blank the
+  screen.
+
+### Real hardware: storage, USB, and firmware-safe teardown
+
+- **AHCI** mounts the internal SATA disk read/write at **`/mnt`**, persistent
+  across reboots. **xHCI USB mass-storage** mounts a stick at **`/usb`** — the
+  bridge for moving files in and out. Both sit behind the same FAT engine
+  (`datavol64.c`) with a one-sector FAT cache and batched cluster writes (the fix
+  for an ~8 s USB-write hang that used to leave copied files empty).
+- The **embedded controller** (T440s, GJHT25WW) is read for battery percent /
+  voltage and, from EC register `0x46`, AC-present (bit 4) and lid (bit 2).
+- **Firmware-safe page-table teardown.** The kernel runs on the firmware's
+  identity map, and this firmware sets `US` (and an available software bit) on
+  its kernel entries — which alias the whole heap arena. The teardown/fork walks
+  therefore cannot trust `US` to mean "user page": doing so double-freed / freed
+  **live kernel pages** on process exit, stable in QEMU but crashing the T440s
+  with `#PF`/`#GP`. The fix tags only entries **we** create with `PTE_OWN`
+  (bit 9), strips it from every copied table, and gates all free/clone walks on
+  it — so teardown provably never descends into shared firmware mappings.
+- **Graphics apps own the screen.** When a full-screen TinyGL app presents,
+  `gfx_present` timestamps the frame and the compositor **stands down**
+  (`wm_pump` early-returns) so the terminal freezes cleanly in the background
+  instead of overdrawing the graphics; the app reads input through the pane
+  router, so it can be driven and quit (`q`) from a pane. On exit the compositor
+  resumes.
+
+---
+
+## 16. Building and running
 
 ```bash
 # 64-bit UEFI build
@@ -471,7 +562,7 @@ demonstrate the Linux-ABI path.
 
 ---
 
-## 16. Testing and verification
+## 17. Testing and verification
 
 - **Headless boot markers.** `make run-x64-headless` prints an ordered set of
   markers; a healthy boot reaches `[linux-abi] … ok`, `[fs] fat16 … mounted`,
@@ -491,18 +582,19 @@ See [`TEST_RESULTS.md`](TEST_RESULTS.md) for the recorded outcomes.
 
 ---
 
-## 17. Known limitations and future work
+## 18. Known limitations and future work
 
-- **No frame reclamation.** `page_alloc`/`kmalloc` are bump-only; `munmap` and
-  process exit do not free physical frames yet.
-- **A ring-3 fault halts the kernel.** A `#PF` from a bad user program currently
-  prints `[EXC]` and halts instead of only terminating that program. Trapping
-  ring-3 faults and returning an error to the shell is planned.
-- **No multiprocessing syscalls.** `fork`/`clone`/`wait4`, `pipe`, and real
-  signals are unimplemented; programs are run synchronously.
+- **A ring-3 fault terminates the faulting program**, not the kernel: a bad user
+  program prints `[EXC] usr pid … killed` and its pane's shell continues. (A
+  kernel-mode fault still panics and halts.)
 - **APs park idle.** SMP bring-up works, but scheduling is BSP-only; SMP-aware
   scheduling and TLB shootdown are future work.
 - **No true page-flip.** The display is a software double buffer over a single
   GOP framebuffer; tear-free animation needs a real GPU driver.
-- **FS scale.** FAT16 with 512-byte clusters and a 16 MiB data partition; larger
-  volumes and deeper toolchain trees will want a roomier layout.
+- **No USB-HID.** Real PCs need a PS/2 or legacy-USB keyboard; there is no
+  USB-HID input stack yet.
+- **Storage is AHCI/SATA + USB only.** NVMe-only machines have no persistence
+  path, and the on-disk layout is FAT (512-byte clusters).
+- **The firmware-`US` teardown fix is real-hardware-specific.** It is validated
+  by construction and on-device; OVMF/QEMU does not exercise the failing
+  condition.
