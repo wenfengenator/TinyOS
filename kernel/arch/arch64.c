@@ -132,6 +132,14 @@ static int          g_next_pid;
 #define PTE_RW  0x2
 #define PTE_US  0x4
 #define PTE_PS  0x80
+/* Software-owned bit (available bit 9): set ONLY on page-table pages and leaf
+ * frames that WE page_alloc()'d for a process address space.  The teardown and
+ * fork walks key off this instead of PTE_US, because real UEFI firmware sets
+ * PTE_US on its kernel identity map (which aliases our whole heap arena) — so
+ * PTE_US cannot distinguish a private user page from a shared kernel page, and
+ * walking US would double-free every arena frame reachable through the retained
+ * identity mappings.  PTE_OWN is unambiguous: no firmware entry carries it. */
+#define PTE_OWN 0x200
 /* Physical address field of a PTE/CR3 (bits 12..51).  Masking with ~0xFFF alone
  * keeps bit 63 (NX) and the software/reserved bits 52..62, which yields a
  * NON-CANONICAL pointer that #GPs when dereferenced on real silicon (QEMU TCG
@@ -399,6 +407,12 @@ static inline void idle_wait(void) {
  * syscalls (access, exec) route /mnt and /usb like the later fd layer does. */
 static int vfs_resolve(const char *full, uint8_t *attr, uint32_t *cluster, uint32_t *size);
 static int vfs_pread(const char *full, void *buf, uint32_t len, uint32_t off);
+
+/* split-pane input helpers (defined with arch_run_panes below) */
+#define PANE_MAX 4
+static int pane_in_use(void);
+static int pane_getkey(void);
+static int pane_trykey(void);
 static int run_linux_path(const char *path, uint8_t *stk, uint8_t *kstack_top,
                           const struct linux_exec_args *args, int on_sched);
 static int arch_user_run(const char *name, const uint8_t *img, uint64_t size,
@@ -592,7 +606,28 @@ static uint64_t sig_return(void) {
 #define TTY_ISIG   0x0001
 #define TTY_ICANON 0x0002
 #define TTY_ECHO   0x0008
-static struct { int fg_pgrp; uint32_t lflag; } g_tty = { 0, TTY_ISIG | TTY_ICANON | TTY_ECHO };
+#define TTY_HIST_N 16
+#define TTY_DEFLFLAG (TTY_ISIG | TTY_ICANON | TTY_ECHO)
+/* Per-pane line discipline: each concurrent shell owns its own termios lflag
+ * (canonical/raw/echo), foreground pgrp, and edit history.  A single shared
+ * state let a raw-mode program (vi) in one pane kill echo in the others
+ * ("typing invisible but still received") and bleed recalled history between
+ * panes.  Slot PANE_MAX is the native console (no split panes). */
+#define TTY_SLOTS (PANE_MAX + 1)
+struct tty_state { int fg_pgrp; uint32_t lflag; char hist[TTY_HIST_N][256]; int histn; };
+static struct tty_state g_ttys[TTY_SLOTS] = {
+    { 0, TTY_DEFLFLAG, {{0}}, 0 }, { 0, TTY_DEFLFLAG, {{0}}, 0 },
+    { 0, TTY_DEFLFLAG, {{0}}, 0 }, { 0, TTY_DEFLFLAG, {{0}}, 0 },
+    { 0, TTY_DEFLFLAG, {{0}}, 0 },
+};
+_Static_assert(TTY_SLOTS == 5, "g_ttys initializer must match TTY_SLOTS (PANE_MAX+1)");
+/* Resolve the calling context's tty slot: the running pane shell's own state,
+ * or the native-console slot when no split panes are active. */
+static struct tty_state *cur_tty(void) {
+    if (pane_in_use() && current->pane >= 0 && current->pane < PANE_MAX)
+        return &g_ttys[current->pane];
+    return &g_ttys[PANE_MAX];
+}
 
 /* Post a signal to every member of a process group. */
 static void signal_pgrp(int pgrp, int sig) {
@@ -1318,12 +1353,17 @@ struct elf64_phdr {
 static uint64_t *copy_page_table(const uint64_t *source) {
     uint64_t *copy = (uint64_t *)page_alloc(1);
     if (!copy) return 0;
-    if (source) for (int i = 0; i < 512; i++) copy[i] = source[i];
+    /* Clear our software-owned bit (PTE_OWN) on every copied entry: real UEFI
+     * firmware may use available bit 9 in its identity map, and the free/fork
+     * walks treat PTE_OWN as "a table/frame WE allocated".  Stripping it here
+     * guarantees OWN is set only by make_table_entry (our own entries), so
+     * teardown never descends into or frees shared firmware kernel tables. */
+    if (source) for (int i = 0; i < 512; i++) copy[i] = source[i] & ~(uint64_t)PTE_OWN;
     return copy;
 }
 
 static uint64_t make_table_entry(uint64_t *table) {
-    return mm_v2p((uint64_t)table) | PTE_P | PTE_RW | PTE_US;
+    return mm_v2p((uint64_t)table) | PTE_P | PTE_RW | PTE_US | PTE_OWN;
 }
 
 /* struct proc_vm / struct linux_fd / enum linux_fd_kind now live in proc64.h;
@@ -1696,10 +1736,6 @@ static int linux_fcntl(int fd, int cmd, uint64_t arg) {
  * Reads one keyboard line, rendering edits to the active terminal with ANSI
  * cursor sequences (ESC[C/D/K).  Returns the length incl. the trailing '\n', or
  * 0 for EOF (Ctrl-D on an empty line). */
-#define TTY_HIST_N 16
-static char g_tty_hist[TTY_HIST_N][256];
-static int  g_tty_histn;
-
 static void tty_emit(const char *s, int n) { usys_write(s, (unsigned long)n); }
 static void tty_bs(int n) { while (n-- > 0) tty_emit("\x1b[D", 3); }   /* cursor left  */
 static void tty_fw(int n) { while (n-- > 0) tty_emit("\x1b[C", 3); }   /* cursor right */
@@ -1707,13 +1743,14 @@ static void tty_fw(int n) { while (n-- > 0) tty_emit("\x1b[C", 3); }   /* cursor
 static void tty_hist_push(const char *s, int n) {
     if (n <= 0) return;
     if (n > 255) n = 255;
-    if (g_tty_histn == TTY_HIST_N) {                       /* full: drop the oldest */
+    struct tty_state *ty = cur_tty();
+    if (ty->histn == TTY_HIST_N) {                         /* full: drop the oldest */
         for (int i = 1; i < TTY_HIST_N; i++)
-            for (int j = 0; j < 256; j++) g_tty_hist[i - 1][j] = g_tty_hist[i][j];
-        g_tty_histn--;
+            for (int j = 0; j < 256; j++) ty->hist[i - 1][j] = ty->hist[i][j];
+        ty->histn--;
     }
-    int i = 0; for (; i < n; i++) g_tty_hist[g_tty_histn][i] = s[i];
-    g_tty_hist[g_tty_histn][i] = 0; g_tty_histn++;
+    int i = 0; for (; i < n; i++) ty->hist[ty->histn][i] = s[i];
+    ty->hist[ty->histn][i] = 0; ty->histn++;
 }
 
 /* Tab completion for the canonical editor: complete the filename token ending
@@ -1760,13 +1797,18 @@ static void tty_complete(char *line, int *plen, int *ppos, int max) {
 
 static int tty_read_line(char *out, int max) {
     char line[256]; int len = 0, pos = 0;
-    int hidx = g_tty_histn;                                 /* == histn: a fresh (unsaved) line */
+    struct tty_state *ty = cur_tty();
+    int hidx = ty->histn;                                  /* == histn: a fresh (unsaved) line */
     for (;;) {
-        int key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
-        if (key < 0) { wm_pump(); power_poll(); idle_wait(); continue; }
-        if (wm_hotkey(key)) { wm_pump(); continue; }        /* F1/F2/log-scroll while shell owns stdin */
-        if (key == 3 && (g_tty.lflag & TTY_ISIG)) {         /* Ctrl-C: discard line, reprompt */
-            signal_pgrp(g_tty.fg_pgrp, 2);
+        int key;
+        if (pane_in_use()) key = pane_getkey();             /* router delivers this pane's keys */
+        else {
+            key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
+            if (key < 0) { wm_pump(); power_poll(); idle_wait(); continue; }
+            if (wm_hotkey(key)) { wm_pump(); continue; }    /* F1/F2/log-scroll while shell owns stdin */
+        }
+        if (key == 3 && (ty->lflag & TTY_ISIG)) {           /* Ctrl-C: discard line, reprompt */
+            signal_pgrp(ty->fg_pgrp, 2);
             tty_emit("\n", 1); out[0] = '\n'; return 1;
         }
         if (key == 4) { if (len == 0) return 0; continue; } /* Ctrl-D: EOF only on an empty line */
@@ -1781,13 +1823,13 @@ static int tty_read_line(char *out, int max) {
         if (key == KEY_UP || key == KEY_DOWN) {             /* history: replace the whole line */
             int ni = hidx + (key == KEY_UP ? -1 : 1);
             if (ni < 0) ni = 0;
-            if (ni > g_tty_histn) ni = g_tty_histn;
+            if (ni > ty->histn) ni = ty->histn;
             if (ni == hidx) continue;
             hidx = ni;
             tty_bs(pos); tty_emit("\x1b[K", 3);             /* cursor to start, clear to EOL */
             len = 0;
-            if (hidx < g_tty_histn)
-                while (g_tty_hist[hidx][len] && len < 255) { line[len] = g_tty_hist[hidx][len]; len++; }
+            if (hidx < ty->histn)
+                while (ty->hist[hidx][len] && len < 255) { line[len] = ty->hist[hidx][len]; len++; }
             tty_emit(line, len); pos = len;
             continue;
         }
@@ -1817,27 +1859,34 @@ static int tty_read_line(char *out, int max) {
 /* Shared keyboard reader for fd 0 and /dev/tty: raw keys in raw mode, else one
  * edited canonical line at a time (Tab completion + history live in the editor). */
 static int tty_stdin_read(void *buf, uint32_t len) {
-    if (!(g_tty.lflag & TTY_ICANON)) {             /* raw mode (vi etc.): keys as they arrive, no echo */
+    struct tty_state *ty = cur_tty();
+    if (!(ty->lflag & TTY_ICANON)) {               /* raw mode (vi etc.): keys as they arrive, no echo */
         char *out = (char *)buf; uint32_t count = 0;
         while (count < len) {
-            int key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
-            if (key < 0) { if (count) break; wm_pump(); power_poll(); idle_wait(); continue; }   /* block for the first byte */
-            if (wm_hotkey(key)) { wm_pump(); continue; }   /* F1/F2/log-scroll even in raw mode */
-            if (key == 3 && (g_tty.lflag & TTY_ISIG)) { signal_pgrp(g_tty.fg_pgrp, 2); break; }
+            int key;
+            if (pane_in_use()) { key = count ? pane_trykey() : pane_getkey(); if (key < 0) break; }
+            else {
+                key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
+                if (key < 0) { if (count) break; wm_pump(); power_poll(); idle_wait(); continue; }   /* block for the first byte */
+                if (wm_hotkey(key)) { wm_pump(); continue; }   /* F1/F2/log-scroll even in raw mode */
+            }
+            if (key == 3 && (ty->lflag & TTY_ISIG)) { signal_pgrp(ty->fg_pgrp, 2); break; }
             if (key > KEY_RIGHT) continue;         /* drop F-keys; keep arrows (0x80-0x83) */
             if (key == '\r') key = '\n';
             out[count++] = (char)key;
         }
         return (int)count;
     }
-    static char cook[256]; static int cook_len, cook_pos;   /* canonical cooked line */
-    if (cook_pos >= cook_len) {                    /* buffer drained: edit a fresh line */
-        cook_pos = 0;
-        cook_len = tty_read_line(cook, sizeof cook);
-        if (cook_len <= 0) { cook_len = 0; return 0; }   /* Ctrl-D EOF */
+    static char cook[TTY_SLOTS][256]; static int cook_len[TTY_SLOTS], cook_pos[TTY_SLOTS];  /* per-pane cooked line */
+    int pi = (pane_in_use() && current->pane >= 0 && current->pane < PANE_MAX) ? current->pane : PANE_MAX;
+    char *ck = cook[pi];
+    if (cook_pos[pi] >= cook_len[pi]) {             /* buffer drained: edit a fresh line */
+        cook_pos[pi] = 0;
+        cook_len[pi] = tty_read_line(ck, 256);
+        if (cook_len[pi] <= 0) { cook_len[pi] = 0; return 0; }   /* Ctrl-D EOF */
     }
     char *out = (char *)buf; uint32_t count = 0;
-    while (count < len && cook_pos < cook_len) out[count++] = cook[cook_pos++];
+    while (count < len && cook_pos[pi] < cook_len[pi]) out[count++] = ck[cook_pos[pi]++];
     return (int)count;
 }
 
@@ -2113,22 +2162,22 @@ static int linux_ioctl(int fd, uint64_t request, void *arg) {
         if (!arg) return -14;
         memset(arg, 0, 60);
         uint32_t *t = (uint32_t *)arg;      /* c_iflag,c_oflag,c_cflag,c_lflag */
-        t[0] = 0x0500; t[1] = 0x0005; t[2] = 0x00BF; t[3] = g_tty.lflag;
+        t[0] = 0x0500; t[1] = 0x0005; t[2] = 0x00BF; t[3] = cur_tty()->lflag;
         ((uint8_t *)arg)[17] = 3;           /* c_cc[VINTR] = Ctrl-C */
         ((uint8_t *)arg)[21] = 4;           /* c_cc[VEOF]  = Ctrl-D */
         return 0;
     }
     case 0x5402: case 0x5403: case 0x5404:  /* TCSETS / TCSETSW / TCSETSF */
         if (!arg) return -14;
-        g_tty.lflag = ((const uint32_t *)arg)[3];
+        cur_tty()->lflag = ((const uint32_t *)arg)[3];
         return 0;
     case 0x540F:                            /* TIOCGPGRP */
         if (!arg) return -14;
-        *(int *)arg = g_tty.fg_pgrp ? g_tty.fg_pgrp : (current->pgid ? current->pgid : current->pid);
+        *(int *)arg = cur_tty()->fg_pgrp ? cur_tty()->fg_pgrp : (current->pgid ? current->pgid : current->pid);
         return 0;
     case 0x5410:                            /* TIOCSPGRP */
         if (!arg) return -14;
-        g_tty.fg_pgrp = *(const int *)arg;
+        cur_tty()->fg_pgrp = *(const int *)arg;
         return 0;
     default:
         return -25;
@@ -2164,7 +2213,7 @@ static int linux_map_page(uint64_t va, uint64_t prot) {
     if (!pte || (*pte & PT_PA_MASK)) return -1;
     void *frame = page_alloc(1);
     if (!frame) return -1;
-    *pte = (uint64_t)frame | PTE_US | (prot ? PTE_P : 0) | ((prot & 2) ? PTE_RW : 0);
+    *pte = (uint64_t)frame | PTE_US | PTE_OWN | (prot ? PTE_P : 0) | ((prot & 2) ? PTE_RW : 0);
     return 0;
 }
 
@@ -2263,11 +2312,15 @@ static int64_t gfx_bo_create(uint32_t w, uint32_t h, void *user_desc) {
 
 static int64_t gfx_present(int handle, int x, int y) {
     if (handle < 0 || handle >= GFX_MAX_BO || !g_gfx[handle].bo) return -22;
+    wm_note_gfx_present();                            /* tell the compositor to stand down */
     tgl_bind(tgl_screen());                          /* composite BO -> back buffer -> display */
     tgl_compose(&g_gfx[handle].bo->surf, x, y);
     tgl_present();
-    int k = kbd64_getkey();
-    if (k < 0) k = hvkbd_getkey();
+    /* In split-pane mode the router owns the keyboard and delivers keys to this
+     * pane's ring; poll it (not the raw controller) so the app still gets input. */
+    int k;
+    if (pane_in_use()) k = pane_trykey();
+    else { k = kbd64_getkey(); if (k < 0) k = hvkbd_getkey(); }
     return k < 0 ? 0 : k;
 }
 
@@ -2395,7 +2448,7 @@ static uint64_t *linux_address_space(const uint64_t code_pte[LINUX_LOAD_PAGES],
         pd = copy_page_table(0);
         if (!pd) return 0;
         uint64_t gbase = old_pdpt[l3] & 0x000FFFFFC0000000ULL;
-        uint64_t gfl   = (old_pdpt[l3] & 0xFFFULL) | PTE_PS;
+        uint64_t gfl   = (old_pdpt[l3] & 0xFFFULL & ~(uint64_t)PTE_OWN) | PTE_PS;   /* never inherit OWN */
         for (int i = 0; i < 512; i++) pd[i] = (gbase + (uint64_t)i * 0x200000ULL) | gfl;
     } else {
         pd = copy_page_table((uint64_t *)(old_pdpt[l3] & PT_PA_MASK));
@@ -2409,7 +2462,7 @@ static uint64_t *linux_address_space(const uint64_t code_pte[LINUX_LOAD_PAGES],
     int code_index = (int)((LINUX_LOAD_VA >> 12) & 0x1FF);
     for (uint64_t i = 0; i < code_pages; i++) {
         if (code_pte[i])
-            code_pt[code_index + i] = (uint64_t)(code + i * 4096) | code_pte[i];
+            code_pt[code_index + i] = (uint64_t)(code + i * 4096) | code_pte[i] | PTE_OWN;
     }
 
     int s4 = (int)((LINUX_STK_TOP >> 39) & 0x1FF);
@@ -2426,7 +2479,7 @@ static uint64_t *linux_address_space(const uint64_t code_pte[LINUX_LOAD_PAGES],
     stack_pd[s2] = make_table_entry(stack_pt);
     int stack_index = (int)((LINUX_STK_TOP >> 12) & 0x1FF);
     for (int i = 0; i < USER_STK_PAGES; i++)
-        stack_pt[stack_index - 1 - i] = (uint64_t)(stk + (uint64_t)i * 4096) | PTE_P | PTE_RW | PTE_US;
+        stack_pt[stack_index - 1 - i] = (uint64_t)(stk + (uint64_t)i * 4096) | PTE_P | PTE_RW | PTE_US | PTE_OWN;
 
     pml4[(USER_CODE_VA >> 39) & 0x1FF] = 0;
     pml4[(LINUX_BRK_BASE >> 39) & 0x1FF] = 0;
@@ -2576,14 +2629,15 @@ static int run_linux_elf_frames(const uint8_t *img, uint64_t size,
         p->on_sched = 1;
         p->kstack_top = kstk + 16384;
         p->pgid = p->pid; p->sid = p->pid;     /* the launched job leads its own session */
-        int saved_fg = g_tty.fg_pgrp;
-        g_tty.fg_pgrp = p->pid;                /* it is the foreground job (Ctrl-C targets it) */
+        struct tty_state *ty = cur_tty();       /* caller's slot (current == parent here) */
+        int saved_fg = ty->fg_pgrp;
+        ty->fg_pgrp = p->pid;                  /* it is the foreground job (Ctrl-C targets it) */
         sched_init();
         usched_spawn_user(im.entry, im.rsp, kstk, 16384, 0, 0, (uint64_t)im.pml4, p);
         sched_start();
         sched_wait((volatile int *)&p->state, PROC_ZOMBIE, p->pid);
         sched_stop();
-        g_tty.fg_pgrp = saved_fg;
+        ty->fg_pgrp = saved_fg;
         current = parent;
         arch_set_syscall_stack((uint64_t)(g_ksys0 + sizeof(g_ksys0)));
         arch_set_tss_rsp0((uint64_t)(g_kstack0 + sizeof(g_kstack0)));
@@ -2957,6 +3011,12 @@ int arch_waitproc_test(void) {
 /* Deep-clone one paging level for fork(): private copies of every user (US) leaf
  * page, shared kernel pages/tables.  Large pages (PS) and kernel (non-US) leaves
  * are shared as-is; only user paths allocate.  level: 3=PDPT, 2=PD, 1=PT. */
+/* Deep-clone one paging level for fork(): private copies of every OWNED (PTE_OWN)
+ * leaf page and OWNED intermediate table; kernel-identity pages/tables — which
+ * carry PTE_US on real firmware but never PTE_OWN — are shared as-is.  Keying off
+ * PTE_OWN (not PTE_US) is essential: the retained identity map aliases the whole
+ * heap arena, and cloning it via US would explode memory and alias live frames.
+ * level: 3=PDPT, 2=PD, 1=PT. */
 static uint64_t clone_pt(uint64_t src_phys, int level) {
     uint64_t *src = (uint64_t *)src_phys;
     uint64_t *dst = (uint64_t *)page_alloc(1);
@@ -2965,15 +3025,15 @@ static uint64_t clone_pt(uint64_t src_phys, int level) {
         uint64_t e = src[i];
         if (!(e & PTE_P)) { dst[i] = 0; continue; }
         if (level == 1) {
-            if (e & PTE_US) {
+            if (e & PTE_OWN) {
                 uint8_t *f = (uint8_t *)page_alloc(1);
                 if (!f) { dst[i] = 0; continue; }
                 const uint8_t *s = (const uint8_t *)(e & PT_PA_MASK);
                 for (int b = 0; b < 4096; b++) f[b] = s[b];
                 dst[i] = (uint64_t)f | (e & 0xFFFULL);
-            } else dst[i] = e;                          /* share kernel page      */
-        } else if (e & PTE_PS) {
-            dst[i] = e;                                 /* share large kernel page */
+            } else dst[i] = e;                          /* share kernel/BO page   */
+        } else if ((e & PTE_PS) || !(e & PTE_OWN)) {
+            dst[i] = e;                                 /* share large/kernel table */
         } else {
             uint64_t sub = clone_pt(e & PT_PA_MASK, level - 1);
             if (!sub) { dst[i] = 0; continue; }
@@ -3001,44 +3061,33 @@ static uint64_t *fork_clone_as(uint64_t parent_pml4) {
     return dst;
 }
 
-/* Free a fully-private paging subtree (STK/BRK/MMAP regions never overlap the
- * shared kernel identity map): return every user leaf page AND intermediate
- * table to the allocator. */
+/* Reclaim a dead process's OWNED paging subtree: free every PTE_OWN leaf frame
+ * and every PTE_OWN intermediate table, then this table.  Entries without
+ * PTE_OWN are shared kernel-identity or BO mappings (which may carry PTE_US on
+ * real firmware) and are left untouched.  Safe to run even on the LOAD region,
+ * whose private PDPT/PD copies retain kernel sibling entries — those lack
+ * PTE_OWN so the walk never descends into or frees the shared kernel map. */
 static void free_pt(uint64_t phys, int level) {
     uint64_t *t = (uint64_t *)phys;
     for (int i = 0; i < 512; i++) {
         uint64_t e = t[i];
         if (!(e & PTE_P)) continue;
-        if (level == 1) { if (e & PTE_US) page_free((void *)(e & PT_PA_MASK), 1); }
-        else if (!(e & PTE_PS)) free_pt(e & PT_PA_MASK, level - 1);
+        if (level == 1) { if (e & PTE_OWN) page_free((void *)(e & PT_PA_MASK), 1); }
+        else if (!(e & PTE_PS) && (e & PTE_OWN)) free_pt(e & PT_PA_MASK, level - 1);
     }
     page_free((void *)phys, 1);
 }
 
-/* Free only the user leaf pages of a subtree, leaving tables in place — for the
- * LOAD region, whose tables interleave with the shared kernel identity map. */
-static void free_pt_pages(uint64_t phys, int level) {
-    uint64_t *t = (uint64_t *)phys;
-    for (int i = 0; i < 512; i++) {
-        uint64_t e = t[i];
-        if (!(e & PTE_P)) continue;
-        if (level == 1) { if (e & PTE_US) page_free((void *)(e & PT_PA_MASK), 1); }
-        else if (!(e & PTE_PS)) free_pt_pages(e & PT_PA_MASK, level - 1);
-    }
-}
-
-/* Reclaim a dead process's private frames: the STK/BRK/MMAP subtrees (pages +
- * tables), the LOAD region's code pages, and the PML4.  Shared kernel pages are
- * left untouched.  The AS must NOT be the active CR3. */
+/* Reclaim a dead process's private frames: the LOAD/STK/BRK/MMAP subtrees (owned
+ * leaf pages + owned tables) and the PML4.  Shared kernel pages and compositor BO
+ * frames (no PTE_OWN) are left untouched.  The AS must NOT be the active CR3. */
 static void free_user_pages(uint64_t *pml4) {
     if (!pml4) return;
-    const uint64_t priv_va[3] = { LINUX_STK_TOP, LINUX_BRK_BASE, LINUX_MMAP_BASE };
-    for (int k = 0; k < 3; k++) {
+    const uint64_t priv_va[4] = { LINUX_LOAD_VA, LINUX_STK_TOP, LINUX_BRK_BASE, LINUX_MMAP_BASE };
+    for (int k = 0; k < 4; k++) {
         int slot = (int)((priv_va[k] >> 39) & 0x1FF);
         if (pml4[slot] & PTE_P) { free_pt(pml4[slot] & PT_PA_MASK, 3); pml4[slot] = 0; }
     }
-    int lslot = (int)((LINUX_LOAD_VA >> 39) & 0x1FF);
-    if (pml4[lslot] & PTE_P) free_pt_pages(pml4[lslot] & PT_PA_MASK, 3);
     page_free(pml4, 1);
 }
 
@@ -3066,6 +3115,7 @@ static uint64_t do_linux_fork(void) {
     ch->sigrestorer = par->sigrestorer;
     for (int i = 0; i <= 64; i++) ch->sighandler[i] = par->sighandler[i];
     ch->pgid = par->pgid; ch->sid = par->sid;                        /* inherit process group/session */
+    ch->pane = par->pane;                                            /* run in the parent's pane */
     proc_set_name(ch, par->name);
     ch->kstack_top = ckstk + 16384;
     ch->state = PROC_RUNNING;
@@ -3333,6 +3383,193 @@ int arch_run_linux(const char *path, const char *arg) {
         while (*p && *p != ' ') p++;
     }
     return run_linux_path(path, g_ustk, g_ksys0 + sizeof(g_ksys0), &args, 1);
+}
+
+/* ================= terminal split panes (concurrent shells) ===============
+ * Up to 4 mbb shells run at once, each owning a pane.  The router (task 0, in
+ * arch_run_panes) reads the keyboard and delivers keys to the focused pane's
+ * ring; each shell's stdin read (pane_getkey) blocks on that ring, and its
+ * stdout (usys_write -> arch_cur_pane_term) lands in its own pane terminal.
+ * F5 = add a pane, F4 = cycle focus, exit/Ctrl-D closes a pane. */
+struct pane_ring { volatile int r, w; unsigned char b[128]; };
+static struct pane_ring g_pin[PANE_MAX];
+static struct proc     *g_pane_proc[PANE_MAX];
+static void            *g_pane_term[PANE_MAX];
+static int              g_pane_n, g_pane_focus;
+#define PANE_CHAN(i)    (0x50000000 + (i))
+
+void *term_make(void);                                 /* term64.c pane-terminal primitives */
+void  term_free(void *t);
+void  term_resize(void *t, int cols, int rows);
+void  term_draw_t(void *t, uint32_t *back, int cx, int cy, int cw, int ch, int focused);
+int   wm_ui_cell(void);
+int   wm_ui_lineh(void);
+void  wm_fill_rect(uint32_t *back, int x, int y, int w, int h, uint32_t rgb);
+
+int   arch_pane_count(void) { return g_pane_n; }
+void *arch_cur_pane_term(void) {
+    int i = (current && current->on_sched) ? current->pane : g_pane_focus;
+    if (i < 0 || i >= g_pane_n) i = (g_pane_focus >= 0 && g_pane_focus < g_pane_n) ? g_pane_focus : 0;
+    return (i >= 0 && i < g_pane_n) ? g_pane_term[i] : 0;
+}
+static void pane_push(int i, int k) {
+    if (i < 0 || i >= g_pane_n) return;
+    struct pane_ring *q = &g_pin[i];
+    int nw = (q->w + 1) & 127;
+    if (nw != q->r) { q->b[q->w] = (unsigned char)k; q->w = nw; }
+    sched_wake(PANE_CHAN(i));
+}
+static int pane_getkey(void) {
+    for (;;) {
+        int i = current ? current->pane : g_pane_focus;   /* re-read every iteration: a reap can */
+        if (i < 0 || i >= PANE_MAX) i = 0;                 /* renumber this shell to a new pane   */
+        struct pane_ring *q = &g_pin[i];
+        if (q->r != q->w) { int k = q->b[q->r]; q->r = (q->r + 1) & 127; return k; }
+        sched_block(PANE_CHAN(i));
+    }
+}
+static int pane_trykey(void) {
+    int i = current ? current->pane : g_pane_focus;
+    if (i < 0 || i >= PANE_MAX) i = 0;
+    struct pane_ring *q = &g_pin[i];
+    if (q->r == q->w) return -1;
+    int k = q->b[q->r]; q->r = (q->r + 1) & 127; return k;
+}
+static int pane_in_use(void) { return g_pane_n > 0 && current && current->on_sched; }
+
+static struct proc *spawn_pane_shell(const uint8_t *img, uint64_t size, int pane, struct proc *parent) {
+    uint8_t *ustk = (uint8_t *)page_alloc(USER_STK_PAGES);
+    if (!ustk) return 0;
+    static struct linux_exec_args a; a.argc = 1; a.envc = 0;
+    a.argv[0][0] = 's'; a.argv[0][1] = 'h'; a.argv[0][2] = 0;
+    struct linux_image im;
+    if (linux_load_image(img, size, ustk, &a, &im) < 0) { page_free(ustk, USER_STK_PAGES); return 0; }
+    struct proc *p = proc_alloc();
+    if (!p) { free_user_pages(im.pml4); page_free(ustk, USER_STK_PAGES); return 0; }
+    uint8_t *kstk = (uint8_t *)page_alloc(4);
+    if (!kstk) { proc_free(p); free_user_pages(im.pml4); page_free(ustk, USER_STK_PAGES); return 0; }
+    p->ppid = parent->pid; p->abi = USER_ABI_LINUX; p->code = im.code; p->stk = ustk;
+    p->kstack_top = kstk + 16384; p->vm.pml4 = im.pml4;
+    p->vm.brk = LINUX_BRK_BASE; p->vm.mmap_next = LINUX_MMAP_BASE;
+    proc_set_name(p, "sh"); p->state = PROC_RUNNING; p->on_sched = 1;
+    p->pane = pane; p->pgid = p->pid; p->sid = p->pid;
+    if (pane >= 0 && pane < PANE_MAX) {                 /* fresh line discipline for this pane */
+        g_ttys[pane].fg_pgrp = 0;
+        g_ttys[pane].lflag = TTY_DEFLFLAG;
+        g_ttys[pane].histn = 0;
+    }
+    usched_spawn_user(im.entry, im.rsp, kstk, 16384, 0, 0, (uint64_t)im.pml4, p);
+    return p;
+}
+static void reap_pane(int i) {
+    struct proc *p = g_pane_proc[i];
+    if (p) {
+        if (p->kstack_top) page_free((void *)(p->kstack_top - 16384), 4);
+        if (p->vm.pml4) { free_user_pages(p->vm.pml4); p->vm.pml4 = 0; }
+        proc_free(p);
+    }
+    if (g_pane_term[i]) term_free(g_pane_term[i]);
+    for (int j = i; j < g_pane_n - 1; j++) {           /* compact: shift the survivors down */
+        g_pane_term[j] = g_pane_term[j + 1];
+        g_pane_proc[j] = g_pane_proc[j + 1];
+        g_pin[j] = g_pin[j + 1];
+        g_ttys[j] = g_ttys[j + 1];                      /* move the shell's line discipline too */
+        if (g_pane_proc[j]) g_pane_proc[j]->pane = j;   /* renumber the shell to its new pane */
+    }
+    g_pane_n--;
+    if (g_pane_focus >= g_pane_n) g_pane_focus = g_pane_n > 0 ? g_pane_n - 1 : 0;
+    /* Wake EVERY pane channel, not just the survivors': a renumbered shell is
+     * still blocked on its old channel index and must re-run pane_getkey to pick
+     * up its new pane number (else it is orphaned and stops receiving keys). */
+    for (int j = 0; j < PANE_MAX; j++) sched_wake(PANE_CHAN(j));
+}
+
+/* Launch the split-pane shell system.  Runs as task 0 (the router) until every
+ * pane's shell has exited, then returns to the native console. */
+int arch_run_panes(void *pane0_term) {
+    char full[256]; fs_resolve("/MBB.BIN", full);
+    uint8_t attr; uint32_t cluster, size;
+    if (vfs_resolve(full, &attr, &cluster, &size) < 0 || (attr & 0x10) || !size) return -1;
+    uint8_t *img = (uint8_t *)kmalloc(size);
+    if (!img) return -1;
+    if (vfs_pread(full, img, size, 0) != (int)size) { kfree(img); return -1; }
+
+    struct proc *parent = current;
+    for (int i = 0; i < PANE_MAX; i++) { g_pin[i].r = g_pin[i].w = 0; g_pane_proc[i] = 0; g_pane_term[i] = 0; }
+    g_pane_term[0] = pane0_term; g_pane_n = 1; g_pane_focus = 0;
+
+    sched_init();
+    g_pane_proc[0] = spawn_pane_shell(img, size, 0, parent);
+    if (!g_pane_proc[0]) { g_pane_n = 0; kfree(img); return -1; }
+    sched_start();
+
+    while (g_pane_n > 0) {
+        int k = kbd64_getkey(); if (k < 0) k = hvkbd_getkey();
+        if (k >= 0) {
+            if (wm_is_sleeping()) wm_sleep_set(0);
+            else if (k == KEY_F5 && g_pane_n < PANE_MAX) {
+                void *t = term_make();
+                if (t) {
+                    int i = g_pane_n;
+                    g_pin[i].r = g_pin[i].w = 0; g_pane_term[i] = t;
+                    g_pane_proc[i] = spawn_pane_shell(img, size, i, parent);
+                    if (g_pane_proc[i]) { g_pane_n++; g_pane_focus = i; }
+                    else { term_free(t); g_pane_term[i] = 0; }
+                }
+                ui_note_activity();
+            }
+            else if (k == KEY_F4) { if (g_pane_n > 1) { g_pane_focus = (g_pane_focus + 1) % g_pane_n; ui_note_activity(); } }
+            else if (wm_hotkey(k)) { /* F1/F2/F3 window + sleep */ }
+            else pane_push(g_pane_focus, k);
+        }
+        wm_pump();
+        power_poll();
+        for (int i = 0; i < g_pane_n; i++)
+            if (g_pane_proc[i] && g_pane_proc[i]->state == PROC_ZOMBIE) { reap_pane(i); i--; }
+        idle_wait();
+    }
+    sched_stop();
+    current = parent;
+    arch_set_syscall_stack((uint64_t)(g_ksys0 + sizeof(g_ksys0)));
+    arch_set_tss_rsp0((uint64_t)(g_kstack0 + sizeof(g_kstack0)));
+    write_fs_base(parent->fs_base);
+    kfree(img);
+    return 0;
+}
+
+/* Render every pane into the terminal window's content rect: a 2-column grid
+ * filled left->right then top->bottom (last short row stretches).  Resizes each
+ * pane terminal to its cell and highlights the focused one. */
+void arch_panes_draw(uint32_t *back, int cx, int cy, int cw, int ch) {
+    int n = g_pane_n; if (n < 1) return;
+    int cols = (n == 1) ? 1 : 2;
+    int rows = (n + cols - 1) / cols;
+    int cell = wm_ui_cell(), lineh = wm_ui_lineh();
+    if (cell < 1) cell = 8;
+    if (lineh < 1) lineh = 16;
+    for (int i = 0; i < n; i++) {
+        int r = i / cols, c = i % cols;
+        int rown = (r == rows - 1) ? (n - r * cols) : cols;   /* panes in this (maybe short) row */
+        int pw = cw / rown, ph = ch / rows;
+        int px = cx + c * pw, py = cy + r * ph;
+        int foc = (i == g_pane_focus);
+        if (n > 1) {                                          /* frame each pane; focused = bright */
+            uint32_t bord = foc ? 0x33FF66 : 0x24506E;
+            int t = foc ? 2 : 1;                              /* thicker border on the focused pane */
+            wm_fill_rect(back, px, py, pw - 2, t, bord);              /* top    */
+            wm_fill_rect(back, px, py + ph - 2 - t, pw - 2, t, bord); /* bottom */
+            wm_fill_rect(back, px, py, t, ph - 2, bord);             /* left   */
+            wm_fill_rect(back, px + pw - 2 - t, py, t, ph - 2, bord); /* right  */
+        }
+        int inset = (n > 1) ? 5 : 0;
+        int ix = px + inset, iy = py + inset;
+        int gw = pw - 2 * inset - 2, gh = ph - 2 * inset - 2;
+        int tcols = gw / cell, trows = gh / lineh;
+        if (tcols < 4) tcols = 4;
+        if (trows < 2) trows = 2;
+        term_resize(g_pane_term[i], tcols, trows);
+        term_draw_t(g_pane_term[i], back, ix, iy, gw, gh, foc);
+    }
 }
 
 /* execve(59) in place for a scheduled process: load the new image, replace the

@@ -60,6 +60,12 @@ static void fill_rect(uint32_t *back, int x, int y, int w, int h, uint32_t rgb) 
     }
 }
 
+/* public wrapper so other modules (arch64 pane frames) can draw into the
+ * full-screen back buffer using the same clipped fill. */
+void wm_fill_rect(uint32_t *back, int x, int y, int w, int h, uint32_t rgb) {
+    fill_rect(back, x, y, w, h, rgb);
+}
+
 /* "label<decimal>" at (x,y), label dim-blue and value white */
 static void draw_kv(uint32_t *back, int x, int y, const char *label, uint32_t val) {
     fb_text_to_s(back, (uint32_t)x, (uint32_t)y, label, 0x99CCFF, CONTENT_BG, g_uisc);
@@ -381,6 +387,10 @@ void ui_note_activity(void) { g_ui_activity_ms = millis(); }
  * Any keypress or a lid-open transition wakes it. */
 static volatile int g_sleeping;
 int wm_is_sleeping(void) { return g_sleeping; }
+/* Timestamp of the last full-screen TinyGL present; while it is recent, wm_pump
+ * stands down so the compositor does not fight the app for the framebuffer. */
+static volatile uint64_t g_gfx_present_ms;
+void wm_note_gfx_present(void) { g_gfx_present_ms = millis(); }
 void wm_sleep_set(int on) {
     if (on == g_sleeping) return;
     g_sleeping = on ? 1 : 0;
@@ -422,6 +432,7 @@ void wm_pump(void) {
     static uint64_t idle_slot = (uint64_t)-1;
     if (!g_back || g_sleeping) return;                  /* asleep: hold the black screen */
     uint64_t t = millis();
+    if (t - g_gfx_present_ms < 600) return;             /* a fullscreen GL app owns the screen */
     if (t - pump_last < 33) return;                     /* 30 FPS hard cap */
     if (t - g_ui_activity_ms > 300) {                   /* idle: skip redundant blits */
         uint64_t slot = t / 500;                        /* cursor blink + clock tick */

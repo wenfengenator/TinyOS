@@ -96,26 +96,36 @@ static void t_clear(terminal_t *t) {
 }
 static void t_prompt(terminal_t *t) { t_puts(t, "> "); }
 
-/* Launch the musl mini-busybox interactive shell (/MBB.BIN sh) inside this
- * terminal.  mbb polls the keyboard itself (linux_read fd0) and pumps the
- * compositor, so the desktop stays live; its stdout is routed here via g_active.
- * Blocks until the user types 'exit'. */
+/* Launch the split-pane shell system inside this terminal (F5 adds panes, F4
+ * cycles focus).  Blocks until every pane's shell exits. */
 static void console_run_shell(terminal_t *t) {
     g_active = t;
-    int rc = arch_run_linux("/MBB.BIN", "sh");
+    int rc = arch_run_panes(t);
     g_active = 0;
     if (rc < 0) t_puts(t, "linux shell unavailable (/MBB.BIN missing)\n");
     else        t_puts(t, "\n[back at tinyos console - type 'sh' to re-enter the linux shell]\n");
 }
 
-/* desktop autostart hook (wm64.c): drop the terminal straight into the shell */
-void term_autostart_shell(void *user) { if (user) console_run_shell((terminal_t *)user); }
+/* desktop autostart hook (wm64.c): launch the split-pane shell system.  Pane 0
+ * uses this window terminal; F5 adds panes.  Returns when every shell exits. */
+void term_autostart_shell(void *user) {
+    if (!user) return;
+    terminal_t *t = (terminal_t *)user;
+    g_active = t;
+    int rc = arch_run_panes(user);
+    g_active = 0;
+    if (rc < 0) { t_puts(t, "linux shell unavailable (/MBB.BIN missing)\n"); t_prompt(t); }
+    else        { t_puts(t, "\n[all shells exited - type 'sh' to relaunch]\n"); t_prompt(t); }
+}
 
-/* ring-3 stdout sink (declared in arch64.h): user SYS_WRITE lands here */
+/* ring-3 stdout sink (declared in arch64.h): user SYS_WRITE lands here.  In pane
+ * mode it routes to the running shell's own pane terminal (current->pane). */
 void usys_write(const char *p, unsigned long n) {
     if (n) ui_note_activity();                 /* terminal output -> repaint at full rate */
-    if (g_active) for (unsigned long i = 0; i < n; i++) t_putc(g_active, p[i]);
-    else          for (unsigned long i = 0; i < n; i++) kputc((char)p[i]);
+    terminal_t *t = g_active;
+    if (arch_pane_count() > 0) t = (terminal_t *)arch_cur_pane_term();
+    if (t) for (unsigned long i = 0; i < n; i++) t_putc(t, p[i]);
+    else   for (unsigned long i = 0; i < n; i++) kputc((char)p[i]);
 }
 
 /* terminal control for full-screen ring-3 programs (SYS_CLEAR / SYS_GOTOXY) */
@@ -501,7 +511,9 @@ static void console_exec(terminal_t *t, char *line) {
 }
 
 /* ---- window manager callbacks ---- */
+static boot_info_t *g_tbi;                     /* remembered for term_make (pane terminals) */
 void *term_create(boot_info_t *bi, int cols, int rows) {
+    g_tbi = bi;
     if (cols < 1) cols = 1;
     if (rows < 1) rows = 1;
     terminal_t *t = (terminal_t *)kmalloc(sizeof(terminal_t));
@@ -537,22 +549,63 @@ void term_key(wm_window_t *win, int key) {
     /* arrows / F-keys reach here only when not consumed by the WM; ignore them */
 }
 
+void term_draw_t(void *t, uint32_t *back, int cx, int cy, int cw, int ch, int focused);
 void term_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw, int ch) {
+    if (arch_pane_count() > 0) { arch_panes_draw(back, cx, cy, cw, ch); return; }  /* split panes */
+    term_draw_t(win->user, back, cx, cy, cw, ch, 1);
+}
+
+/* ---- split-pane terminal primitives (used by arch64 arch_run_panes) ---- */
+void *term_make(void) {
+    terminal_t *t = (terminal_t *)kmalloc(sizeof(terminal_t));
+    if (!t) return 0;
+    t->bi = g_tbi; t->cols = 40; t->rows = 20;
+    t->grid = (char *)kmalloc((uint64_t)t->cols * t->rows);
+    if (!t->grid) { kfree(t); return 0; }
+    for (int i = 0; i < t->cols * t->rows; i++) t->grid[i] = ' ';
+    t->cx = t->cy = 0; t->llen = 0; t->esc = 0;
+    return t;
+}
+void term_free(void *tp) {
+    terminal_t *t = (terminal_t *)tp;
+    if (!t) return;
+    if (t->grid) kfree(t->grid);
+    kfree(t);
+}
+void term_resize(void *tp, int cols, int rows) {
+    terminal_t *t = (terminal_t *)tp;
+    if (!t || cols < 1 || rows < 1 || (t->cols == cols && t->rows == rows)) return;
+    char *ng = (char *)kmalloc((uint64_t)cols * rows);
+    if (!ng) return;
+    for (int i = 0; i < cols * rows; i++) ng[i] = ' ';
+    int cr = t->rows < rows ? t->rows : rows;      /* top-anchor: keep the top rows */
+    int cc = t->cols < cols ? t->cols : cols;
+    for (int r = 0; r < cr; r++)
+        for (int c = 0; c < cc; c++)
+            ng[r * cols + c] = t->grid[r * t->cols + c];
+    char *old = t->grid; t->grid = ng; kfree(old);
+    t->cols = cols; t->rows = rows;
+    if (t->cx >= cols) t->cx = cols - 1;
+    if (t->cy >= rows) t->cy = rows - 1;
+}
+
+/* Render one terminal grid into a rect; focused panes are bright, others dim. */
+void term_draw_t(void *tp, uint32_t *back, int cx, int cy, int cw, int ch, int focused) {
     (void)cw; (void)ch;
-    terminal_t *t = (terminal_t *)win->user;
+    terminal_t *t = (terminal_t *)tp;
     if (!t) return;
     int cell = wm_ui_cell(), sc = wm_ui_scale();
-    int lineh = wm_ui_lineh();               /* vertical row pitch (adds leading) */
+    int lineh = wm_ui_lineh();
+    uint32_t fg = focused ? 0x33FF66 : 0x2AD055;   /* unfocused: readable, just a touch dimmer */
     char rowbuf[256];
     for (int r = 0; r < t->rows; r++) {
         const char *g = &t->grid[r * t->cols];
         int last = -1;
         for (int c = 0; c < t->cols && c < 255; c++) { rowbuf[c] = g[c]; if (g[c] != ' ') last = c; }
-        if (last < 0) continue;                 /* blank row: content bg shows through */
+        if (last < 0) continue;
         rowbuf[last + 1] = 0;
-        fb_text_to_s(back, (uint32_t)cx, (uint32_t)(cy + r * lineh), rowbuf, 0x33FF66, 0x08111C, sc);
+        fb_text_to_s(back, (uint32_t)cx, (uint32_t)(cy + r * lineh), rowbuf, fg, 0x08111C, sc);
     }
-    /* blinking block cursor */
-    if ((millis() / 500) & 1)
+    if (focused && ((millis() / 500) & 1))
         fb_text_to_s(back, (uint32_t)(cx + t->cx * cell), (uint32_t)(cy + t->cy * lineh), "_", 0xFFFFFF, 0x08111C, sc);
 }

@@ -43,6 +43,7 @@ int         wm_focused_index(void);
 int         wm_ui_scale(void);          /* glyph magnification: 1 (low-res) or 2 */
 int         wm_ui_cell(void);           /* glyph cell size in px = 8 * wm_ui_scale */
 int         wm_ui_lineh(void);          /* text row pitch in px (cell + leading) */
+void        wm_fill_rect(uint32_t *back, int x, int y, int w, int h, uint32_t rgb);  /* clipped fill into back buffer */
 
 /* terminal widget (kernel/term64.c). */
 void *term_create(boot_info_t *bi, int cols, int rows);

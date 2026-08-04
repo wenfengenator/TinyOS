@@ -93,6 +93,8 @@ int kbd64_getkey(void) {
         case 0x3B: return KEY_F1;
         case 0x3C: return KEY_F2;
         case 0x3D: return KEY_F3;
+        case 0x3E: return KEY_F4;
+        case 0x3F: return KEY_F5;
     }
 
     char c = s_shift ? sc_shift[sc & 0x7F] : sc_ascii[sc & 0x7F];

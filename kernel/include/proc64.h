@@ -65,6 +65,7 @@ struct proc {
     uint8_t *code;                  /* loaded image frames (Linux ABI)*/
     uint8_t *stk;                   /* user stack frames              */
     uint8_t *kstack_top;            /* SYSCALL kernel stack top       */
+    int      pane;                  /* terminal split-pane index (0..3) this shell owns */
     char name[16];                  /* for `ps`                       */
 };
 
