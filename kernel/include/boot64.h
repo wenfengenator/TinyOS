@@ -42,6 +42,8 @@ typedef struct {
 #define KEY_F1    0x84
 #define KEY_F2    0x85
 #define KEY_F3    0x86
+#define KEY_F4    0x87
+#define KEY_F5    0x88
 #define KEY_ESC   0x1B
 
 /* ---- kernel console: serial (COM1) + GOP framebuffer (kernel/fb64.c) ---- */
@@ -156,9 +158,18 @@ void     cpu_idle_add_ms(uint64_t ms);         /* add halted time from a HLT out
 
 /* composite + present one desktop frame (kernel/wm64.c); used by blocking syscalls */
 void     wm_pump(void);
+/* A ring-3 graphics app (TinyGL) just presented a full-screen frame; the WM
+ * compositor stands down briefly so it does not overdraw the app's output with
+ * the desktop chrome / pane grid.  Called from gfx_present (kernel/arch64.c). */
+void     wm_note_gfx_present(void);
 /* Note UI activity (keypress / terminal output) so wm_pump repaints at 30 FPS
  * briefly, then drops to ~2 FPS when idle to save power. */
 void     ui_note_activity(void);
+/* terminal split panes: concurrent shells (kernel/arch64.c + kernel/term64.c) */
+int      arch_run_panes(void *pane0_term);     /* router loop; returns when all shells exit */
+int      arch_pane_count(void);                /* number of active panes (0 = native console) */
+void    *arch_cur_pane_term(void);             /* running shell's pane terminal (usys_write target) */
+void     arch_panes_draw(uint32_t *back, int cx, int cy, int cw, int ch);   /* render the pane grid */
 /* Low-power sleep: blank the panel + stop compositing (deep HLT idle) on lid
  * close, restore on lid open / keypress.  power_poll() samples the lid. */
 void     wm_sleep_set(int on);
