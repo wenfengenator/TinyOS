@@ -1,6 +1,6 @@
 # tinyos
 
-**Release: v1.0.0**
+**Release: v2.0.0**
 
 A teaching operating system built from scratch, in two editions that show its
 evolution:
@@ -126,6 +126,21 @@ application (`BOOTX64.EFI`). It boots on `qemu-system-x86_64` + OVMF and on
   that runs stock **musl** binaries and an **on-device TinyCC** — building
   ordinary/K&R C against the full musl standard-library headers, and
   recompiling itself.
+* **Concurrent processes** — real `fork`/`execve`/`wait4`, `pipe`, and signal
+  delivery, with a preemptive scheduler and **per-process frame reclamation**
+  (dead processes return their pages to the allocator).
+* **A tmux-style multi-pane terminal** — up to four **concurrent shells** in a
+  grid; **F5** splits a new pane, **F4** cycles focus. Each pane has its own
+  line discipline, history, and cursor, so you can edit in one pane while a
+  build runs in another.
+* **Power management for battery life** — an **HLT-based idle** (idle cores draw
+  ~0% instead of spinning), render-on-change compositing, a live **CPU %** meter,
+  and **sleep** (screen off + deep idle) on **F3**, **lid close**, or the
+  **power button**; a wake on lid-open or keypress.
+* **Runs on real hardware** — bring-up and stability hardening on a **ThinkPad
+  T440s** (Haswell): **AHCI** persistence at `/mnt`, **xHCI USB mass-storage**
+  read/write at `/usb` (the file bridge to the outside world), EC battery/AC
+  reporting, and a firmware-safe page-table teardown (see the release notes).
 
 ```bash
 make setup-tcc                # one-time: build musl + TinyCC from vendored source (third_party/)
@@ -154,11 +169,18 @@ sudo dd if=tinyos-usb.img of=/dev/sdX bs=4M conv=fsync status=progress   # ERASE
 
 A physical PC has no virtio-blk/StorVSC, so TinyOS runs **live from a RAM disk**
 embedded in the loader (the mbb shell + coreutils, local `git`, Tetris/2048, and
-the TinyGL demos). There is no on-disk persistence yet — that needs an AHCI/NVMe
-driver — and a **PS/2 or legacy-USB keyboard** is required (no USB-HID stack yet).
+the TinyGL demos). On machines with a **SATA (AHCI)** controller — e.g. the
+ThinkPad T440s — the internal disk is mounted read/write at **`/mnt`** and
+persists across reboots, and a plugged-in **USB stick** is mounted at **`/usb`**
+(xHCI mass-storage) as the bridge for moving files in and out. A **PS/2 or
+legacy-USB keyboard** is required (no USB-HID stack yet); NVMe-only laptops have
+no persistence path yet.
 
 Sign in as `root` / `root`. From the terminal, `./musl.bin`,
-`./tcc.bin file.c -o out.bin`, and `./out.bin` exercise the Linux-ABI path.
+`./tcc.bin file.c -o out.bin`, and `./out.bin` exercise the Linux-ABI path;
+`cp kr.c /usb/kr.c` copies a file out to the USB stick. Press **F5** to split
+the terminal into concurrent panes (**F4** to cycle focus), and **F3** (or close
+the lid) to sleep.
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 
 ## Layout
@@ -181,6 +203,7 @@ written for entry-level OS developers.
 
 Documentation map:
 
+* [`CHANGELOG.md`](CHANGELOG.md) — release notes per version (v2.0.0, v1.0.0).
 * [`docs/GUIDE.md`](docs/GUIDE.md) — beginner, concept-first walkthrough (32-bit).
 * [`docs/DESIGN.md`](docs/DESIGN.md) — architecture reference for the 32-bit kernel
   (memory map, boot flow, privilege model, `int 0x80` ABI, scheduler, emulator).
