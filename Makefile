@@ -334,7 +334,7 @@ $(BUILD)/httpd.elf: programs/httpd.c $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/https.elf: programs/https.c programs/tcc_include/tnet.h programs/tcc_include/ttls.h programs/tcc_include/tcrypto.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
-$(BUILD)/git.elf: programs/git.c programs/tcc_include/tnet.h programs/tcc_include/ttls.h programs/tcc_include/tcrypto.h programs/tcc_include/tgit.h programs/tcc_include/tinflate.h programs/tcc_include/tssh.h $(BUILD)/musl-gcc.specs
+$(BUILD)/git.elf: programs/git.c programs/tcc_include/tnet.h programs/tcc_include/ttls.h programs/tcc_include/tcrypto.h programs/tcc_include/tgit.h programs/tcc_include/tinflate.h programs/tcc_include/tdeflate.h programs/tcc_include/tssh.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/musl_probe.h: $(BUILD)/musl_probe.elf | $(BUILD)
 	$(PYTHON) -c "d=open('$<','rb').read(); open('$@','w').write('static const unsigned char musl_probe_elf[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
@@ -373,7 +373,7 @@ esp: $(BUILD)/BOOTX64.EFI
 # Persistent-disk staging root: disk/ plus /lib (crt, libc.a, libtcc1.a), the full
 # musl /include header tree, and a K&R sample so on-device `./tcc.bin a.c -o a.bin`
 # resolves the standard library through TCC's built-in search paths.
-$(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h programs/tcc_kr_demo.c programs/tcc_include/tinygl.h programs/tcc_include/taudio.h programs/audio_demo.c programs/tgl_demo.c programs/tgl3d_demo.c programs/tetris.c programs/2048.c programs/pacman.c programs/sudoku.c programs/snake.c programs/p15.c programs/reversi.c programs/vim.c programs/tcc_include/tnet.h programs/tcc_include/tcrypto.h programs/tcc_include/ttls.h programs/tcc_include/tinflate.h programs/tcc_include/tgit.h programs/tcc_include/tssh.h programs/wget.c programs/httpd.c programs/https.c programs/git.c $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
+$(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h programs/tcc_kr_demo.c programs/tcc_include/tinygl.h programs/tcc_include/taudio.h programs/audio_demo.c programs/tgl_demo.c programs/tgl3d_demo.c programs/tetris.c programs/2048.c programs/pacman.c programs/sudoku.c programs/snake.c programs/p15.c programs/reversi.c programs/vim.c programs/tcc_include/tnet.h programs/tcc_include/tcrypto.h programs/tcc_include/ttls.h programs/tcc_include/tinflate.h programs/tcc_include/tdeflate.h programs/tcc_include/tgit.h programs/tcc_include/tssh.h programs/wget.c programs/httpd.c programs/https.c programs/git.c $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
 	rm -rf $(BUILD)/fsroot
 	mkdir -p $(BUILD)/fsroot/lib $(BUILD)/fsroot/include
 	cp -r disk/. $(BUILD)/fsroot/
@@ -385,6 +385,7 @@ $(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h p
 	cp programs/tcc_include/tcrypto.h $(BUILD)/fsroot/include/tcrypto.h
 	cp programs/tcc_include/ttls.h $(BUILD)/fsroot/include/ttls.h
 	cp programs/tcc_include/tinflate.h $(BUILD)/fsroot/include/tinflate.h
+	cp programs/tcc_include/tdeflate.h $(BUILD)/fsroot/include/tdeflate.h
 	cp programs/tcc_include/tgit.h $(BUILD)/fsroot/include/tgit.h
 	cp programs/tcc_include/tssh.h $(BUILD)/fsroot/include/tssh.h
 	cp programs/tcc_kr_demo.c $(BUILD)/fsroot/kr.c
