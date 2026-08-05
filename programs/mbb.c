@@ -467,15 +467,15 @@ static int ap_expr(int argc, char **argv) {
  * Normal: h j k l / arrows move; 0 $ line ends; i a A insert; o open; x del;
  * dd del line; : ex (:w :q :wq :x :q!).  Insert: type, Tab, Enter, Backspace,
  * arrows, ESC.  Line-number gutter + long-line wrapping like the native vi. */
-#define VI_MAXL 512
-#define VI_MAXC 200
-#define VI_GUT  4
+#define VI_MAXL (512 * 3)
+#define VI_MAXC (200 * 2)
+#define VI_GUT  5
 #define VK_UP 0x80
 #define VK_DOWN 0x81
 #define VK_LEFT 0x82
 #define VK_RIGHT 0x83
 static char vbuf[VI_MAXL][VI_MAXC + 2];
-static int  vlen[VI_MAXL], vnl, vcx, vcy, vtop, vVH = 23, vVW = 76, vdirty;
+static int  vlen[VI_MAXL], vnl, vcx, vcy, vtop, vVH = 23, vVW = 75, vdirty;
 static char vfname[128];
 
 static void vout(const char *s) { int n = 0; while (s[n]) n++; if (n) write(1, s, n); }
@@ -553,10 +553,11 @@ static void vi_redraw(const char *status) {
         for (int k = 0; k < rows && r < vVH; k++, r++) {
             char num[VI_GUT];
             if (k == 0) { int ln = i + 1;
-                num[0] = (ln >= 100) ? (char)('0' + (ln / 100) % 10) : ' ';
-                num[1] = (ln >= 10)  ? (char)('0' + (ln / 10) % 10)  : ' ';
-                num[2] = (char)('0' + ln % 10); num[3] = ' ';
-            } else { num[0] = num[1] = num[2] = num[3] = ' '; }
+                num[0] = (ln >= 1000) ? (char)('0' + (ln / 1000) % 10) : ' ';
+                num[1] = (ln >= 100)  ? (char)('0' + (ln / 100) % 10)  : ' ';
+                num[2] = (ln >= 10)   ? (char)('0' + (ln / 10) % 10)   : ' ';
+                num[3] = (char)('0' + ln % 10); num[4] = ' ';
+            } else { num[0] = num[1] = num[2] = num[3] = num[4] = ' '; }
             vxy(r + 1, 1); write(1, num, VI_GUT);
             int start = k * vVW, n = vlen[i] - start; if (n > vVW) n = vVW;
             if (n > 0) write(1, vbuf[i] + start, n);
@@ -581,7 +582,7 @@ static int ap_vi(int argc, char **argv) {
     raw.c_lflag &= ~(ICANON | ECHO | ISIG);
     tcsetattr(0, TCSANOW, &raw);
 
-    int ins = 0, run = 1;
+    int ins = 0, run = 1, count = 0;           /* count = pending numeric prefix, e.g. 10G */
     while (run) {
         char st[128]; int p = 0;               /* status line (native-style) */
         if (ins) { const char *m = "-- INSERT --  (ESC=normal)"; while (*m && p < 127) st[p++] = *m++; }
@@ -606,12 +607,16 @@ static int ap_vi(int argc, char **argv) {
             else if (c == '\t') { int n = 4 - (vcx & 3); while (n-- > 0) vi_ins(' '); }
             else if (c >= 32 && c < 127) vi_ins((char)c);
         } else {                               /* ---- NORMAL ---- */
+            if ((c >= '1' && c <= '9') || (c == '0' && count > 0)) { count = count * 10 + (c - '0'); continue; }
+            int cnt = count; count = 0;        /* consume any pending [count] for this command */
             if (c == 'h' || c == VK_LEFT) { if (vcx > 0) vcx--; }
             else if (c == 'l' || c == VK_RIGHT) { if (vcx < vlen[vcy]) vcx++; }
             else if (c == 'j' || c == VK_DOWN) { if (vcy < vnl - 1) { vcy++; if (vcx > vlen[vcy]) vcx = vlen[vcy]; } }
             else if (c == 'k' || c == VK_UP) { if (vcy > 0) { vcy--; if (vcx > vlen[vcy]) vcx = vlen[vcy]; } }
             else if (c == '0') vcx = 0;
             else if (c == '$') vcx = vlen[vcy] ? vlen[vcy] - 1 : 0;
+            else if (c == 'G') { vcy = cnt > 0 ? cnt - 1 : vnl - 1; if (vcy >= vnl) vcy = vnl - 1; if (vcy < 0) vcy = 0; vcx = 0; }
+            else if (c == 'g') { char g2; if (read(0, &g2, 1) > 0 && g2 == 'g') { vcy = cnt > 0 ? cnt - 1 : 0; if (vcy >= vnl) vcy = vnl - 1; if (vcy < 0) vcy = 0; vcx = 0; } }
             else if (c == 'i') ins = 1;
             else if (c == 'a') { if (vcx < vlen[vcy]) vcx++; ins = 1; }
             else if (c == 'A') { vcx = vlen[vcy]; ins = 1; }
