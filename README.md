@@ -168,7 +168,7 @@ sudo dd if=tinyos-usb.img of=/dev/sdX bs=4M conv=fsync status=progress   # ERASE
 ```
 
 A physical PC has no virtio-blk/StorVSC, so TinyOS runs **live from a RAM disk**
-embedded in the loader (the mbb shell + coreutils, local `git`, Tetris/2048, and
+embedded in the loader (the mbb shell + coreutils, local `git`, Tetris/2048/Pac-Man/Sudoku/Snake/15-Puzzle/Reversi, and
 the TinyGL demos). On machines with a **SATA (AHCI)** controller — e.g. the
 ThinkPad T440s — the internal disk is mounted read/write at **`/mnt`** and
 persists across reboots, and a plugged-in **USB stick** is mounted at **`/usb`**
