@@ -9,6 +9,7 @@
  *
  * Controls: arrows / W A S D move, P pause, R restart, Q or Esc quit. */
 #include <tinygl.h>
+#include <taudio.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -90,6 +91,7 @@ static Ghost gh[4];
 static int   px, py, pdir, pwant;
 static int   score, lives, level, over, paused, frame;
 static int   fright, ghost_pts, ready, mode_timer, scatter;
+static int   sound, pellet_note;
 static unsigned long rng;
 
 static const int GSC[4]  = { 13, 13, 11, 16 };
@@ -114,6 +116,13 @@ static int num(char *b, long v) {
 }
 static int rev(int d) { return (d + 2) & 3; }
 static int isqrt(int v) { if (v < 0) return 0; int x = 0; while ((x + 1) * (x + 1) <= v) x++; return x; }
+static void sfx(int hz, int ms, int volume) { if (sound) taudio_tone(hz, ms, volume); }
+static void sfx_death(void) {
+    sfx(440, 45, 65); sfx(330, 45, 65); sfx(220, 70, 70);
+}
+static void sfx_level(void) {
+    sfx(523, 35, 55); sfx(659, 35, 55); sfx(784, 55, 60);
+}
 
 /* 8x8 font scaled by `sc` (built on the tinygl.h glyph table). */
 static void text_s(tgl_t *g, int x, int y, const char *s, uint32_t c, int sc) {
@@ -244,13 +253,15 @@ static void update_ghost(int i) {
 static void start_fright(void) {
     fright = FRIGHT_FR; ghost_pts = 200;
     for (int i = 0; i < 4; i++) if (gh[i].state != GEATEN) { gh[i].state = GFRIGHT; gh[i].dir = rev(gh[i].dir); }
+    sfx(180, 65, 70);
 }
 
 static void update_pac(void) {
     if (px % CELL == 0 && py % CELL == 0) {
         int tc = px / CELL, tr = py / CELL;
         char *ch = &maze[tr][tc];
-        if (*ch == '.') { *ch = ' '; score += 10; pellets--; }
+        if (*ch == '.') { *ch = ' '; score += 10; pellets--;
+            sfx(pellet_note ? 980 : 820, 6, 24); pellet_note = !pellet_note; }
         else if (*ch == 'o') { *ch = ' '; score += 50; pellets--; start_fright(); }
         if (!blocked(tr, tc, pwant, 0)) pdir = pwant;
         if (blocked(tr, tc, pdir, 0)) return;
@@ -275,6 +286,7 @@ static void load_maze(void) {
         char ch = MAZE0[r][c]; maze[r][c] = ch; if (ch == '.' || ch == 'o') pellets++; } maze[r][COLS] = 0; }
 }
 static void die(void) {
+    sfx_death();
     lives--; fright = 0;
     if (lives < 0) { over = 1; return; }
     reset_positions(); ready = READY_FR;
@@ -283,7 +295,7 @@ static void collisions(void) {
     for (int i = 0; i < 4; i++) {
         int dx = px - gh[i].x, dy = py - gh[i].y;
         if (dx * dx + dy * dy < CELL * CELL / 2) {
-            if (gh[i].state == GFRIGHT) { score += ghost_pts; ghost_pts *= 2; gh[i].state = GEATEN; }
+            if (gh[i].state == GFRIGHT) { score += ghost_pts; ghost_pts *= 2; gh[i].state = GEATEN; sfx(1320, 55, 70); }
             else if (gh[i].state == GNORMAL) { die(); return; }
         }
     }
@@ -331,6 +343,7 @@ int main(void) {
     tgl_t g;
     if (tgl_open(&g, w, h) != 0) { static const char *e = "pacman: no display\n"; write(2, e, 19); return 1; }
     int ox = (sw - g.w) / 2, oy = (sh - g.h) / 2; if (ox < 0) ox = 0; if (oy < 0) oy = 0;
+    sound = taudio_ready();
     new_game();
     for (;;) {
         draw(&g);
@@ -353,7 +366,7 @@ int main(void) {
                     if (fright > 0) { if (--fright == 0) for (int i = 0; i < 4; i++) if (gh[i].state == GFRIGHT) gh[i].state = GNORMAL; }
                     else if (--mode_timer <= 0) { scatter = !scatter; mode_timer = scatter ? SCATTER_FR : CHASE_FR;
                         for (int i = 0; i < 4; i++) if (gh[i].state == GNORMAL) gh[i].dir = rev(gh[i].dir); }
-                    if (pellets == 0) { level++; load_maze(); reset_positions(); ready = READY_FR; }
+                    if (pellets == 0) { sfx_level(); level++; load_maze(); reset_positions(); ready = READY_FR; }
                 }
             }
         }

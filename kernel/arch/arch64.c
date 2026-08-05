@@ -121,6 +121,12 @@ static int          g_next_pid;
 #define TGL_SYS_BO_CREATE  0x54474C01ULL
 #define TGL_SYS_PRESENT    0x54474C02ULL
 #define TGL_SYS_BO_DESTROY 0x54474C03ULL
+#define AUD_SYS_INFO       0x41554400ULL      /* 'AUD': query HDA availability */
+#define AUD_SYS_PLAY       0x41554401ULL      /* play 48kHz S16 stereo PCM */
+#define AUD_SYS_TONE       0x41554402ULL      /* generated game tone */
+#define AUD_SYS_STOP       0x41554403ULL
+#define AUD_SYS_DIAG       0x41554404ULL      /* copy hda_diag_t */
+#define AUD_SYS_VOLUME     0x41554405ULL      /* a0=0..100 set, negative=query */
 #define NET_SYS_RESOLVE    0x4E455400ULL      /* 'NET': userspace DNS resolve */
 #define NET_SYS_PING       0x4E455401ULL      /* 'NET'+1: userspace ICMP echo */
 #define NET_SYS_IFCONFIG   0x4E455402ULL      /* 'NET'+2: userspace interface config */
@@ -807,6 +813,18 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
             return (uint64_t)gfx_present((int)a0, (int)a1, (int)a2);
         case TGL_SYS_BO_DESTROY:            /* TinyGL: free a buffer       */
             return (uint64_t)gfx_bo_destroy((int)a0);
+        case AUD_SYS_INFO:                  /* Intel HDA availability       */
+            return (uint64_t)hda_init();
+        case AUD_SYS_PLAY:                  /* a0=S16 stereo, a1=frames     */
+            return (uint64_t)(int64_t)hda_play((const int16_t *)a0, (uint32_t)a1);
+        case AUD_SYS_TONE:                  /* Hz, milliseconds, volume %   */
+            return (uint64_t)(int64_t)hda_tone((uint32_t)a0, (uint32_t)a1, (uint32_t)a2);
+        case AUD_SYS_STOP:
+            hda_stop(); return 0;
+        case AUD_SYS_DIAG:
+            return (uint64_t)(int64_t)hda_get_diag((hda_diag_t *)a0);
+        case AUD_SYS_VOLUME:
+            return (uint64_t)(int64_t)((int64_t)a0 < 0 ? hda_get_volume() : hda_set_volume((int)a0));
         case 13:                            /* rt_sigaction               */
             return (uint64_t)(int64_t)linux_rt_sigaction((int)a0, (const void *)a1, (void *)a2, a3);
         case 15:                            /* rt_sigreturn               */

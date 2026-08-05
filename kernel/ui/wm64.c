@@ -174,6 +174,31 @@ static const char *volt_text(char *b) {
     return b;
 }
 
+static const char *audio_text(char *b) {
+    hda_diag_t d;
+    if (hda_get_diag(&d) > 0) {
+        int n = 0;
+        const char *s = "READY C"; while (*s) b[n++] = *s++;
+        if (d.codec >= 10) b[n++] = (char)('0' + d.codec / 10);
+        b[n++] = (char)('0' + d.codec % 10); b[n++] = ' '; b[n++] = 'P';
+        if (d.pin >= 10) b[n++] = (char)('0' + d.pin / 10);
+        b[n++] = (char)('0' + d.pin % 10); b[n++] = ' '; b[n++] = 'V';
+        if (d.volume >= 100) b[n++] = '1';
+        if (d.volume >= 10) b[n++] = (char)('0' + (d.volume / 10) % 10);
+        b[n++] = (char)('0' + d.volume % 10); b[n] = 0;
+        return b;
+    }
+    const char *s = d.stage == 0 ? "NOT PROBED" :
+                    d.stage == 1 ? "NO PCI" :
+                    d.stage == 2 ? "BAD BAR" :
+                    d.stage == 3 ? "RESET LOW" :
+                    d.stage == 4 ? "RESET HIGH" :
+                    d.stage == 5 && !d.codecs ? "NO CODEC" :
+                    d.stage == 5 ? "NO ANALOG" : "NO DMA";
+    int n = 0; while (*s) b[n++] = *s++; b[n] = 0;
+    return b;
+}
+
 /* CPU-busy % over the last ~second, derived from the accumulated HLT-idle time
  * (kernel/arch64.c).  Recomputed twice a second; 0 % at an idle shell prompt. */
 static uint32_t cpu_busy_pct(void) {
@@ -207,6 +232,7 @@ static void sysmon_draw(wm_window_t *win, uint32_t *back, int cx, int cy, int cw
     draw_kv(back, cx, y, "TSC MHZ  ", (uint32_t)(tsc_freq_hz() / 1000000));         y += g_lineh;
     draw_kv(back, cx, y, "HV STAGE ", (uint32_t)hvkbd_stage());                    y += g_lineh;
     draw_kv(back, cx, y, "NET STG  ", (uint32_t)netvsc_stage());                   y += g_lineh;
+    { char b[20]; draw_str(back, cx, y, "AUDIO    ", audio_text(b)); }             y += g_lineh;
     draw_res(back, cx, y, g_scr_w, g_scr_h);                                       y += g_lineh;
     draw_kv(back, cx, y, "GOP MODES", g_bi ? g_bi->gop_modes : 0);                 y += g_lineh;
     batt_refresh();

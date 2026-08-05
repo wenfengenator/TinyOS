@@ -81,6 +81,7 @@ void kmain64(boot_info_t *bi) {
     hvkbd_init();
     acpi_init(bi->rsdp);          /* FADT/ECDT/DSDT: poweroff + EC battery state */
     ahci_init();                  /* AHCI/SATA disk (read-only until the installer) */
+    if (!hda_init()) kputs("[hda] no supported analog output\n");
 
     kputs("[tinyos64] TinyOS v" TINYOS_VERSION " - TINYOS X64 UEFI BOOT OK\n");
     arch_user_init();
