@@ -17,10 +17,13 @@ typedef struct {
     boot_info_t *bi;
     int   cols, rows;
     char *grid;            /* cols*rows cells, space-filled                    */
+    uint32_t *fg, *bg;     /* per-cell ANSI colors                             */
     int   cx, cy;          /* cursor cell                                      */
     char  line[256];       /* current input line                               */
     int   llen;
-    int   esc, esc_arg, esc_arg2, esc_semi;    /* ANSI escape state (CSI + up to 2 args) */
+    int   esc, esc_args[8], esc_narg, esc_private;
+    uint32_t cur_fg, cur_bg;
+    int   bold, reverse, cursor_visible;
 } terminal_t;
 
 /* terminal whose console is currently running a ring-3 program; its stdout
@@ -38,46 +41,96 @@ static int  t_ieq(const char *a, const char *b) {
 }
 
 /* ---- grid output ---- */
+static const uint32_t ansi16[16] = {
+    0x000000, 0xAA0000, 0x00AA00, 0xAA5500, 0x0000AA, 0xAA00AA, 0x00AAAA, 0xAAAAAA,
+    0x555555, 0xFF5555, 0x55FF55, 0xFFFF55, 0x5555FF, 0xFF55FF, 0x55FFFF, 0xFFFFFF
+};
+static uint32_t ansi256(int n) {
+    if (n < 0) n = 0;
+    if (n > 255) n = 255;
+    if (n < 16) return ansi16[n];
+    if (n < 232) {
+        int q = n - 16, b = q % 6, g = (q / 6) % 6, r = q / 36;
+        r = r ? 55 + r * 40 : 0; g = g ? 55 + g * 40 : 0; b = b ? 55 + b * 40 : 0;
+        return (uint32_t)((r << 16) | (g << 8) | b);
+    }
+    int v = 8 + (n - 232) * 10; return (uint32_t)((v << 16) | (v << 8) | v);
+}
+static void t_reset_style(terminal_t *t) {
+    t->cur_fg = 0x33FF66; t->cur_bg = 0x08111C; t->bold = t->reverse = 0;
+}
+static void t_blank(terminal_t *t, int i) {
+    t->grid[i] = ' '; t->fg[i] = t->cur_fg; t->bg[i] = t->cur_bg;
+}
+static void t_sgr(terminal_t *t) {
+    if (t->esc_narg == 0) { t_reset_style(t); return; }
+    for (int i = 0; i < t->esc_narg; i++) {
+        int a = t->esc_args[i];
+        if (a == 0) t_reset_style(t);
+        else if (a == 1) t->bold = 1;
+        else if (a == 22) t->bold = 0;
+        else if (a == 7) t->reverse = 1;
+        else if (a == 27) t->reverse = 0;
+        else if (a == 39) t->cur_fg = 0x33FF66;
+        else if (a == 49) t->cur_bg = 0x08111C;
+        else if (a >= 30 && a <= 37) t->cur_fg = ansi16[a - 30];
+        else if (a >= 40 && a <= 47) t->cur_bg = ansi16[a - 40];
+        else if (a >= 90 && a <= 97) t->cur_fg = ansi16[a - 90 + 8];
+        else if (a >= 100 && a <= 107) t->cur_bg = ansi16[a - 100 + 8];
+        else if ((a == 38 || a == 48) && i + 2 < t->esc_narg && t->esc_args[i + 1] == 5) {
+            uint32_t color = ansi256(t->esc_args[i + 2]);
+            if (a == 38) t->cur_fg = color; else t->cur_bg = color;
+            i += 2;
+        }
+    }
+}
 static void t_scroll(terminal_t *t) {
-    for (int r = 1; r < t->rows; r++)
-        for (int c = 0; c < t->cols; c++)
-            t->grid[(r - 1) * t->cols + c] = t->grid[r * t->cols + c];
-    for (int c = 0; c < t->cols; c++) t->grid[(t->rows - 1) * t->cols + c] = ' ';
+    for (int r = 1; r < t->rows; r++) for (int c = 0; c < t->cols; c++) {
+        int dst = (r - 1) * t->cols + c, src = r * t->cols + c;
+        t->grid[dst] = t->grid[src]; t->fg[dst] = t->fg[src]; t->bg[dst] = t->bg[src];
+    }
+    for (int c = 0; c < t->cols; c++) t_blank(t, (t->rows - 1) * t->cols + c);
     t->cy = t->rows - 1;
 }
 static void t_newline(terminal_t *t) { t->cx = 0; t->cy++; if (t->cy >= t->rows) t_scroll(t); }
 static void t_putc(terminal_t *t, char c) {
     if (t->esc == 1) {                          /* just saw ESC */
-        if (c == '[') { t->esc = 2; t->esc_arg = 0; t->esc_arg2 = 0; t->esc_semi = 0; } else t->esc = 0;
+        if (c == '[') { t->esc = 2; t->esc_narg = 0; t->esc_private = 0; for (int i = 0; i < 8; i++) t->esc_args[i] = 0; } else t->esc = 0;
         return;
     }
-    if (t->esc == 2) {                          /* CSI: ESC [ <n>[;<n>] <cmd> */
-        if (c >= '0' && c <= '9') { t->esc_arg = t->esc_arg * 10 + (c - '0'); return; }
-        if (c == ';') { t->esc_arg2 = t->esc_arg; t->esc_arg = 0; t->esc_semi = 1; return; }
-        int n = t->esc_arg ? t->esc_arg : 1; t->esc = 0;
-        if (c == 'D') { t->cx -= n; if (t->cx < 0) t->cx = 0; }                        /* left  */
+    if (t->esc == 2) {                          /* CSI: ESC [ args command */
+        if (c == '?' && t->esc_narg == 0) { t->esc_private = 1; return; }
+        if (c >= '0' && c <= '9') { if (t->esc_narg == 0) t->esc_narg = 1; t->esc_args[t->esc_narg - 1] = t->esc_args[t->esc_narg - 1] * 10 + (c - '0'); return; }
+        if (c == ';') { if (t->esc_narg == 0) t->esc_narg = 1; if (t->esc_narg < 8) t->esc_narg++; return; }
+        int n = (t->esc_narg && t->esc_args[t->esc_narg - 1]) ? t->esc_args[t->esc_narg - 1] : 1; t->esc = 0;
+        if (t->esc_private) { if (n == 25 && c == 'h') t->cursor_visible = 1; else if (n == 25 && c == 'l') t->cursor_visible = 0; }
+        else if (c == 'D') { t->cx -= n; if (t->cx < 0) t->cx = 0; }                   /* left  */
         else if (c == 'C') { t->cx += n; if (t->cx >= t->cols) t->cx = t->cols - 1; }  /* right */
-        else if (c == 'K') { for (int x = t->cx; x < t->cols; x++) t->grid[t->cy * t->cols + x] = ' '; }
+        else if (c == 'K') { for (int x = t->cx; x < t->cols; x++) t_blank(t, t->cy * t->cols + x); }
         else if (c == 'H' || c == 'f') {        /* cursor to (row;col), 1-based */
-            int row = t->esc_semi ? (t->esc_arg2 ? t->esc_arg2 : 1) : (t->esc_arg ? t->esc_arg : 1);
-            int col = t->esc_semi ? (t->esc_arg ? t->esc_arg : 1) : 1;
+            int row = t->esc_narg > 0 && t->esc_args[0] ? t->esc_args[0] : 1;
+            int col = t->esc_narg > 1 && t->esc_args[1] ? t->esc_args[1] : 1;
             t->cy = row - 1; if (t->cy < 0) t->cy = 0; if (t->cy >= t->rows) t->cy = t->rows - 1;
             t->cx = col - 1; if (t->cx < 0) t->cx = 0; if (t->cx >= t->cols) t->cx = t->cols - 1;
         }
         else if (c == 'J') {                    /* 2 = whole screen, else cursor->end */
             int end = t->cols * t->rows;
-            if (t->esc_arg == 2) { for (int i = 0; i < end; i++) t->grid[i] = ' '; t->cx = t->cy = 0; }
-            else { for (int i = t->cy * t->cols + t->cx; i < end; i++) t->grid[i] = ' '; }
+            if (t->esc_narg && t->esc_args[0] == 2) { for (int i = 0; i < end; i++) t_blank(t, i); t->cx = t->cy = 0; }
+            else { for (int i = t->cy * t->cols + t->cx; i < end; i++) t_blank(t, i); }
         }
+        else if (c == 'm') t_sgr(t);
         return;
     }
     if (c == 0x1b) { t->esc = 1; return; }      /* ESC begins an escape sequence */
     if (c == '\n') { t_newline(t); return; }
     if (c == '\r') { t->cx = 0; return; }
     if (c == '\t') { int n = 4 - (t->cx & 3); while (n--) t_putc(t, ' '); return; }
-    if (c == '\b') { if (t->cx > 0) { t->cx--; t->grid[t->cy * t->cols + t->cx] = ' '; } return; }
+    if (c == '\b') { if (t->cx > 0) { t->cx--; t_blank(t, t->cy * t->cols + t->cx); } return; }
     if (t->cx >= t->cols) t_newline(t);
-    t->grid[t->cy * t->cols + t->cx] = c; t->cx++;
+    int i = t->cy * t->cols + t->cx;
+    t->grid[i] = c; t->fg[i] = t->reverse ? t->cur_bg : t->cur_fg; t->bg[i] = t->reverse ? t->cur_fg : t->cur_bg;
+    if (t->bold) { uint32_t fg = t->fg[i]; t->fg[i] = fg | ((fg & 0x7F7F7F) << 1); }
+    t->cx++;
 }
 static void t_puts(terminal_t *t, const char *s) { for (; *s; s++) t_putc(t, *s); }
 static void t_u32(terminal_t *t, uint32_t v) {
@@ -91,7 +144,7 @@ static void t_u64hex(terminal_t *t, uint64_t v) {
     for (int i = 60; i >= 0; i -= 4) { int d = (int)((v >> i) & 0xF); t_putc(t, (char)(d < 10 ? '0' + d : 'A' + d - 10)); }
 }
 static void t_clear(terminal_t *t) {
-    for (int i = 0; i < t->cols * t->rows; i++) t->grid[i] = ' ';
+    for (int i = 0; i < t->cols * t->rows; i++) t_blank(t, i);
     t->cx = t->cy = 0;
 }
 static void t_prompt(terminal_t *t) { t_puts(t, "> "); }
@@ -520,9 +573,11 @@ void *term_create(boot_info_t *bi, int cols, int rows) {
     if (!t) return 0;
     t->bi = bi; t->cols = cols; t->rows = rows;
     t->grid = (char *)kmalloc((uint64_t)cols * rows);
-    if (!t->grid) return 0;
-    for (int i = 0; i < cols * rows; i++) t->grid[i] = ' ';
-    t->cx = t->cy = 0; t->llen = 0; t->esc = 0;
+    t->fg = (uint32_t *)kmalloc((uint64_t)cols * rows * sizeof(uint32_t));
+    t->bg = (uint32_t *)kmalloc((uint64_t)cols * rows * sizeof(uint32_t));
+    if (!t->grid || !t->fg || !t->bg) return 0;
+    t_reset_style(t); for (int i = 0; i < cols * rows; i++) t_blank(t, i);
+    t->cx = t->cy = 0; t->llen = 0; t->esc = 0; t->cursor_visible = 1;
     t_puts(t, "tinyos x64 terminal\n");
     t_puts(t, "type 'sh' for a linux shell, or 'help' for native commands.\n\n");
     t_prompt(t);
@@ -561,29 +616,38 @@ void *term_make(void) {
     if (!t) return 0;
     t->bi = g_tbi; t->cols = 40; t->rows = 20;
     t->grid = (char *)kmalloc((uint64_t)t->cols * t->rows);
-    if (!t->grid) { kfree(t); return 0; }
-    for (int i = 0; i < t->cols * t->rows; i++) t->grid[i] = ' ';
-    t->cx = t->cy = 0; t->llen = 0; t->esc = 0;
+    t->fg = (uint32_t *)kmalloc((uint64_t)t->cols * t->rows * sizeof(uint32_t));
+    t->bg = (uint32_t *)kmalloc((uint64_t)t->cols * t->rows * sizeof(uint32_t));
+    if (!t->grid || !t->fg || !t->bg) { kfree(t); return 0; }
+    t_reset_style(t); for (int i = 0; i < t->cols * t->rows; i++) t_blank(t, i);
+    t->cx = t->cy = 0; t->llen = 0; t->esc = 0; t->cursor_visible = 1;
     return t;
 }
 void term_free(void *tp) {
     terminal_t *t = (terminal_t *)tp;
     if (!t) return;
     if (t->grid) kfree(t->grid);
+    if (t->fg) kfree(t->fg);
+    if (t->bg) kfree(t->bg);
     kfree(t);
 }
 void term_resize(void *tp, int cols, int rows) {
     terminal_t *t = (terminal_t *)tp;
     if (!t || cols < 1 || rows < 1 || (t->cols == cols && t->rows == rows)) return;
     char *ng = (char *)kmalloc((uint64_t)cols * rows);
-    if (!ng) return;
-    for (int i = 0; i < cols * rows; i++) ng[i] = ' ';
+    uint32_t *nf = (uint32_t *)kmalloc((uint64_t)cols * rows * sizeof(uint32_t));
+    uint32_t *nb = (uint32_t *)kmalloc((uint64_t)cols * rows * sizeof(uint32_t));
+    if (!ng || !nf || !nb) return;
+    for (int i = 0; i < cols * rows; i++) { ng[i] = ' '; nf[i] = t->cur_fg; nb[i] = t->cur_bg; }
     int cr = t->rows < rows ? t->rows : rows;      /* top-anchor: keep the top rows */
     int cc = t->cols < cols ? t->cols : cols;
     for (int r = 0; r < cr; r++)
-        for (int c = 0; c < cc; c++)
-            ng[r * cols + c] = t->grid[r * t->cols + c];
-    char *old = t->grid; t->grid = ng; kfree(old);
+        for (int c = 0; c < cc; c++) {
+            int dst = r * cols + c, src = r * t->cols + c;
+            ng[dst] = t->grid[src]; nf[dst] = t->fg[src]; nb[dst] = t->bg[src];
+        }
+    char *old = t->grid; uint32_t *of = t->fg, *ob = t->bg;
+    t->grid = ng; t->fg = nf; t->bg = nb; kfree(old); kfree(of); kfree(ob);
     t->cols = cols; t->rows = rows;
     if (t->cx >= cols) t->cx = cols - 1;
     if (t->cy >= rows) t->cy = rows - 1;
@@ -596,16 +660,19 @@ void term_draw_t(void *tp, uint32_t *back, int cx, int cy, int cw, int ch, int f
     if (!t) return;
     int cell = wm_ui_cell(), sc = wm_ui_scale();
     int lineh = wm_ui_lineh();
-    uint32_t fg = focused ? 0x33FF66 : 0x2AD055;   /* unfocused: readable, just a touch dimmer */
     char rowbuf[256];
     for (int r = 0; r < t->rows; r++) {
-        const char *g = &t->grid[r * t->cols];
-        int last = -1;
-        for (int c = 0; c < t->cols && c < 255; c++) { rowbuf[c] = g[c]; if (g[c] != ' ') last = c; }
-        if (last < 0) continue;
-        rowbuf[last + 1] = 0;
-        fb_text_to_s(back, (uint32_t)cx, (uint32_t)(cy + r * lineh), rowbuf, fg, 0x08111C, sc);
+        int c = 0;
+        while (c < t->cols) {
+            int start = c, i = r * t->cols + c; uint32_t fg = t->fg[i], bg = t->bg[i];
+            while (c < t->cols && c - start < 255 && t->fg[r * t->cols + c] == fg && t->bg[r * t->cols + c] == bg) {
+                rowbuf[c - start] = t->grid[r * t->cols + c]; c++;
+            }
+            rowbuf[c - start] = 0;
+            if (!focused) fg = ((fg & 0xFEFEFE) >> 1) + ((fg & 0xFCFCFC) >> 2);
+            fb_text_to_s(back, (uint32_t)(cx + start * cell), (uint32_t)(cy + r * lineh), rowbuf, fg, bg, sc);
+        }
     }
-    if (focused && ((millis() / 500) & 1))
+    if (focused && t->cursor_visible && ((millis() / 500) & 1))
         fb_text_to_s(back, (uint32_t)(cx + t->cx * cell), (uint32_t)(cy + t->cy * lineh), "_", 0xFFFFFF, 0x08111C, sc);
 }

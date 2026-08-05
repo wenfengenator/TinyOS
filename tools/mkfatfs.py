@@ -30,15 +30,90 @@ def configure(size_kb):
     DATA_START    = RESERVED + NFATS * FAT_SECTORS + ROOT_SECTORS
 
 
-def dirent(name83, attr, cluster, size):
-    base, _, ext = name83.partition(".")
-    nm = (base.upper()[:8].ljust(8) + ext.upper()[:3].ljust(3)).encode()
+def short_raw(name83):
+    if name83 == ".":
+        return b".          "
+    if name83 == "..":
+        return b"..         "
+    base, _, ext = name83.rpartition(".")
+    if not base:
+        base, ext = ext, ""
+    return (base.upper()[:8].ljust(8) + ext.upper()[:3].ljust(3)).encode()
+
+
+def dirent_raw(nm, attr, cluster, size):
     e = bytearray(32)
     e[0:11] = nm
     e[11] = attr
     struct.pack_into("<H", e, 26, cluster)      # first cluster (low word)
     struct.pack_into("<I", e, 28, size)         # file size
     return bytes(e)
+
+
+def dirent(name83, attr, cluster, size):
+    return dirent_raw(short_raw(name83), attr, cluster, size)
+
+
+def fits_83(name):
+    base, dot, ext = name.rpartition(".")
+    if not dot:
+        base, ext = name, ""
+    valid = "$%'-_@~`!(){}^#&"
+    return (0 < len(base) <= 8 and len(ext) <= 3 and
+            all(c.isalnum() or c in valid for c in base + ext))
+
+
+def alias_raw(name, used):
+    base, dot, ext = name.rpartition(".")
+    if not dot:
+        base, ext = name, ""
+    clean = "".join(c if c.isalnum() else "_" for c in base).upper() or "_"
+    ext = "".join(c if c.isalnum() else "_" for c in ext).upper()[:3]
+    for number in range(1, 100000):
+        suffix = "~" + str(number)
+        alias = clean[:8 - len(suffix)] + suffix
+        raw = (alias.ljust(8) + ext.ljust(3)).encode()
+        if raw not in used:
+            return raw
+    raise RuntimeError("cannot create FAT alias for " + name)
+
+
+def lfn_checksum(raw):
+    value = 0
+    for byte in raw:
+        value = (((value & 1) << 7) + (value >> 1) + byte) & 0xFF
+    return value
+
+
+def named_dirents(name, attr, cluster, size, used):
+    if fits_83(name):
+        raw = short_raw(name)
+        if raw not in used:
+            used.add(raw)
+            return [dirent_raw(raw, attr, cluster, size)]
+    raw = alias_raw(name, used)
+    used.add(raw)
+    checksum = lfn_checksum(raw)
+    positions = (1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30)
+    count = (len(name) + 12) // 13
+    entries = []
+    for order in range(count, 0, -1):
+        entry = bytearray(32)
+        entry[0] = order | (0x40 if order == count else 0)
+        entry[11] = 0x0F
+        entry[13] = checksum
+        base = (order - 1) * 13
+        for index, pos in enumerate(positions):
+            offset = base + index
+            char = ord(name[offset]) if offset < len(name) else (0 if offset == len(name) else 0xFFFF)
+            struct.pack_into("<H", entry, pos, char)
+        entries.append(bytes(entry))
+    entries.append(dirent_raw(raw, attr, cluster, size))
+    return entries
+
+
+def entry_slots(name):
+    return 1 if fits_83(name) else 1 + (len(name) + 12) // 13
 
 
 class Fat:
@@ -85,18 +160,19 @@ def build_dir(fat, path, parent_cluster):
     items   = sorted(os.listdir(path))
     files   = [f for f in items if os.path.isfile(os.path.join(path, f))]
     subdirs = [d for d in items if os.path.isdir(os.path.join(path, d))]
-    nent    = 2 + len(files) + len(subdirs)                 # '.', '..', entries
+    nent    = 2 + sum(entry_slots(name) for name in files + subdirs)
     nclus   = max(1, (nent * 32 + SECSZ - 1) // SECSZ)
     self_cluster = fat.reserve(nclus)                        # reserve before children
     ents = [dirent(".", 0x10, self_cluster, 0),
             dirent("..", 0x10, parent_cluster, 0)]
+    used = {short_raw("."), short_raw("..")}
     for f in files:
         data = open(os.path.join(path, f), "rb").read()
         c, _ = fat.alloc_chain(data)
-        ents.append(dirent(f, 0x20, c, len(data)))
+        ents.extend(named_dirents(f, 0x20, c, len(data), used))
     for d in subdirs:
         c = build_dir(fat, os.path.join(path, d), self_cluster)
-        ents.append(dirent(d, 0x10, c, 0))
+        ents.extend(named_dirents(d, 0x10, c, 0, used))
     fat.write_chain(self_cluster, b"".join(ents))
     return self_cluster
 
@@ -104,13 +180,14 @@ def build_dir(fat, path, parent_cluster):
 def build(srcdir, extra_files=()):
     fat = Fat()
     root = b""
+    used = set()
 
     # subdirectories (recursive: one FAT entry per top-level dir, nested below)
     for entry in sorted(os.listdir(srcdir)):
         p = os.path.join(srcdir, entry)
         if os.path.isdir(p):
             c = build_dir(fat, p, 0)                  # parent == root (cluster 0)
-            root += dirent(entry, 0x10, c, 0)
+            root += b"".join(named_dirents(entry, 0x10, c, 0, used))
 
     # root files
     for entry in sorted(os.listdir(srcdir)):
@@ -118,12 +195,12 @@ def build(srcdir, extra_files=()):
         if os.path.isfile(p):
             data = open(p, "rb").read()
             c, sz = fat.alloc_chain(data)
-            root += dirent(entry, 0x20, c, len(data))
+            root += b"".join(named_dirents(entry, 0x20, c, len(data), used))
 
     for name, path in extra_files:
         data = open(path, "rb").read()
         c, sz = fat.alloc_chain(data)
-        root += dirent(name, 0x20, c, len(data))
+        root += b"".join(named_dirents(name, 0x20, c, len(data), used))
 
     # ---- assemble image ----
     img = bytearray(TOTAL_SECTORS * SECSZ)

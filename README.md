@@ -168,8 +168,9 @@ sudo dd if=tinyos-usb.img of=/dev/sdX bs=4M conv=fsync status=progress   # ERASE
 ```
 
 A physical PC has no virtio-blk/StorVSC, so TinyOS runs **live from a RAM disk**
-embedded in the loader (the mbb shell + coreutils, local `git`, Tetris/2048/Pac-Man/Sudoku/Snake/15-Puzzle/Reversi, and
-the TinyGL demos). On machines with a **SATA (AHCI)** controller — e.g. the
+embedded in the loader (the mbb shell + coreutils, local `git`, standalone
+syntax-highlighting `vim`, Tetris/2048/Pac-Man/Sudoku/Snake/15-Puzzle/Reversi,
+and the TinyGL demos). On machines with a **SATA (AHCI)** controller — e.g. the
 ThinkPad T440s — the internal disk is mounted read/write at **`/mnt`** and
 persists across reboots, and a plugged-in **USB stick** is mounted at **`/usb`**
 (xHCI mass-storage) as the bridge for moving files in and out. A **PS/2 or
@@ -178,6 +179,8 @@ no persistence path yet.
 
 Sign in as `root` / `root`. From the terminal, `./musl.bin`,
 `./tcc.bin file.c -o out.bin`, and `./out.bin` exercise the Linux-ABI path;
+`./vim.bin file.c` opens the modal editor (`i`, Esc, `dd`, `yy`, `p`, `/`, and
+`:w`/`:q` are supported in the proof of concept);
 `cp kr.c /usb/kr.c` copies a file out to the USB stick. Press **F5** to split
 the terminal into concurrent panes (**F4** to cycle focus), and **F3** (or close
 the lid) to sleep.
@@ -190,7 +193,7 @@ boot.asm          boot sector (assembly)
 kernel/           C kernel: mm/paging, fs, ramdisk, procs, sched, timer, kbd,
                   ata (disk), fat (FAT16), vfs (unified tree), entry.s
 user/             in-kernel ring-3 tasks (login, worker) + ulib.h
-programs/         standalone ramdisk programs: shell, hello, count, vi (editor)
+programs/         standalone ramdisk programs, games, mbb vi, and colored vim
 disk/             source tree baked into the FAT16 image (fs.img)
 tools/            emulate.py (Unicorn PC), mkramdisk.py, mkfatfs.py, xcc/xcxx
 docs/             GUIDE (beginner walkthrough), DESIGN, PROJECT_PLAN, TEST_PLAN, TEST_RESULTS
