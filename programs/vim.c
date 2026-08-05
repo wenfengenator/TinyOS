@@ -17,13 +17,35 @@
 
 enum { NORMAL, INSERT };
 enum { S_TEXT, S_COMMENT, S_STRING, S_NUMBER, S_KEYWORD, S_PREPROC };
+enum { FT_TEXT, FT_C, FT_PYTHON, FT_SHELL, FT_MAKE };
 
 static char (*lines)[MAX_COLS + 1], yank[MAX_COLS + 1];
 static unsigned short lens[MAX_LINES];
 static int nlines = 1, row, col, top, top_segment, left, rows = 24, cols = 80;
 static int mode, dirty, running = 1, pending_d, pending_y, operator_count, count;
 static int wrap_enabled, number_enabled = 1;
+static int filetype, help_active, help_top;
 static char filename[128], search_text[80], message[128];
+
+static const char *help_lines[] = {
+    "TinyOS Vim help", "", "MOVEMENT", "  h j k l / arrows   move cursor",
+    "  [count]j/k         move several lines", "  0 / $              start / end of line",
+    "  gg / G             first / last line", "  [line]gg / [line]G go to line", "",
+    "INSERT", "  i / a              insert before / after cursor",
+    "  I / A              insert at start / end of line", "  o / O              open line below / above",
+    "  Esc                return to Normal mode", "  Tab                insert spaces", "",
+    "EDIT", "  x / [count]x      delete character(s)", "  dd / [count]dd    delete line(s)",
+    "  yy                 yank line", "  p                  paste yanked line below", "",
+    "SEARCH", "  /text              search forward", "  n                  repeat search", "",
+    "EX COMMANDS", "  :w                 write file", "  :q / :q!           quit / discard changes",
+    "  :wq / :x           write and quit", "  :[line]            go to line",
+    "  :set               show options", "  :set wrap/nowrap   toggle line wrapping",
+    "  :set number/nonumber (nu/nonu also work)", "  :help / :h         open this help", "",
+    "SYNTAX", "  Detected: C/C++, Python, shell, Makefile, plain text",
+    "  Highlighting is selected from the file name.", "", "HELP CONTROLS",
+    "  j/k or arrows      scroll", "  q or Esc            close help"
+};
+#define HELP_LINES ((int)(sizeof(help_lines) / sizeof(help_lines[0])))
 
 static void outn(const char *s, int n) { if (n > 0) { ssize_t written = write(1, s, (size_t)n); (void)written; } }
 static void outs(const char *s) { outn(s, (int)strlen(s)); }
@@ -34,30 +56,57 @@ static void number(int value) {
 }
 static void at(int r, int c) { outs("\x1b["); number(r); outs(";"); number(c); outs("H"); }
 static int ident(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
-static int keyword(const char *s, int n) {
-    static const char *words[] = { "auto","break","case","char","const","continue","default","do","double","else","enum","extern","float","for","goto","if","inline","int","long","register","restrict","return","short","signed","sizeof","static","struct","switch","typedef","union","unsigned","void","volatile","while","bool","class","namespace","public","private","template","using","NULL" };
-    int nw = (int)(sizeof(words) / sizeof(words[0]));
-    for (int i = 0; i < nw; i++) if ((int)strlen(words[i]) == n && !memcmp(s, words[i], (size_t)n)) return 1;
+static int word_in(const char *s, int n, const char *const *words, int count) {
+    for (int i = 0; i < count; i++) if ((int)strlen(words[i]) == n && !memcmp(s, words[i], (size_t)n)) return 1;
     return 0;
+}
+static int keyword(const char *s, int n) {
+    static const char *const c_words[] = { "auto","break","case","char","const","continue","default","do","double","else","enum","extern","float","for","goto","if","inline","int","long","register","restrict","return","short","signed","sizeof","static","struct","switch","typedef","union","unsigned","void","volatile","while","bool","class","namespace","public","private","protected","template","using","NULL","true","false","nullptr" };
+    static const char *const py_words[] = { "and","as","assert","async","await","break","class","continue","def","del","elif","else","except","False","finally","for","from","global","if","import","in","is","lambda","None","nonlocal","not","or","pass","raise","return","True","try","while","with","yield" };
+    static const char *const sh_words[] = { "case","do","done","elif","else","esac","fi","for","function","if","in","select","then","time","until","while" };
+    if (filetype == FT_C) return word_in(s, n, c_words, (int)(sizeof(c_words) / sizeof(c_words[0])));
+    if (filetype == FT_PYTHON) return word_in(s, n, py_words, (int)(sizeof(py_words) / sizeof(py_words[0])));
+    if (filetype == FT_SHELL) return word_in(s, n, sh_words, (int)(sizeof(sh_words) / sizeof(sh_words[0])));
+    return 0;
+}
+static int ends_with(const char *name, const char *suffix) {
+    int nl = (int)strlen(name), sl = (int)strlen(suffix);
+    return nl >= sl && !memcmp(name + nl - sl, suffix, (size_t)sl);
+}
+static void detect_filetype(void) {
+    const char *base = filename; for (const char *p = filename; *p; p++) if (*p == '/') base = p + 1;
+    if (!strcmp(base, "Makefile") || !strcmp(base, "makefile") || ends_with(base, ".mk")) filetype = FT_MAKE;
+    else if (ends_with(base, ".c") || ends_with(base, ".h") || ends_with(base, ".cc") || ends_with(base, ".cpp") || ends_with(base, ".cxx") || ends_with(base, ".hpp")) filetype = FT_C;
+    else if (ends_with(base, ".py")) filetype = FT_PYTHON;
+    else if (ends_with(base, ".sh") || ends_with(base, ".bash")) filetype = FT_SHELL;
+    else filetype = FT_TEXT;
+}
+static const char *filetype_name(void) {
+    static const char *names[] = { "text", "c", "python", "sh", "make" }; return names[filetype];
 }
 
 /* Returns whether the next line starts inside a block comment. */
 static int lex_line(int r, int block, unsigned char *style) {
     int n = lens[r], i = 0, pre = 1;
     while (i < n) {
-        if (block) {
+        if (filetype == FT_TEXT) { style[i++] = S_TEXT;
+        } else if (block) {
             style[i] = S_COMMENT;
             if (i + 1 < n && lines[r][i] == '*' && lines[r][i + 1] == '/') { style[i + 1] = S_COMMENT; i += 2; block = 0; }
             else i++;
-        } else if (i + 1 < n && lines[r][i] == '/' && lines[r][i + 1] == '/') {
+        } else if (filetype == FT_C && i + 1 < n && lines[r][i] == '/' && lines[r][i + 1] == '/') {
             while (i < n) style[i++] = S_COMMENT;
-        } else if (i + 1 < n && lines[r][i] == '/' && lines[r][i + 1] == '*') {
+        } else if (filetype == FT_C && i + 1 < n && lines[r][i] == '/' && lines[r][i + 1] == '*') {
             style[i++] = S_COMMENT; style[i++] = S_COMMENT; block = 1;
+        } else if ((filetype == FT_PYTHON || filetype == FT_SHELL || filetype == FT_MAKE) && lines[r][i] == '#') {
+            while (i < n) style[i++] = S_COMMENT;
         } else if (lines[r][i] == '"' || lines[r][i] == '\'') {
             char quote = lines[r][i]; style[i++] = S_STRING;
             while (i < n) { style[i] = S_STRING; if (lines[r][i] == '\\' && i + 1 < n) style[++i] = S_STRING; else if (lines[r][i] == quote) { i++; break; } i++; }
-        } else if (pre && lines[r][i] == '#') {
+        } else if (filetype == FT_C && pre && lines[r][i] == '#') {
             while (i < n) style[i++] = S_PREPROC;
+        } else if ((filetype == FT_SHELL || filetype == FT_MAKE) && lines[r][i] == '$') {
+            style[i++] = S_PREPROC; if (i < n && lines[r][i] == '(') { while (i < n) { style[i] = S_PREPROC; if (lines[r][i++] == ')') break; } } else while (i < n && ident(lines[r][i])) style[i++] = S_PREPROC;
         } else if (lines[r][i] >= '0' && lines[r][i] <= '9') {
             while (i < n && (ident(lines[r][i]) || lines[r][i] == '.')) style[i++] = S_NUMBER;
         } else if ((lines[r][i] >= 'a' && lines[r][i] <= 'z') || (lines[r][i] >= 'A' && lines[r][i] <= 'Z') || lines[r][i] == '_') {
@@ -90,6 +139,20 @@ static void advance_view_row(void) {
     if (top_segment >= line_screen_rows(top)) { top++; top_segment = 0; }
 }
 
+static void render_help(void) {
+    int text_rows = rows - 2;
+    outs("\x1b[?25l\x1b[H");
+    for (int screen = 0; screen < text_rows; screen++) {
+        int index = help_top + screen; at(screen + 1, 1); outs("\x1b[48;5;235m\x1b[K");
+        if (index >= HELP_LINES) continue;
+        const char *line = help_lines[index];
+        if (line[0] && line[0] != ' ') outs("\x1b[1;38;5;81m"); else outs("\x1b[38;5;252m");
+        int n = (int)strlen(line); if (n > cols) n = cols; outn(line, n);
+    }
+    at(rows - 1, 1); outs("\x1b[48;5;24m\x1b[38;5;231m VIM HELP \x1b[K");
+    at(rows, 1); outs("\x1b[0m\x1b[48;5;234m\x1b[38;5;250m j/k scroll  q/Esc close\x1b[K");
+}
+
 static void render(void) {
     unsigned char styles[MAX_COLS]; int block = 0;
     for (int r = 0; r < top; r++) block = lex_line(r, block, styles);
@@ -115,9 +178,9 @@ static void render(void) {
         if (segment >= line_screen_rows(r)) { r++; segment = 0; block = next_block; }
     }
     at(rows - 1, 1); outs(mode == INSERT ? "\x1b[48;5;24m\x1b[38;5;231m -- INSERT -- " : "\x1b[48;5;238m\x1b[38;5;231m -- NORMAL -- ");
-    outs(filename[0] ? filename : "[No Name]"); if (dirty) outs(" [+]"); outs("\x1b[K");
+    outs(filename[0] ? filename : "[No Name]"); if (dirty) outs(" [+]"); outs("  ["); outs(filetype_name()); outs("]\x1b[K");
     at(rows, 1); outs("\x1b[0m\x1b[48;5;234m\x1b[38;5;250m");
-    if (message[0]) outs(message); else outs("i insert  / search  dd delete  yy/p yank/paste  : commands");
+    if (message[0]) outs(message); else outs("i insert  / search  dd delete  yy/p yank/paste  :help");
     outs("\x1b[K");
     int cr = cursor_screen_row() + 1;
     int cc = (wrap_enabled ? col % width : col - left) + gutter + 1;
@@ -227,6 +290,7 @@ static void ex_command(void) {
     else if (!strcmp(cmd, "wq") || !strcmp(cmd, "x")) { if (save_file() == 0) running = 0; }
     else if (!strcmp(cmd, "set")) set_options("");
     else if (!memcmp(cmd, "set ", 4)) set_options(cmd + 4);
+    else if (!strcmp(cmd, "help") || !strcmp(cmd, "h")) { help_active = 1; help_top = 0; }
     else if (cmd[0] >= '0' && cmd[0] <= '9') { int target = atoi(cmd); if (target > 0) { row = target - 1; if (row >= nlines) row = nlines - 1; col = 0; } }
     else strcpy(message, "Not an editor command");
 }
@@ -252,11 +316,20 @@ int main(int argc, char **argv) {
     lines = (char (*)[MAX_COLS + 1])calloc(MAX_LINES, sizeof(*lines));
     if (!lines) { outs("vim: cannot allocate text buffer\n"); return 1; }
     if (argc > 1) { strncpy(filename, argv[1], sizeof(filename) - 1); filename[sizeof(filename) - 1] = 0; }
+    detect_filetype();
     load_file(); struct winsize ws; if (ioctl(1, TIOCGWINSZ, &ws) == 0) { if (ws.ws_row > 5) rows = ws.ws_row; if (ws.ws_col > 20) cols = ws.ws_col; }
     struct termios old, raw; tcgetattr(0, &old); raw = old; raw.c_lflag &= ~(ICANON | ECHO | ISIG); tcsetattr(0, TCSANOW, &raw);
     outs("\x1b[2J");
     while (running) {
-        render(); message[0] = 0; char ch; if (read(0, &ch, 1) <= 0) continue; int c = (unsigned char)ch;
+        if (help_active) render_help(); else render();
+        message[0] = 0; char ch; if (read(0, &ch, 1) <= 0) continue; int c = (unsigned char)ch;
+        if (help_active) {
+            int page = rows - 2, max_top = HELP_LINES > page ? HELP_LINES - page : 0;
+            if (c == 'q' || c == 27) help_active = 0;
+            else if (c == 'j' || c == KEY_DOWN) { if (help_top < max_top) help_top++; }
+            else if (c == 'k' || c == KEY_UP) { if (help_top > 0) help_top--; }
+            continue;
+        }
         if (mode == INSERT) {
             if (c == 27) { mode = NORMAL; if (col) col--; }
             else if (c == '\n' || c == '\r') split_line(); else if (c == 8 || c == 127) backspace();

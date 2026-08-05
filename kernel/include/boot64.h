@@ -207,6 +207,21 @@ int      ahci_write(uint64_t lba, uint32_t count, const void *buf);
 uint64_t ahci_sectors(void);                         /* disk size in 512-byte sectors */
 int      ahci_present(void);
 
+/* ---- Intel High Definition Audio (kernel/drivers/hda64.c) ---- */
+typedef struct hda_diag {
+    uint32_t stage, gcap, codecs;
+    int32_t codec, afg, dac, pin;
+    uint32_t volume;
+} hda_diag_t;
+int      hda_init(void);                              /* 1 when an analog output is ready */
+int      hda_ready(void);
+int      hda_get_diag(hda_diag_t *diag);
+int      hda_set_volume(int volume);                  /* software master volume, 0..100 */
+int      hda_get_volume(void);
+int      hda_play(const int16_t *samples, uint32_t frames); /* 48 kHz S16 stereo, synchronous */
+int      hda_tone(uint32_t hz, uint32_t duration_ms, uint32_t volume);
+void     hda_stop(void);
+
 /* ---- USB host (xHCI) + Mass Storage block device (kernel/drivers/usb64.c) ---- */
 int      usb_init(void);                             /* 1 if a USB mass-storage device is ready */
 int      usb_present(void);
