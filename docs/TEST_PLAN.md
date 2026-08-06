@@ -104,6 +104,26 @@ headless (`-serial stdio`).
 | Q7  | Arrow keys + Delete| in `vi`: type `axb`, ESC, `←` `←`, `Delete` | cursor moves; `Delete` removes `x` → file is `ab`   |
 | Q8  | Shell line editor  | type `lss`, `←`, `Delete`, Enter | edits to `ls` and runs it (arrows/Delete drive in-line editing) |
 
+## 6c. MicroPython integration test cases
+
+Run the host checks after `make setup-micropython`; run hardware-facing cases
+inside the x64 image under QEMU + OVMF with `ich9-intel-hda` and `hda-output`.
+
+| ID | Feature | Steps | Expected |
+|---|---|---|---|
+| MP1 | Reproducible source | run `make setup-micropython` | v1.26.1 commit matches the pinned hash |
+| MP2 | Static ELF | run `file /tmp/tinyos-micropython/micropython` | x86-64, statically linked, no interpreter |
+| MP3 | Module registration | import `tgl, taudio` on the host | imports succeed; `tgl.Surface` exists |
+| MP4 | Script compatibility | run `mpy-cross programs/reversi.py` | compilation succeeds |
+| MP5 | Image packaging | extract `/PYTHON.BIN` and `/reversi.py` from the FAT image | bytes match the build outputs |
+| MP6 | Language runtime | run `python /hello.py` in TinyOS | greeting and square list print; process exits cleanly |
+| MP7 | Native graphics | run `python /tgl.py` and `python /reversi.py` | surface renders, keys update it, `q` restores desktop |
+| MP8 | Native audio | run `python /audio.py`, then make a Reversi move | HDA diagnostics print; tone syscalls return; game redraws |
+
+For MP7, capture the QEMU framebuffer and check that the surface is nonblank,
+centered, and has no clipped or overlapping text. Host Linux can validate
+imports, but it cannot execute TinyOS's private graphics or audio syscalls.
+
 ## 7. Integration scenario (current demo)
 
 ```

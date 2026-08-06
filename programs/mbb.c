@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* mbb — a musl-static multi-call "mini-busybox" for TinyOS.
  *
  * Proves the Tier-1 Unix substrate: a shell that runs pipelines (fork + pipe +

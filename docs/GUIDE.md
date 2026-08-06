@@ -14,6 +14,9 @@ teaching-oriented walkthrough.
 > **64-bit UEFI** edition — long mode, SMP, the framebuffer desktop, persistent
 > FAT16 on Hyper-V/QEMU, the Linux-compatible ABI, musl, and the on-device
 > self-hosting compiler — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+> For a focused walkthrough of how the 64-bit edition runs an upstream static
+> MicroPython interpreter and exposes TinyGL and Intel HDA to Python, see
+> [`MICROPYTHON.md`](MICROPYTHON.md).
 
 ---
 
@@ -1158,6 +1161,11 @@ console, and the timer — essentially the whole OS.
 | `tools/emulate.py`   | Unicorn CPU emulator + Python service layer                |
 | `tools/mkramdisk.py` | packs programs into the ramdisk archive                    |
 | `tools/mkfatfs.py`   | builds the FAT16 `fs.img`                                  |
+
+The 64-bit edition adds `tools/setup_micropython.sh` plus the native modules in
+`programs/micropython_port/`. Those files are intentionally covered in the
+separate [`MicroPython on TinyOS`](MICROPYTHON.md) chapter because this source
+map describes the original 32-bit teaching kernel.
 
 ---
 

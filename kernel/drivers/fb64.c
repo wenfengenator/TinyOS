@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 kernel console: COM1 serial + GOP linear framebuffer.
  *
  * Runs after ExitBootServices, so it touches only hardware the firmware left in

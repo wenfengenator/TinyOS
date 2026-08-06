@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 minimal TCP/IP stack — Cycle 8 Phase N2.
  *
  * A compact, dependency-free network stack over the virtio-net frame transport

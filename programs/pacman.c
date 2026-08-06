@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* Pac-Man for TinyOS — renders through the TinyGL user library (tinygl.h).
  *
  * Build off-device with musl-gcc (staged as /PACMAN.BIN) or on device:

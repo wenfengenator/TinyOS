@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyOS Intel HDA smoke test. Build on-device:
  *   ./tcc.bin /audio.c -o /audio.bin ; ./audio.bin */
 #include <taudio.h>

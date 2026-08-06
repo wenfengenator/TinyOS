@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos kernel core: freestanding libc, console, descriptor tables, boot. */
 #include "kernel.h"
 #include "mm.h"

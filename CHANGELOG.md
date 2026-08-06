@@ -4,6 +4,31 @@ All notable changes to tinyos are recorded here. The format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semantic
 versioning of the **64-bit UEFI edition** (`TINYOS_VERSION`).
 
+## [Unreleased]
+
+### Added
+- **MicroPython v1.26.1.** The official minimal Unix port now builds as a
+  static, non-PIE musl ELF64 program and is packaged as `/PYTHON.BIN` in the
+  live RAM filesystem, persistent data image, VHDX, and USB image.
+- **Native Python graphics and audio.** Built-in `tgl` and `taudio` C modules
+  expose zero-copy TinyGL surfaces, drawing primitives, shared 8x8 text,
+  keyboard polling, Intel HDA tones, master volume, and diagnostics.
+- **Python demos and game.** `/hello.py`, `/tgl.py`, `/audio.py`, and a
+  graphical, audio-enabled `/reversi.py` are included in every image. Reversi
+  supports depth-4 AI, two-player mode, readable TinyGL text, and sound cues.
+- **MicroPython integration guide.** `docs/MICROPYTHON.md` documents the build,
+  packaging, ELF runtime path, native module boundary, APIs, extension steps,
+  limitations, and validation workflow.
+
+### Changed
+- The reproducible MicroPython builder compiles repository user C modules via
+  `USER_C_MODULES` while leaving the pinned upstream source unmodified.
+
+### Validated
+- Static interpreter bootstrap, native-module imports, `mpy-cross` script
+  compilation, full GPT/VHDX/USB packaging, and graphical/audio Reversi under
+  QEMU + OVMF with emulated Intel HDA.
+
 ## [2.0.0] - 2026-08-03
 
 Second major release of the 64-bit UEFI edition. The theme of this cycle was

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyGL (Cycle 7 G2): rendering + composition over the display backend.
  *
  * A surface is a render target — an offscreen pixel buffer object, or the screen

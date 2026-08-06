@@ -460,3 +460,46 @@ on the T440s.
 | Native console pegged a core at 100% | scheduler stopped, so no timer tick to break `hlt` → scoped one-shot LAPIC idle-tick around the halt |
 | `?ELF` binary garbage in the terminal + panic after closing all panes and relaunching (`sh`) | `reap_pane` freed pane-0's WM-owned terminal; the relaunch's ELF `kmalloc` reused it → never free the pane-0 terminal in the pane teardown |
 | A pane (often `vi`) stops receiving input after cycling panes and can't be closed | non-atomic check-then-`sched_block` (lost wakeup) + per-pane wait channels (renumbered shell orphaned) → one shared wait channel + `cli`-atomic check-and-block |
+
+## Phase 18 — MicroPython, native graphics/audio, and Python Reversi
+
+The official MicroPython `v1.26.1` Unix port was built against TinyOS's staged
+musl as a static, non-PIE ELF64 program. The build used upstream commit
+`647c8b96cae7e202c7a020395b7cfe65e5b8ce04` and repository user C modules.
+
+### Build and registration
+
+| Step | Result |
+|---|---|
+| `mpy-cross` and `ports/unix VARIANT=minimal` build | ✅ |
+| Result is a stripped, statically linked x86-64 ELF | ✅ |
+| Host bootstrap prints `MicroPython TinyOS bootstrap OK` | ✅ |
+| Built-in `tgl` and `taudio` imports; `tgl.Surface` is registered | ✅ |
+| `/hello.py`, `/tgl.py`, `/audio.py`, `/reversi.py` staged in FAT images | ✅ |
+| Packaged `/reversi.py` is byte-identical to repository source | ✅ |
+
+### TinyOS guest validation
+
+QEMU used OVMF, standard VGA, `ich9-intel-hda`, and `hda-output`. The complete
+81 MiB GPT image booted with no kernel exception and reached the login panel.
+
+| Step | Result |
+|---|---|
+| HDA discovery: codec 0, AFG 1, DAC 2, analog pin 3 | ✅ |
+| TinyGL G2-G6 boot self-tests still pass | ✅ |
+| `python /reversi.py` opens a centered zero-copy TinyGL surface | ✅ |
+| Board, discs, legal-move markers, cursor, scores, status, and controls render | ✅ framebuffer inspected |
+| Shared 8x8 `Surface.text()` output fits without clipping or overlap | ✅ framebuffer inspected |
+| Opening legal moves are `[19, 26, 37, 44]`; depth-4 AI selects a legal reply | ✅ |
+| Player move and AI response change the framebuffer | ✅ checksum changed |
+| Synchronous player and AI tone calls return before the redraw | ✅ |
+| `q` closes the surface and restores the desktop | ✅ |
+| VHDX and USB artifacts regenerated from the validated image | ✅ |
+
+### Minimal-runtime compatibility fixes
+
+| Symptom | Root cause and fix |
+|---|---|
+| `SyntaxError` in alpha-beta search | minimal runtime parser rejected `board[:]`; use `list(board)` |
+| AI reached `NameError` at runtime | optional `min`, `max`, and `enumerate` builtins are absent; use explicit comparisons and indexed loops |
+| Python UI showed placeholder bars | `tgl` initially lacked font drawing; add native `Surface.text()` using TinyGL's shared 8x8 font |

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 // tinyos interactive ring-3 demo: prompts, reads a line you type in the terminal
 // (via SYS_READ), then greets you.  Proves keyboard input reaches user mode.
 #include "ulib.h"

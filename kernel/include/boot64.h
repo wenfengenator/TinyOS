@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 boot handoff + kernel console API (shared by the UEFI loader in
  * boot/efi_main.c and the 64-bit kernel in kernel/kmain64.c, kernel/fb64.c). */
 #ifndef TINYOS_BOOT64_H

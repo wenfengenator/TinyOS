@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 # tinyos x64 kernel entry trampoline (R3).
 #
 # The UEFI loader calls kstart(boot_info *) — SysV ABI, so the pointer arrives

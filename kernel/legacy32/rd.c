@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos ramdisk: a block-backed image embedded in the kernel (see the
  * generated build/ramdisk.s / .incbin).  It is a tiny read-only archive of
  * program images used by exec().  On real hardware the same bytes could come

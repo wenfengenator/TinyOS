@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
 TINYOS_MOD_DIR := $(USERMOD_DIR)
 SRC_USERMOD += $(TINYOS_MOD_DIR)/modtgl.c
 SRC_USERMOD += $(TINYOS_MOD_DIR)/modtaudio.c

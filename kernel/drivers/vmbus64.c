@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 Hyper-V VMBus synthetic keyboard.
  *
  * Hyper-V Gen 2 VMs have no PS/2 i8042 — the keyboard is a synthetic VMBus

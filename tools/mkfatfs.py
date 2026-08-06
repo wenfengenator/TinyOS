@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+
 """Build a FAT16 disk image from a source directory (one level of subdirs).
 
     mkfatfs.py <out.img> <srcdir> [size_kb] [NAME=path ...]

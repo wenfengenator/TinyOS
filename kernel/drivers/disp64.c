@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 display layer: a swappable display backend behind a stable seam.
  *
  * The default backend is the GOP / Hyper-V synthetic framebuffer: one shared,

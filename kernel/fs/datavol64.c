@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 — generic FAT32 read/write engine over a pluggable block backend.
  *
  * Originally the read/write driver for the internal-disk data partition (created

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* https — a minimal HTTPS/1.0 client for TinyOS (Cycle 9 C5).
  *
  * Resolves a host, opens a TCP connection, runs the TLS 1.3 client handshake

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 FAT16 filesystem — a port of kernel/fat.c backed by a RAM-resident
  * disk image embedded in the kernel (build/fatfs.h, built from disk/ by
  * tools/mkfatfs.py).  The image is copied into writable pages at boot so whole-

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+
 """Pack tinyos ramdisk programs into a simple archive (magic 'TRD').
 
 Layout:  'TRD\\0' | count(u32) | count*{ name[16], off(u32), size(u32) } | blobs

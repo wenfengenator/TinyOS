@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyGL 3D (Cycle 7 G4): a small fixed-point software triangle rasterizer.
  *
  * The kernel builds -mno-sse (no FPU), so all math is 16.16 fixed point; x86-64

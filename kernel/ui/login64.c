@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 login screen (Cycle 4, Phase A).
  *
  * Shown after boot, before the desktop (kernel/wm64.c).  Renders a framebuffer

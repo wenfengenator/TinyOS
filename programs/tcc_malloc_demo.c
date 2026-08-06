@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* Heap demo: malloc / calloc / realloc / free against the on-device musl libc.
  * Writes and reads back real memory, and stress-cycles the allocator. */
 #include <stdio.h>

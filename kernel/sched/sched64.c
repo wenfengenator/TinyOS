@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 preemptive scheduler (Cycle 4).
  *
  * A round-robin scheduler for KERNEL threads, driven by the Local APIC timer.

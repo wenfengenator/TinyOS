@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* Linker script for tinyos x64 user programs.
  *
  * Programs are compiled -fPIC -fvisibility=hidden (RIP-relative, no GOT) and

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* Reversi (Othello) for TinyOS — renders through TinyGL (tinygl.h).
  *
  * Build off-device with musl-gcc (staged as /REVERSI.BIN) or on device:

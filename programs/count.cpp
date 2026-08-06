@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 // tinyos CPU-bound program: prints a few ticks with busy-work between them, so
 // two concurrent instances visibly interleave under the preemptive scheduler.
 #include "ulib.h"

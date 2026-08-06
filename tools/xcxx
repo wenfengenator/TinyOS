@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
 # tinyos C++ compiler wrapper (see xcc).
 if command -v g++-13 >/dev/null 2>&1; then exec g++-13 "$@"; fi
 if command -v g++    >/dev/null 2>&1; then exec g++    "$@"; fi

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 AHCI (SATA) driver — real-hardware disk access.
  *
  * The T440s (and any modern UEFI PC) exposes its SATA SSD through an AHCI HBA,

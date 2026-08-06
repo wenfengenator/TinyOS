@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 — USB host (xHCI) + Mass Storage (Bulk-Only Transport) + SCSI.
  *
  * The user wants to copy files to/from a USB stick.  Modern machines (and the

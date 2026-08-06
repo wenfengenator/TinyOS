@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* Linker script for standalone tinyos user programs.
  * Programs are position-dependent, linked at USER_BASE; exec() maps a fresh
  * set of pages there in the new task's address space. */

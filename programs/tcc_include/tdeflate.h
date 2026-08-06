@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyOS userspace DEFLATE/zlib compressor — Cycle 10 (native git write path).
  *
  * The read side (tinflate.h) let git *read* objects; to *write* objects and

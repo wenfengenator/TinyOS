@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 // tinyos login program (C++), ring 3.
 // Prompts for credentials, reads them from stdin (int 0x80 SYS_READ), then
 // authenticates against /etc/passwd via the file syscalls.  On success it

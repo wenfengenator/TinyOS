@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 privilege-level plumbing (Cycle 4, Phase B).
  *
  * All the assembly the ring-0/ring-3 split needs that cannot be expressed in C:

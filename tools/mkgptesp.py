@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+
 """Build a GPT disk image with a FAT32 ESP and a FAT16 TinyOS data partition.
 
     mkgptesp.py <out.img> <esp_dir> <data.img>

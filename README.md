@@ -161,15 +161,25 @@ network access or distro packages, just a standard host toolchain (`gcc`,
 `make setup-micropython` fetches the official pinned MicroPython v1.26.1
 source, builds `mpy-cross`, and produces a static minimal Unix-port interpreter
 at `/tmp/tinyos-micropython/micropython`. Subsequent filesystem and USB builds
-package it as `/PYTHON.BIN`, along with `/hello.py`. On TinyOS:
+package it as `/PYTHON.BIN`. The interpreter includes native `tgl` and `taudio`
+modules, and the images include `/hello.py`, `/tgl.py`, `/audio.py`, and the
+graphical, audio-enabled `/reversi.py`. On TinyOS:
 
 ```sh
 python /hello.py
 python -c print(6*7)
+python /audio.py
+python /tgl.py
+python /reversi.py
 ```
 
 Script files are preferred for multi-word expressions because the current
 TinyOS shell does not yet group quoted arguments.
+
+The minimal build currently imports `builtins`, `os`, `sys`, `tgl`, and
+`taudio`; it intentionally omits most optional standard-library modules. See
+[`docs/MICROPYTHON.md`](docs/MICROPYTHON.md) for the complete build, packaging,
+runtime, native-module, and extension walkthrough.
 
 ### Boot on a real PC (USB)
 
@@ -214,7 +224,7 @@ user/             in-kernel ring-3 tasks (login, worker) + ulib.h
 programs/         standalone ramdisk programs, games, mbb vi, and colored vim
 disk/             source tree baked into the FAT16 image (fs.img)
 tools/            emulate.py (Unicorn PC), mkramdisk.py, mkfatfs.py, xcc/xcxx
-docs/             GUIDE (beginner walkthrough), DESIGN, PROJECT_PLAN, TEST_PLAN, TEST_RESULTS
+docs/             GUIDE, ARCHITECTURE, MICROPYTHON, AUDIO, plans and test records
 Makefile
 ```
 
@@ -230,6 +240,9 @@ Documentation map:
   (memory map, boot flow, privilege model, `int 0x80` ABI, scheduler, emulator).
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the full **64-bit UEFI** system
   design (boot flow, SMP, display, storage, filesystem, Linux ABI, toolchain).
+* [`docs/MICROPYTHON.md`](docs/MICROPYTHON.md) — static interpreter integration,
+  native `tgl`/`taudio` modules, APIs, packaging, extension, and validation.
+* [`docs/AUDIO.md`](docs/AUDIO.md) — Intel HDA design and C/Python sound APIs.
 * [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) — objectives, phases, milestones
   across every cycle.
 * [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) / [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)
@@ -239,3 +252,13 @@ Documentation map:
   [`docs/CYCLE8_PLAN.md`](docs/CYCLE8_PLAN.md) — per-cycle plans (x64/graphics;
   compiler substrate; Tier 1 mini-Unix / busybox-static; **TinyGL** graphics
   stack; connectivity / TCP-IP / USB).
+
+## License
+
+TinyOS-authored source code and documentation are licensed under the GNU
+General Public License, version 2 only (`GPL-2.0-only`). See
+[`LICENSE`](LICENSE) for the complete terms.
+
+Files under [`third_party/`](third_party/) and other files carrying their own
+license notice remain under their respective upstream licenses. Generated
+images and bundled binaries may contain components under those separate terms.

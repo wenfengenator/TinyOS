@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 virtio-blk (legacy PCI) block driver.
  *
  * Persistent storage for the QEMU dev environment: 512-byte sector read/write to

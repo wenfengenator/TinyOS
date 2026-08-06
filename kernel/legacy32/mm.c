@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos memory management: physical frame allocator + paging.
  *
  * The kernel identity-maps the low 16 MB in every address space (so kernel code

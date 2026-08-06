@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 — FAT32 reader for the internal-disk EFI System Partition, over AHCI.
  *
  * Toward installing TinyOS to the internal disk: locate the ESP in the GPT, parse

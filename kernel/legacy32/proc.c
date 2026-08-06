@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos process management (hardware path): exec, fork, wait.
  *
  * The Unicorn emulator performs the equivalent operations itself at runtime

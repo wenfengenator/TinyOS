@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 terminal widget + built-in command console (Cycle 3).
  *
  * A terminal is a character grid (cols x rows of 8x8 glyphs) that lives inside a

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 process model (Cycle 6, Tier 1 Phase A).
  *
  * `struct proc` is the per-process object that replaces the old set of

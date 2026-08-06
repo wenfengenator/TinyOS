@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+
 """
 tinyos emulator (Unicorn-based) — runs the OS when QEMU is unavailable.
 

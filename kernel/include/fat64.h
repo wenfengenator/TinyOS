@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 FAT16 filesystem (kernel/fat64.c) — persistent block device when
  * available, embedded RAM image otherwise.  Supports whole-file and offset I/O. */
 #ifndef TINYOS_FAT64_H
