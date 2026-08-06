@@ -73,6 +73,7 @@ void     fb_get(uint32_t *w, uint32_t *h);     /* visible dimensions            
 void     fb_present(const uint32_t *back);     /* blit a tight w*h back buffer     */
 void     fb_present_diff(const uint32_t *back, uint32_t *shadow,
                         uint32_t w, uint32_t h); /* blit only changed scanlines     */
+void     fb_panel_power(int on);               /* Intel PWM backlight; no-op elsewhere */
 
 /* display layer (kernel/disp64.c): a swappable backend behind a stable seam.
  * The default backend is the GOP / Hyper-V framebuffer (double buffer + scanline
@@ -172,10 +173,11 @@ int      arch_run_panes(void *pane0_term);     /* router loop; returns when all 
 int      arch_pane_count(void);                /* number of active panes (0 = native console) */
 void    *arch_cur_pane_term(void);             /* running shell's pane terminal (usys_write target) */
 void     arch_panes_draw(uint32_t *back, int cx, int cy, int cw, int ch);   /* render the pane grid */
-/* Low-power sleep: blank the panel + stop compositing (deep HLT idle) on lid
- * close, restore on lid open / keypress.  power_poll() samples the lid. */
+/* System suspend: stop audio, blank/power down the panel, and block the
+ * foreground task in HLT until lid-open or a keypress. */
 void     wm_sleep_set(int on);
 int      wm_is_sleeping(void);
+void     wm_sleep_wait(void);
 void     power_poll(void);
 int      acpi_lid_open(void);                  /* 1 = lid open (or EC absent), 0 = closed */
 int      acpi_power_button(void);              /* 1 on a fresh power-button press (latch cleared) */

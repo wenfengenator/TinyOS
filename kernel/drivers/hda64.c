@@ -261,7 +261,12 @@ int hda_play(const int16_t *samples, uint32_t frames) {
     hda_verb(codec, dac, 0x706, 0x10); hda_verb(codec, dac, 0x200, HDA_FORMAT);
     w32(stream_off, (1u << 20) | 2u);
     uint64_t end = millis() + ((uint64_t)frames * 1000u + HDA_RATE - 1) / HDA_RATE + 20;
-    while (millis() < end && !(r8(stream_off + 3) & 4)) { wm_pump(); __asm__ volatile("pause"); }
+    while (millis() < end && !(r8(stream_off + 3) & 4)) {
+        power_poll();
+        if (wm_is_sleeping()) { stop_stream(); wm_sleep_wait(); return 0; }
+        wm_pump();
+        __asm__ volatile("pause");
+    }
     stop_stream(); return (int)frames;
 }
 

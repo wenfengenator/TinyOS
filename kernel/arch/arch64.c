@@ -726,9 +726,17 @@ static int linux_uname(void *buf) {
 static int linux_nanosleep(const void *req, void *rem) {
     if (!req) return -14;
     const uint64_t *ts = (const uint64_t *)req;   /* {tv_sec, tv_nsec} */
-    uint64_t ms = ts[0] * 1000 + ts[1] / 1000000;
-    uint64_t t0 = millis();
-    while (millis() - t0 < ms) __asm__ volatile("pause");
+    uint64_t remaining = ts[0] * 1000 + ts[1] / 1000000;
+    uint64_t last = millis();
+    while (remaining) {
+        power_poll();
+        if (wm_is_sleeping()) { wm_sleep_wait(); last = millis(); continue; }
+        uint64_t now = millis(), elapsed = now - last;
+        if (elapsed >= remaining) break;
+        remaining -= elapsed;
+        last = now;
+        idle_wait();
+    }
     if (rem) { ((uint64_t *)rem)[0] = 0; ((uint64_t *)rem)[1] = 0; }
     return 0;
 }
@@ -774,6 +782,8 @@ static int linux_prlimit(void *old) {
 uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
                    uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a3; (void)a4; (void)a5;
+    power_poll();
+    wm_sleep_wait();
     if (g_user_abi == USER_ABI_DEMO) {          /* scheduler self-test procs */
         if (num == 0x2000) sched_block((int)a0); /* blocking "read" -> yield the CPU     */
         else if (num == 0x2001) {                /* exit(status): zombie + retire task   */
@@ -2341,6 +2351,11 @@ static int64_t gfx_present(int handle, int x, int y) {
     int k;
     if (pane_in_use()) k = pane_trykey();
     else { k = kbd64_getkey(); if (k < 0) k = hvkbd_getkey(); }
+    if (k == KEY_F3) {
+        wm_hotkey(k);
+        wm_sleep_wait();
+        return 0;
+    }
     return k < 0 ? 0 : k;
 }
 

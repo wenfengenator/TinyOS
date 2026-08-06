@@ -26,6 +26,12 @@ static inline void outb(uint16_t port, uint8_t val) {
 static inline uint8_t inb(uint16_t port) {
     uint8_t r; __asm__ volatile("inb %1, %0" : "=a"(r) : "Nd"(port)); return r;
 }
+static inline void outl(uint16_t port, uint32_t val) {
+    __asm__ volatile("outl %0, %1" :: "a"(val), "Nd"(port));
+}
+static inline uint32_t inl(uint16_t port) {
+    uint32_t r; __asm__ volatile("inl %1, %0" : "=a"(r) : "Nd"(port)); return r;
+}
 void serial_init(void) {
     outb(COM1 + 1, 0x00); outb(COM1 + 3, 0x80); outb(COM1 + 0, 0x03);
     outb(COM1 + 1, 0x00); outb(COM1 + 3, 0x03); outb(COM1 + 2, 0xC7);
@@ -42,6 +48,63 @@ static uint32_t g_w, g_h, g_pitch, g_fmt;
 static uint32_t g_cx, g_cy;             /* text cursor (glyph cells)             */
 static uint32_t g_fg = 0xC0C0C0;        /* light grey on dark blue               */
 static uint32_t g_bg = 0x001020;
+
+/* Haswell Intel display PWM registers.  Save and restore both CPU and PCH
+ * controls because firmware may route the internal panel through either path.
+ * Other GPUs and VMs are left untouched. */
+#define BLC_PWM_CPU_CTL  0x48254
+#define BLC_PWM_PCH_CTL2 0xC8254
+static volatile uint8_t *g_igd;
+static uint32_t g_cpu_ctl, g_pch_ctl2;
+static int g_panel_saved, g_panel_off;
+
+static uint32_t pci_read(int bus, int dev, int fn, int off) {
+    uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)dev << 11) |
+                    ((uint32_t)fn << 8) | (uint32_t)(off & 0xFC);
+    outl(0xCF8, addr);
+    return inl(0xCFC);
+}
+
+static void panel_probe(void) {
+    if (g_igd) return;
+    for (int bus = 0; bus < 256 && !g_igd; bus++) for (int dev = 0; dev < 32 && !g_igd; dev++) {
+        uint32_t id = pci_read(bus, dev, 0, 0);
+        if ((id & 0xFFFFu) != 0x8086u) continue;
+        uint32_t cls = pci_read(bus, dev, 0, 8);
+        if ((cls >> 24) != 0x03) continue;
+        uint32_t lo = pci_read(bus, dev, 0, 0x10);
+        if ((lo & 1u) || !(lo & ~0xFu)) continue;
+        uint64_t bar = lo & ~0xFu;
+        if ((lo & 6u) == 4) bar |= (uint64_t)pci_read(bus, dev, 0, 0x14) << 32;
+        g_igd = (volatile uint8_t *)(uintptr_t)bar;
+    }
+}
+
+static uint32_t igd_read(uint32_t off) { return *(volatile uint32_t *)(g_igd + off); }
+static void igd_write(uint32_t off, uint32_t value) {
+    *(volatile uint32_t *)(g_igd + off) = value;
+    (void)*(volatile uint32_t *)(g_igd + off);           /* posting read */
+}
+
+void fb_panel_power(int on) {
+    panel_probe();
+    if (!g_igd) return;
+    if (!on && !g_panel_off) {
+        g_cpu_ctl = igd_read(BLC_PWM_CPU_CTL);
+        g_pch_ctl2 = igd_read(BLC_PWM_PCH_CTL2);
+        g_panel_saved = 1;
+        /* Keep the PWM clocks/controllers running.  Disabling both controllers
+         * loses the firmware-programmed panel sequencing on Haswell and the
+         * T440s may not light again when raw register snapshots are restored. */
+        igd_write(BLC_PWM_CPU_CTL, 0);
+        igd_write(BLC_PWM_PCH_CTL2, g_pch_ctl2 & 0xFFFF0000u);
+        g_panel_off = 1;
+    } else if (on && g_panel_off && g_panel_saved) {
+        igd_write(BLC_PWM_CPU_CTL, g_cpu_ctl);
+        igd_write(BLC_PWM_PCH_CTL2, g_pch_ctl2);
+        g_panel_off = 0;
+    }
+}
 
 /* Pack an 0xRRGGBB colour for the firmware's pixel layout.  pixel_format gives
  * the in-memory byte order; as a little-endian dword that is:

@@ -409,10 +409,10 @@ static void setup_windows(boot_info_t *bi) {
 static volatile uint64_t g_ui_activity_ms;
 void ui_note_activity(void) { g_ui_activity_ms = millis(); }
 
-/* ---- low-power sleep (lid close / manual) --------------------------------
- * When asleep the compositor stops (screen held black, deepest HLT idle) and,
- * on the real T440s, the EC has already cut the panel backlight in hardware.
- * Any keypress or a lid-open transition wakes it. */
+/* ---- system suspend (lid close / manual) ----------------------------------
+ * The foreground task blocks here while audio is stopped and the panel is
+ * powered down.  This is not ACPI S3: entering S3 safely also requires a resume
+ * trampoline plus device restoration, which TinyOS does not yet provide. */
 static volatile int g_sleeping;
 int wm_is_sleeping(void) { return g_sleeping; }
 /* Timestamp of the last full-screen TinyGL present; while it is recent, wm_pump
@@ -422,14 +422,40 @@ void wm_note_gfx_present(void) { g_gfx_present_ms = millis(); }
 void wm_sleep_set(int on) {
     if (on == g_sleeping) return;
     g_sleeping = on ? 1 : 0;
-    if (!g_back) return;
-    if (on) {                                           /* blank the framebuffer once */
-        for (uint32_t i = 0, n = g_scr_w * g_scr_h; i < n; i++) g_back[i] = 0;
-        disp_present();
-    } else {                                            /* wake: force a fresh full frame */
+    if (on) {
+        hda_stop();
+        if (g_back) {
+            for (uint32_t i = 0, n = g_scr_w * g_scr_h; i < n; i++) g_back[i] = 0;
+            disp_present_full();
+        }
+        fb_panel_power(0);
+    } else {
+        fb_panel_power(1);
         ui_note_activity();
-        compositor(g_back);
-        disp_present();
+        if (g_back) {
+            compositor(g_back);
+            disp_present_full();
+        }
+    }
+}
+
+void wm_sleep_wait(void) {
+    while (g_sleeping) {
+        power_poll();
+        int key = kbd64_getkey();
+        if (key < 0) key = hvkbd_getkey();
+        if (key >= 0) { wm_sleep_set(0); break; }       /* consume the wake key */
+        uint64_t t0 = millis();
+        if (sched_is_running()) {
+            __asm__ volatile("sti; hlt; cli");
+        } else if (lapic_ready()) {
+            lapic_idle_arm();
+            __asm__ volatile("sti; hlt; cli");
+            lapic_idle_disarm();
+        } else {
+            sleep_ms(3);
+        }
+        cpu_idle_add_ms(millis() - t0);
     }
 }
 
