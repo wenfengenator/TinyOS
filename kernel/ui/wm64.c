@@ -415,10 +415,11 @@ void ui_note_activity(void) { g_ui_activity_ms = millis(); }
  * trampoline plus device restoration, which TinyOS does not yet provide. */
 static volatile int g_sleeping;
 int wm_is_sleeping(void) { return g_sleeping; }
-/* Timestamp of the last full-screen TinyGL present; while it is recent, wm_pump
- * stands down so the compositor does not fight the app for the framebuffer. */
-static volatile uint64_t g_gfx_present_ms;
-void wm_note_gfx_present(void) { g_gfx_present_ms = millis(); }
+/* A presented ring-3 surface owns the display until it is destroyed.  Lifetime
+ * ownership keeps the desktop from flashing over compute-heavy graphics apps. */
+static volatile unsigned g_gfx_owners;
+void wm_gfx_acquire(void) { g_gfx_owners++; }
+void wm_gfx_release(void) { if (g_gfx_owners) g_gfx_owners--; }
 void wm_sleep_set(int on) {
     if (on == g_sleeping) return;
     g_sleeping = on ? 1 : 0;
@@ -486,7 +487,7 @@ void wm_pump(void) {
     static uint64_t idle_slot = (uint64_t)-1;
     if (!g_back || g_sleeping) return;                  /* asleep: hold the black screen */
     uint64_t t = millis();
-    if (t - g_gfx_present_ms < 600) return;             /* a fullscreen GL app owns the screen */
+    if (g_gfx_owners) return;                           /* a TinyGL app owns the screen */
     if (t - pump_last < 33) return;                     /* 30 FPS hard cap */
     if (t - g_ui_activity_ms > 300) {                   /* idle: skip redundant blits */
         uint64_t slot = t / 500;                        /* cursor blink + clock tick */

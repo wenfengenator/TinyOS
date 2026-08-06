@@ -73,8 +73,8 @@ uint64_t sched_tick(uint64_t cur_rsp) {
     if (g_tasks[g_cur].is_user) {                       /* ring-3 proc: point the  */
         arch_set_tss_rsp0(g_tasks[g_cur].rsp0);         /* fault + syscall stacks  */
         arch_set_syscall_stack(g_tasks[g_cur].rsp0);    /* at this proc's kstack   */
-        if (g_tasks[g_cur].proc) arch_switch_current(g_tasks[g_cur].proc); /* syscalls act on it */
     }
+    if (g_tasks[g_cur].proc) arch_switch_current(g_tasks[g_cur].proc);
     if (g_tasks[g_cur].cr3) wrcr3(g_tasks[g_cur].cr3);  /* switch address space    */
     return g_tasks[g_cur].rsp;
 }
@@ -285,6 +285,7 @@ void sched_init(void) {
     g_cur = 0; g_switches = 0;
     g_tasks[0].state = T_RUNNING; g_tasks[0].stack = 0; /* task 0 = the caller's context */
     g_tasks[0].cr3   = rdcr3();                         /* resume in the kernel address space */
+    g_tasks[0].proc  = arch_current_process();          /* restore `current` with task 0 */
 }
 
 static volatile int g_sched_running;               /* 1 while the LAPIC timer is firing */

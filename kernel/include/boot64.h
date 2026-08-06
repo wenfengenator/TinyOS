@@ -161,10 +161,10 @@ void     cpu_idle_add_ms(uint64_t ms);         /* add halted time from a HLT out
 
 /* composite + present one desktop frame (kernel/wm64.c); used by blocking syscalls */
 void     wm_pump(void);
-/* A ring-3 graphics app (TinyGL) just presented a full-screen frame; the WM
- * compositor stands down briefly so it does not overdraw the app's output with
- * the desktop chrome / pane grid.  Called from gfx_present (kernel/arch64.c). */
-void     wm_note_gfx_present(void);
+/* Track ring-3 TinyGL display ownership so the WM compositor does not overdraw
+ * a live graphics app while it is rendering or computing between frames. */
+void     wm_gfx_acquire(void);
+void     wm_gfx_release(void);
 /* Note UI activity (keypress / terminal output) so wm_pump repaints at 30 FPS
  * briefly, then drops to ~2 FPS when idle to save power. */
 void     ui_note_activity(void);

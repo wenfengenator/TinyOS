@@ -28,6 +28,7 @@ void term_active_size(int *cols, int *rows);/* active terminal grid size (SYS_WI
 /* scheduler support + Phase B user-preemption self-test */
 void arch_set_tss_rsp0(uint64_t rsp0);      /* set TSS.RSP0 for the running proc  */
 void arch_switch_current(void *proc);       /* scheduler: set `current` on a switch */
+void *arch_current_process(void);           /* scheduler: capture task 0's proc context */
 int  arch_usched_selftest(uint32_t *a, uint32_t *b, uint32_t *switches); /* two ring-3 procs, own address spaces; results via out-params */
 int  arch_proc_test(int stress);            /* process-table alloc/free/reuse test  */
 int  arch_procsched_test(void);             /* Phase C: schedule a real proc, run to exit, reap */

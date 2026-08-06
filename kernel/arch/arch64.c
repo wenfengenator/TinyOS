@@ -340,6 +340,7 @@ void arch_switch_current(void *proc) {
     current = p;
     write_fs_base(p->fs_base);                         /* restore incoming TLS base */
 }
+void *arch_current_process(void) { return current; }
 
 /* ---- syscall dispatch (called from kernel/trap64.s:syscall_entry) ---- */
 static int arch_exec_named(const char *name, const char *arg);  /* nested child */
@@ -2301,7 +2302,7 @@ int arch_bo_zerocopy_test(void) {
  * them through the display backend.  An app renders into the mapped BO and the
  * compositor samples it in place — no pixel copy crosses the syscall boundary. */
 #define GFX_MAX_BO 16
-static struct gfx_slot { tgl_bo_t *bo; uint64_t uva, bytes; uint64_t *owner; } g_gfx[GFX_MAX_BO];
+static struct gfx_slot { tgl_bo_t *bo; uint64_t uva, bytes; uint64_t *owner; int presented; } g_gfx[GFX_MAX_BO];
 
 /* Channel shifts that reproduce fb64's device packing (probed via fb_pack). */
 static void gfx_shifts(uint32_t *rsh, uint32_t *gsh, uint32_t *bsh) {
@@ -2331,7 +2332,7 @@ static int64_t gfx_bo_create(uint32_t w, uint32_t h, void *user_desc) {
     uint64_t uva = arch_bo_map_user(bo->surf.px, (uint32_t)bytes);
     if (!uva) { tgl_bo_unref(bo); return -12; }
     g_gfx[slot].bo = bo; g_gfx[slot].uva = uva; g_gfx[slot].bytes = bytes;
-    g_gfx[slot].owner = current->vm.pml4;
+    g_gfx[slot].owner = current->vm.pml4; g_gfx[slot].presented = 0;
     struct { uint64_t va; uint32_t w, h, stride, rsh, gsh, bsh; int32_t handle; uint32_t pad; } d;
     d.va = uva; d.w = bo->surf.w; d.h = bo->surf.h; d.stride = bo->surf.w;
     gfx_shifts(&d.rsh, &d.gsh, &d.bsh);
@@ -2342,7 +2343,10 @@ static int64_t gfx_bo_create(uint32_t w, uint32_t h, void *user_desc) {
 
 static int64_t gfx_present(int handle, int x, int y) {
     if (handle < 0 || handle >= GFX_MAX_BO || !g_gfx[handle].bo) return -22;
-    wm_note_gfx_present();                            /* tell the compositor to stand down */
+    if (!g_gfx[handle].presented) {
+        g_gfx[handle].presented = 1;
+        wm_gfx_acquire();                             /* hold display ownership until close */
+    }
     tgl_bind(tgl_screen());                          /* composite BO -> back buffer -> display */
     tgl_compose(&g_gfx[handle].bo->surf, x, y);
     tgl_present();
@@ -2369,7 +2373,9 @@ static int64_t gfx_bo_destroy(int handle) {
         write_cr3((uint64_t)current->vm.pml4);       /* flush the stale TLB entries */
     }
     tgl_bo_unref(g_gfx[handle].bo);
-    g_gfx[handle].bo = 0; g_gfx[handle].uva = g_gfx[handle].bytes = 0; g_gfx[handle].owner = 0;
+    if (g_gfx[handle].presented) wm_gfx_release();
+    g_gfx[handle].bo = 0; g_gfx[handle].uva = g_gfx[handle].bytes = 0;
+    g_gfx[handle].owner = 0; g_gfx[handle].presented = 0;
     return 0;
 }
 
@@ -3432,6 +3438,7 @@ static struct proc     *g_pane_proc[PANE_MAX];
 static void            *g_pane_term[PANE_MAX];
 static void            *g_pane0_term;          /* the WM-owned terminal (pane 0); never term_free'd here */
 static int              g_pane_n, g_pane_focus;
+static volatile int     g_pane_layout_changed;
 #define PANE_CHAN(i)    (0x50000000 + (i))
 /* All pane readers block on ONE shared wait channel and re-check their own ring
  * on wake.  A shared channel (vs per-pane) is immune to the renumber race: a
@@ -3515,16 +3522,23 @@ static void reap_pane(int i) {
         proc_free(p);
     }
     if (g_pane_term[i] && g_pane_term[i] != g_pane0_term) term_free(g_pane_term[i]);  /* never free the WM's pane-0 terminal */
+    __asm__ volatile("cli");                           /* readers must not observe a half-moved pane */
     for (int j = i; j < g_pane_n - 1; j++) {           /* compact: shift the survivors down */
         g_pane_term[j] = g_pane_term[j + 1];
         g_pane_proc[j] = g_pane_proc[j + 1];
         g_pin[j] = g_pin[j + 1];
         g_ttys[j] = g_ttys[j + 1];                      /* move the shell's line discipline too */
-        if (g_pane_proc[j]) g_pane_proc[j]->pane = j;   /* renumber the shell to its new pane */
+        for (int k = 1; k < PROC_MAX; k++)              /* shell plus any forked foreground app */
+            if (g_proc[k].state != PROC_UNUSED && g_proc[k].pane == j + 1)
+                g_proc[k].pane = j;
     }
     g_pane_n--;
+    if (g_pane_focus > i) g_pane_focus--;               /* keep focus on the same survivor */
     if (g_pane_focus >= g_pane_n) g_pane_focus = g_pane_n > 0 ? g_pane_n - 1 : 0;
+    g_pane_layout_changed = 1;
     sched_wake(PANE_CHAN_ALL);   /* wake all readers so renumbered shells re-check their ring */
+    __asm__ volatile("sti");
+    ui_note_activity();          /* force the compositor to apply the new geometry promptly */
 }
 
 /* Launch the split-pane shell system.  Runs as task 0 (the router) until every
@@ -3539,6 +3553,7 @@ int arch_run_panes(void *pane0_term) {
 
     struct proc *parent = current;
     for (int i = 0; i < PANE_MAX; i++) { g_pin[i].r = g_pin[i].w = 0; g_pane_proc[i] = 0; g_pane_term[i] = 0; }
+    g_pane_layout_changed = 0;
     g_pane_term[0] = pane0_term; g_pane0_term = pane0_term; g_pane_n = 1; g_pane_focus = 0;
 
     sched_init();
@@ -3556,7 +3571,7 @@ int arch_run_panes(void *pane0_term) {
                     int i = g_pane_n;
                     g_pin[i].r = g_pin[i].w = 0; g_pane_term[i] = t;
                     g_pane_proc[i] = spawn_pane_shell(img, size, i, parent);
-                    if (g_pane_proc[i]) { g_pane_n++; g_pane_focus = i; }
+                    if (g_pane_proc[i]) { g_pane_n++; g_pane_focus = i; g_pane_layout_changed = 1; }
                     else { term_free(t); g_pane_term[i] = 0; }
                 }
                 ui_note_activity();
@@ -3612,6 +3627,10 @@ void arch_panes_draw(uint32_t *back, int cx, int cy, int cw, int ch) {
         if (trows < 2) trows = 2;
         term_resize(g_pane_term[i], tcols, trows);
         term_draw_t(g_pane_term[i], back, ix, iy, gw, gh, foc);
+    }
+    if (g_pane_layout_changed) {
+        g_pane_layout_changed = 0;
+        for (int i = 0; i < n; i++) pane_push(i, '\f'); /* post-resize full-redraw request */
     }
 }
 

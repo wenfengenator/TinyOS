@@ -314,6 +314,18 @@ static void clamp_view(void) {
     }
 }
 
+static void update_size(void) {
+    struct winsize ws;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0) {
+        if (ws.ws_row > 5) rows = ws.ws_row;
+        if (ws.ws_col > 20) cols = ws.ws_col;
+    }
+    top_segment = 0;
+    left = 0;
+    clamp_view();
+    outs("\x1b[2J\x1b[H");
+}
+
 int main(int argc, char **argv) {
     lines = (char (*)[MAX_COLS + 1])calloc(MAX_LINES, sizeof(*lines));
     if (!lines) { outs("vim: cannot allocate text buffer\n"); return 1; }
@@ -325,6 +337,7 @@ int main(int argc, char **argv) {
     while (running) {
         if (help_active) render_help(); else render();
         message[0] = 0; char ch; if (read(0, &ch, 1) <= 0) continue; int c = (unsigned char)ch;
+        if (c == '\f') { update_size(); continue; }
         if (help_active) {
             int page = rows - 2, max_top = HELP_LINES > page ? HELP_LINES - page : 0;
             if (c == 'q' || c == 27) help_active = 0;
