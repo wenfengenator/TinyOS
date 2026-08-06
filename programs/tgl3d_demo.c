@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyGL 3D demo — a userspace spinning, textured, depth-tested cube rendered
  * entirely by the client library's software rasterizer (programs/tcc_include/
  * tinygl.h), straight into a zero-copy buffer the kernel then presents.

@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
 # Build TinyOS's target toolchain (musl libc + TinyCC) entirely from source that
 # is vendored in this repo under third_party/.  No network access and no distro
 # packages are required — only a standard host toolchain (gcc, make, coreutils).

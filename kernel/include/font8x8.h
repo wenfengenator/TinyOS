@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* Complete 8x8 bitmap font for the framebuffer console (kernel/fb64.c).
  *
  * Covers ASCII 0x20..0x7E (space .. tilde) INCLUDING lowercase, so text now

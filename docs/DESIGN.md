@@ -8,6 +8,8 @@
 > 64-bit UEFI edition — long mode, SMP, the framebuffer desktop, persistent
 > FAT16 on Hyper-V/QEMU, the Linux-compatible ABI, musl, and the on-device
 > self-hosting compiler — see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+> The static MicroPython runtime and its native TinyGL/audio bridge are covered
+> separately in [`MICROPYTHON.md`](MICROPYTHON.md).
 
 ## 1. Overview
 

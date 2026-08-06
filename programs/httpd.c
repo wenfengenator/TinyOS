@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* httpd — a tiny HTTP/1.0 server for TinyOS (Cycle 8 N4).
  *
  * Listens on a TCP port and serves one small page per connection using the BSD

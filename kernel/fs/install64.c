@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 — clean-install disk imager.
  *
  * Writes a fresh MBR + FAT32 EFI System Partition (type 0xEF) containing TinyOS's

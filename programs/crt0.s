@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 # tinyos user program startup (crt0), linked at USER_BASE (0x40000000).
 # Passes the exec argument pointer (mapped at 0x50000000) to umain(), then
 # performs sys_exit(return value).

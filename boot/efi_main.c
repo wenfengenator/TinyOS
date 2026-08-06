@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 UEFI loader (R2).
  *
  * Self-contained: NO gnu-efi, NO mingw.  We declare just enough of the UEFI ABI

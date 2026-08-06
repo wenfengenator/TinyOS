@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 kernel entry (R3).
  *
  * Reached from the UEFI loader (boot/efi_main.c) via the assembly trampoline

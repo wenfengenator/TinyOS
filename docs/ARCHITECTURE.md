@@ -402,6 +402,26 @@ The shell reaches all of this: an unknown command is tokenized into `argv` and
 run through `execve`, so `./musl.bin`, `./tcc.bin foo.c -o foo.bin`, and
 `./foo.bin` all work from the prompt.
 
+### MicroPython on the Linux ABI
+
+MicroPython is deliberately not embedded in the kernel. The official v1.26.1
+Unix port is built as a static, non-PIE musl ELF64 program and packaged as
+`/PYTHON.BIN`. It therefore follows the same ELF loader, System V stack,
+private page-table, VFS, tty, memory-syscall, and process-reclamation path as
+TinyCC and the other static Linux programs.
+
+The `minimal` variant is extended at build time with two native user C modules:
+`tgl` and `taudio`. Their ordinary Python object and drawing logic runs in ring
+3. Private syscall numbers outside the Linux range provide only the hardware
+boundary: TinyGL buffer creation/presentation/destruction and Intel HDA
+readiness/tone/diagnostics/volume.
+
+TinyGL buffer creation maps the buffer object's pixel pages directly into the
+MicroPython process. `Surface.fill`, `disc`, `text`, and the other raster
+methods write to that mapping without copying frames through the kernel;
+`present` asks the compositor to display it. See
+[`MICROPYTHON.md`](MICROPYTHON.md) for the end-to-end build and runtime path.
+
 ---
 
 ## 13. Userland: musl and the on-device toolchain
@@ -548,6 +568,9 @@ make tinyos.vhdx              # -> tinyos.vhdx (GPT: FAT32 ESP + FAT16 data)
 
 # One-time: build musl + TinyCC from vendored source (third_party/) into /tmp
 make setup-tcc
+
+# Build pinned MicroPython with the native TinyGL and audio modules
+make setup-micropython
 ```
 
 Requirements: `gcc`/`g++` + binutils (`ld` supporting `-mi386pep`, `objcopy`
@@ -559,6 +582,10 @@ target toolchain (musl libc + TinyCC) is built from source vendored in
 At the sign-in panel log in with `root` / `root`. From the terminal, `help`
 lists commands; `./musl.bin`, `./printf.bin`, and `./tcc.bin file.c -o out.bin`
 demonstrate the Linux-ABI path.
+
+`python /hello.py`, `python /audio.py`, `python /tgl.py`, and
+`python /reversi.py` exercise the MicroPython language, HDA, zero-copy TinyGL,
+and graphical game paths respectively.
 
 ---
 
@@ -577,6 +604,10 @@ demonstrate the Linux-ABI path.
 - **Hardware.** The daily-driver Hyper-V VM is the final gate; the COM1 serial
   log is captured over a named pipe to confirm the same markers on real
   hardware (10/10 cores, StorVSC persistence, Linux-ABI probes, TCC).
+- **MicroPython.** The pinned interpreter is checked as a static ELF, its
+  built-in modules are imported on the host, scripts are compiled with
+  `mpy-cross`, and graphics/audio are exercised under QEMU + OVMF with emulated
+  Intel HDA. Reversi rendering is verified from a framebuffer capture.
 
 See [`TEST_RESULTS.md`](TEST_RESULTS.md) for the recorded outcomes.
 

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 ACPI power management + Embedded Controller.
  *
  * Enough ACPI to (a) power the machine off cleanly (S5) and reset it, and (b)

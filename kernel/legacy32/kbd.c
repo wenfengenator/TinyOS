@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos PS/2 keyboard driver (IRQ1).
  *
  * On real hardware the keyboard controller raises IRQ1; irq1_stub (entry.s)

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 static const char message[] = "[tcc] on-device compiled ELF executed\n";
 
 void _start(void) {

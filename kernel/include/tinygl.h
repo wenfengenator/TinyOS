@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyGL (Cycle 7): a small bespoke graphics API — a rendering API that draws
  * into a surface, and a composition API that places surfaces on screen and
  * presents through the display backend (kernel/disp64.c).  Not a GL/GLES subset.

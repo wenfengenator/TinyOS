@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyOS audio user API: Intel HDA, 48 kHz signed 16-bit stereo PCM.
  * Plain C and header-only so on-device TinyCC applications can include it. */
 #ifndef TINYOS_AUDIO_H

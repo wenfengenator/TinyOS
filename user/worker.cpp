@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 // tinyos worker app (C++), ring 3.
 // Tasks A and B run this same code concurrently; the scheduler preempts them
 // so their output interleaves.  Each also exercises the file syscalls by

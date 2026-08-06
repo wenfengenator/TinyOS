@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyOS userspace TLS 1.3 client — Cycle 9 Phase C4.
  *
  * A minimal RFC 8446 client: X25519 key exchange, TLS_CHACHA20_POLY1305_SHA256,

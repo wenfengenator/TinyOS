@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 monotonic time: TSC calibrated against the ACPI PM timer.
  *
  * The 8254 PIT is unreliable on some hypervisors (Hyper-V Gen 2 especially), so

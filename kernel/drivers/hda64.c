@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* Intel High Definition Audio: minimal synchronous PCM output for TinyOS.
  * Targets the analog HDA codec used by machines such as the ThinkPad T440s.
  * Format is fixed at 48 kHz, signed 16-bit, stereo. */

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 arch layer (Cycle 4, Phase B): ring-0/ring-3 privilege split.
  *
  * arch_init() installs our own GDT (kernel + user code/data), a TSS (so faults

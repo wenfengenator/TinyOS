@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyOS userspace DEFLATE/zlib decompressor — Cycle 9 C6a (git over HTTPS).
  *
  * git packfiles store every object zlib-compressed (RFC 1950 wrapper around a

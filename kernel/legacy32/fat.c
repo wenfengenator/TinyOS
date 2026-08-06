@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos FAT16 reader/writer — mounts a filesystem image from the second disk
  * (via kernel/ata.c).  Reads directories and files created with tools/mkfatfs.py
  * or mkfs.vfat -F16, and writes whole files back (fat_write) so edits persist to

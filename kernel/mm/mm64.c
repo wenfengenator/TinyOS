@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 heap: a simple allocator over UEFI conventional memory.
  *
  * After ExitBootServices every EfiConventionalMemory region is ours to use, and

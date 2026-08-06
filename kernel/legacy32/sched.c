@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos tasks & scheduler state.
  *
  * On real hardware the PIT timer IRQ calls schedule() and switch_context()

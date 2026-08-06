@@ -2,7 +2,9 @@
 
 TinyOS provides a minimal Intel High Definition Audio driver for analog laptop
 outputs, initially targeting the ThinkPad T440s. The userspace interface is the
-header-only `/include/taudio.h` API and is compatible with on-device TinyCC.
+header-only `programs/tcc_include/taudio.h` API, staged as
+`/include/taudio.h`, and is compatible with on-device TinyCC. MicroPython uses
+the same kernel interface through its built-in `taudio` module.
 
 ## Hardware test
 
@@ -57,6 +59,34 @@ output stream. It does not yet provide mixing, interrupt-driven queues, volume
 control through codec amplifier gain, input, HDMI audio, or automatic headphone
 switching. Master volume is applied by software scaling before DMA.
 
+## MicroPython API
+
+The static `/PYTHON.BIN` interpreter includes `taudio` as a built-in native
+module:
+
+```python
+import taudio
+
+if taudio.ready():
+    taudio.volume(60)
+    taudio.tone(440, 120, 70)
+```
+
+The Python API provides `ready()`, `tone(hz, duration_ms, volume)`, `stop()`,
+`volume()`, `volume(level)`, and `info()`. Frequency is limited to 20 through
+12,000 Hz, duration to 1 through 300 ms, and volume to 0 through 100. `info()`
+returns `(stage, gcap, codecs, codec, afg, dac, pin, volume)`.
+
+Run the packaged smoke test with:
+
+```sh
+python /audio.py
+```
+
+Like the C API, Python tone playback is synchronous. See
+[`MICROPYTHON.md`](MICROPYTHON.md) for how the native module is compiled into
+the interpreter and crosses into the HDA driver.
+
 ## Pac-Man demo
 
 `pacman` uses `taudio_tone()` for alternating pellet chirps, energizers, eaten
@@ -67,3 +97,6 @@ because playback is synchronous. Set the master level before launching it:
 audio 45
 pacman
 ```
+
+The packaged `/reversi.py` also uses `taudio` for startup, legal and illegal
+moves, passes, mode changes, and game-over results.

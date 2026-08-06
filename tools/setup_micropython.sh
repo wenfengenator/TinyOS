@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
 # Build a static-musl MicroPython Unix binary for TinyOS.
 set -eu
 

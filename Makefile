@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
 # tinyos build
 #
 #   make               build os.img (boot + kernel + user)   [ARCH=i386, default]

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* git — a minimal git clone/ls-remote client over HTTP(S) for TinyOS (Cycle 9 C6).
  *
  * Speaks the git smart-HTTP protocol: it discovers refs with

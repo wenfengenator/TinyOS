@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* Public-domain VGA 8x16 bitmap font (IBM VGA ROM letterforms) for the
  * framebuffer console + terminal (kernel/drivers/fb64.c).  Extracted from the
  * console-setup VGA16 font; ASCII 0x20..0x7E, 16 rows/glyph, row 0 on top,

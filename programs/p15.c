@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* 15-Puzzle for TinyOS — renders through the TinyGL user library (tinygl.h).
  *
  * Build off-device with musl-gcc (staged as /P15.BIN) or on device:

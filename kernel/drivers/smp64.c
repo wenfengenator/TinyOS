@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 SMP bring-up (R8).
  *
  * Enumerates CPUs from the ACPI MADT, then starts every application processor

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyOS userspace networking helper — Cycle 8 N4.
  *
  * Sockets themselves are the standard BSD API (<sys/socket.h> etc.); the only

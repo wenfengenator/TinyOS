@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
 # tinyos C compiler wrapper.
 # Prefers a system gcc; falls back to the WSL/snap host toolchain when running
 # inside the Copilot sandbox (where gcc lives under the hostfs mount).

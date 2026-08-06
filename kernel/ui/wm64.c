@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 tiny windowing system (Cycle 3).
  *
  * A keyboard-driven desktop compositor over the GOP framebuffer.  Every frame it

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyOS Vim POC: standalone, TCC-compatible modal editor with C highlighting.
  * On device: ./tcc.bin /vim.c -o /vim.bin ; ./vim.bin file.c */
 #include <unistd.h>

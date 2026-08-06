@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 polled PS/2 keyboard (i8042).
  *
  * No IDT/IRQ yet, so we poll: when the controller's output buffer is full

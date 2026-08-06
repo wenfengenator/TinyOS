@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 # tinyos low-level entry & stubs (the little bit that must be assembly)
     .code32
 

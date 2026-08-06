@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* wget — a minimal HTTP/1.0 client for TinyOS (Cycle 8 N4).
  *
  * Resolves a host (DNS via the kernel resolver, or a dotted-quad literal),

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 graphics demo (R5) — exercises every Doom-enabling primitive:
  *   heap      : a full-screen 32-bpp back buffer allocated with kmalloc()
  *   timer     : millis()-driven animation + FPS counter

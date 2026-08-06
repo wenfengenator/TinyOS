@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 "pong" — a classic two-paddle ball game rendered to a full-screen
  * 32-bpp back buffer, in the same style as kernel/demo64.c.  Launched from the
  * terminal console with the `pong` command.
