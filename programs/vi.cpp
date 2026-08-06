@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 // tinyos "vi" — a minimal modal full-screen editor (ramdisk program, ring 3).
 // Normal mode: h j k l move, i insert, a append, o open line, x delete char,
 //              : command (:w write, :q quit, :wq).  Insert mode: type, Enter,

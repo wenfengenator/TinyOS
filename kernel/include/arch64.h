@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 arch layer (Cycle 4, Phase B): ring-0/ring-3 privilege split. */
 #ifndef TINYOS_ARCH64_H
 #define TINYOS_ARCH64_H
@@ -5,6 +7,8 @@
 #include "boot64.h"
 
 void arch_init(void);                       /* install our GDT + TSS + IDT       */
+void arch_fb_mem_diag(uint64_t base, uint64_t size); /* report framebuffer memory type (perf) */
+void arch_fb_set_wc(uint64_t base, uint64_t size);   /* make the framebuffer write-combining */
 void arch_set_irq_gate(int vec, uint64_t handler); /* live IDT gate (scheduler timer) */
 void arch_user_init(void);                  /* set up the reusable ring-3 region */
 int  arch_user_run_named(const char *name, const char *arg); /* run a built-in program; exit code, or -1 if unknown */

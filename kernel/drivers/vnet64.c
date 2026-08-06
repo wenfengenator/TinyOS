@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 virtio-net (legacy PCI) network driver — Cycle 8 Phase N1.
  *
  * Moves Ethernet frames in and out over the QEMU paravirtual NIC using the same

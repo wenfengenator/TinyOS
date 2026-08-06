@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyGL user API (Cycle 7 G7): a tcc-buildable client library for the TinyOS
  * kernel graphics driver.
  *

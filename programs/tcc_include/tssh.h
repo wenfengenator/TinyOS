@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyOS userspace SSH transport — Cycle 9 C7b (git over SSH).
  *
  * Implements the SSH 2.0 transport layer (RFC 4253) far enough to clone over

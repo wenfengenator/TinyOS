@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 minimal TCP — Cycle 8 Phase N3.
  *
  * A compact, correct-enough TCP for a teaching OS: the connection state machine

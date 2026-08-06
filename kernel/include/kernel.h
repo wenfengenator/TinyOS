@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos kernel — shared definitions */
 #ifndef TINYOS_KERNEL_H
 #define TINYOS_KERNEL_H

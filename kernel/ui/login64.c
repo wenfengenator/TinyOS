@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 login screen (Cycle 4, Phase A).
  *
  * Shown after boot, before the desktop (kernel/wm64.c).  Renders a framebuffer
@@ -50,13 +52,12 @@ void login_run(boot_info_t *bi) {
     char ubuf[L_MAX + 4] = {0}, pbuf[L_MAX + 4] = {0};
     int  ulen = 0, plen = 0, field = 0;             /* field 0=login 1=password */
     const char *msg = "";
-    int  dirty = 1, last_blink = -1;                /* repaint only on change    */
+    uint64_t last_frame = 0;                         /* ~30 FPS cap (present continuously) */
     kputs("[login] awaiting credentials (default root/root)\n");
 
     for (;;) {
-        int k, got = 0;
+        int k;
         while ((k = kbd64_getkey()) >= 0 || (k = hvkbd_getkey()) >= 0) {
-            got = 1;
             if (k == '\n' || k == '\r') {
                 if (field == 0) {
                     field = 1;
@@ -80,14 +81,12 @@ void login_run(boot_info_t *bi) {
             }
         }
 
-        /* Repaint only when something changed (a key or the 2 Hz cursor blink),
-         * so we don't flood Hyper-V's synthetic video with a continuous full-
-         * frame blit — that stalls the Virtual Machine Connection console. */
-        int blink = (int)((millis() / 500) & 1);
-        if (got || blink != last_blink) dirty = 1;
-        last_blink = blink;
-        if (!dirty) { sleep_ms(5); continue; }
-        dirty = 0;
+        /* Present continuously at ~30 FPS (scanline-diff blits nothing while the
+         * panel is static, so no synthvid flood); real HW shows each frame's write
+         * burst on the next present, so a keypress must not be required to paint. */
+        uint64_t t = millis();
+        if (t - last_frame < 33) { sleep_ms(3); continue; }
+        last_frame = t;
 
         /* ---- render the sign-in panel ---- */
         L_fill(bb, 0, 0, (int)L_w, (int)L_h, 0x0A1424);          /* backdrop     */

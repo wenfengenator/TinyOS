@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 # tinyos boot sector — 512 bytes, real mode -> 32-bit protected mode
 # Assembled with GNU as (AT&T syntax).  BIOS loads this at 0x7c00.
 #

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 user program startup (crt0).
  *
  * The 64-bit counterpart of programs/crt0.s: it calls umain() and then performs

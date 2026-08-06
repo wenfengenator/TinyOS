@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 // tinyos ramdisk program: a standalone image exec'd into its own isolated,
 // paged address space at USER_BASE (0x40000000).  Ring 3, syscalls via int 0x80.
 #include "ulib.h"

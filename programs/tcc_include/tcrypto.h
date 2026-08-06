@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyOS userspace crypto library — Cycle 9 (secure comms: HTTPS / git / SSH).
  *
  * Phase C1: the hashing primitives that everything else is built on —

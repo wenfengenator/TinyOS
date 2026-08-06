@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 UEFI loader (R2).
  *
  * Self-contained: NO gnu-efi, NO mingw.  We declare just enough of the UEFI ABI
@@ -166,6 +168,24 @@ typedef struct _EFI_SIMPLE_FS {
     EFI_VOLUME_OPEN OpenVolume;
 } EFI_SIMPLE_FS;
 
+/* ---- Block I/O (to tell a USB boot from a fixed-disk boot for the installer) ---- */
+typedef struct {
+    uint32_t MediaId;
+    uint8_t  RemovableMedia;
+    uint8_t  MediaPresent;
+    uint8_t  LogicalPartition;
+    uint8_t  ReadOnly;
+    uint8_t  WriteCaching;
+    uint8_t  _pad[3];
+    uint32_t BlockSize;
+    /* remaining fields unused */
+} EFI_BLOCK_IO_MEDIA;
+typedef struct {
+    uint64_t Revision;
+    EFI_BLOCK_IO_MEDIA *Media;
+    /* remaining function pointers unused */
+} EFI_BLOCK_IO_PROTOCOL;
+
 /* ---- COM1 serial (headless verification, also used before ExitBootServices) ---- */
 #define COM1 0x3F8
 static inline void outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0,%1" :: "a"(v), "Nd"(p)); }
@@ -189,6 +209,12 @@ static EFI_GUID LOADED_IMAGE_GUID =
     { 0x5b1b31a1, 0x9562, 0x11d2, { 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } };
 static EFI_GUID SIMPLE_FS_GUID =
     { 0x964e5b22, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } };
+/* EFI_BLOCK_IO_PROTOCOL GUID {964e5b21-6459-11d2-8e39-00a0c969723b} */
+static EFI_GUID BLOCK_IO_GUID =
+    { 0x964e5b21, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } };
+/* EFI_DEVICE_PATH_PROTOCOL GUID {09576e91-6d3f-11d2-8e39-00a0c969723b} */
+static EFI_GUID DEVICE_PATH_GUID =
+    { 0x09576e91, 0x6d3f, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } };
 static EFI_GUID FILE_INFO_GUID =
     { 0x09576e92, 0x6d3f, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } };
 /* ACPI 2.0 table GUID (identifies the RSDP in the UEFI configuration table) */
@@ -239,6 +265,66 @@ static void load_asset(EFI_BOOT_SERVICES *BS, EFI_HANDLE img, boot_info_t *bi) {
     sputs("[efi] asset: TINYWAD.DAT loaded\n");
 }
 
+/* Load the loader's own \EFI\BOOT\BOOTX64.EFI into memory so the disk installer
+ * can copy TinyOS onto the internal disk.  Same machinery as load_asset. */
+static void load_self_efi(EFI_BOOT_SERVICES *BS, EFI_HANDLE img, boot_info_t *bi) {
+    EFI_LOADED_IMAGE_PROTOCOL *li = 0;
+    if (BS->HandleProtocol(img, &LOADED_IMAGE_GUID, (void **)&li) != EFI_SUCCESS || !li) return;
+    EFI_SIMPLE_FS *fs = 0;
+    if (BS->HandleProtocol(li->DeviceHandle, &SIMPLE_FS_GUID, (void **)&fs) != EFI_SUCCESS || !fs) return;
+    EFI_FILE_PROTOCOL *root = 0;
+    if (fs->OpenVolume(fs, &root) != EFI_SUCCESS || !root) return;
+    EFI_FILE_PROTOCOL *file = 0;
+    static CHAR16 name[] = u"\\EFI\\BOOT\\BOOTX64.EFI";
+    if (root->Open(root, &file, (CHAR16 *)name, 1, 0) != EFI_SUCCESS || !file) {
+        sputs("[efi] self: BOOTX64.EFI not found\n"); return;
+    }
+    uint8_t info[256] __attribute__((aligned(8))); UINTN isz = sizeof(info);
+    if (file->GetInfo(file, &FILE_INFO_GUID, &isz, info) != EFI_SUCCESS) { file->Close(file); return; }
+    uint64_t fsize = *(uint64_t *)(info + 8);
+    void *buf = 0;
+    if (BS->AllocatePool(EFILOADERDATA, fsize, &buf) != EFI_SUCCESS || !buf) { file->Close(file); return; }
+    file->SetPosition(file, 0);
+    UINTN rd = fsize;
+    if (file->Read(file, &rd, buf) != EFI_SUCCESS) { file->Close(file); return; }
+    file->Close(file);
+    bi->efi_base = (uint64_t)(uintptr_t)buf;
+    bi->efi_size = rd;
+    sputs("[efi] self: BOOTX64.EFI loaded for the installer\n");
+}
+
+/* Determine whether we booted from removable media (USB stick) or a fixed disk
+ * (the internal SSD).  The installer is only allowed from removable media so it
+ * can never re-wipe the disk it was installed onto.  The boot partition's
+ * RemovableMedia flag is unreliable (logical partitions report FALSE even on
+ * USB), so the primary signal is a USB node in the boot device path. */
+static int devpath_is_usb(EFI_BOOT_SERVICES *BS, EFI_HANDLE dev) {
+    void *dp = 0;
+    if (BS->HandleProtocol(dev, &DEVICE_PATH_GUID, &dp) != EFI_SUCCESS || !dp) return 0;
+    uint8_t *p = (uint8_t *)dp;
+    for (int guard = 0; guard < 64; guard++) {
+        uint8_t type = p[0], sub = p[1];
+        uint16_t len = (uint16_t)(p[2] | (p[3] << 8));
+        if (type == 0x7F || len < 4) break;                       /* End / malformed */
+        if (type == 0x03 && (sub == 0x05 || sub == 0x0F || sub == 0x10)) return 1; /* USB messaging node */
+        p += len;
+    }
+    return 0;
+}
+static void detect_boot_media(EFI_BOOT_SERVICES *BS, EFI_HANDLE img, boot_info_t *bi) {
+    bi->booted_removable = 0;
+    EFI_LOADED_IMAGE_PROTOCOL *li = 0;
+    if (BS->HandleProtocol(img, &LOADED_IMAGE_GUID, (void **)&li) != EFI_SUCCESS || !li) return;
+    if (devpath_is_usb(BS, li->DeviceHandle)) bi->booted_removable = 1;
+    else {                                                         /* fallback: RemovableMedia flag */
+        EFI_BLOCK_IO_PROTOCOL *bio = 0;
+        if (BS->HandleProtocol(li->DeviceHandle, &BLOCK_IO_GUID, (void **)&bio) == EFI_SUCCESS
+            && bio && bio->Media && bio->Media->RemovableMedia) bi->booted_removable = 1;
+    }
+    sputs(bi->booted_removable ? "[efi] booted from removable media (USB)\n"
+                              : "[efi] booted from fixed disk (install disabled)\n");
+}
+
 /* ---- entry point (UEFI calls this with the MS x64 ABI) ---- */
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_BOOT_SERVICES *BS = SystemTable->BootServices;
@@ -284,6 +370,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     /* 1b) load the WAD-sized asset while boot services are still up */
     load_asset(BS, ImageHandle, &g_bi);
+    load_self_efi(BS, ImageHandle, &g_bi);       /* our own EFI, for the disk installer */
+    detect_boot_media(BS, ImageHandle, &g_bi);   /* USB vs fixed-disk boot (install gate) */
 
     /* 1c) find the ACPI RSDP in the UEFI configuration table (for SMP/MADT) */
     {

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 // tinyos ring-3 shell: reads commands from the terminal (SYS_READ) and runs them.
 // Built-ins, plus launching the other embedded programs via sys::exec (SYS_EXEC).
 #include "ulib.h"

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 FAT16 filesystem — a port of kernel/fat.c backed by a RAM-resident
  * disk image embedded in the kernel (build/fatfs.h, built from disk/ by
  * tools/mkfatfs.py).  The image is copied into writable pages at boot so whole-
@@ -916,3 +918,7 @@ int fs_chdir(const char *path) {
 }
 
 void fs_getcwd(char *out) { s_copy(out, g_cwd); }
+
+/* set the cwd to an already-absolute, normalized path (validated by the caller);
+ * used by the /mnt + /usb VFS routing in kernel/arch64.c. */
+void fs_setcwd(const char *abs) { if (abs && abs[0] == '/') s_copy(g_cwd, abs); }

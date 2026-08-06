@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos programmable interval timer (PIT) + 8259 PIC — the hardware source of
  * preemption.  On real hardware / QEMU the PIT raises IRQ0 ~100x/second; the
  * asm stub irq0_stub (entry.s) runs on_timer() and could invoke the scheduler

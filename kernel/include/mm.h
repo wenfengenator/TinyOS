@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos memory management: physical frame allocator + paging. */
 #ifndef TINYOS_MM_H
 #define TINYOS_MM_H

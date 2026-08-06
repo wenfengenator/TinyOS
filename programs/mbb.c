@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* mbb — a musl-static multi-call "mini-busybox" for TinyOS.
  *
  * Proves the Tier-1 Unix substrate: a shell that runs pipelines (fork + pipe +
@@ -265,14 +267,83 @@ static int ap_ls(int argc, char **argv) {
     closedir(d);
     return 0;
 }
-static int ap_cp(int argc, char **argv) {
-    if (argc < 3) { outs(2, "usage: cp SRC DST\n"); return 1; }
-    int s = open(argv[1], O_RDONLY); if (s < 0) { outs(2, "cp: cannot open source\n"); return 1; }
-    int d = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC); if (d < 0) { close(s); outs(2, "cp: cannot open dest\n"); return 1; }
-    char b[512]; int n; while ((n = read(s, b, sizeof b)) > 0) write(d, b, n);
-    close(s); close(d); return 0;
+/* join dir + '/' + name -> out (bounded) */
+static void cp_join(char *out, int cap, const char *dir, const char *name) {
+    int n = 0;
+    for (const char *p = dir; *p && n < cap - 2; p++) out[n++] = *p;
+    if (n && out[n - 1] != '/') out[n++] = '/';
+    for (const char *p = name; *p && n < cap - 1; p++) out[n++] = *p;
+    out[n] = 0;
 }
-static int ap_mv(int argc, char **argv) { if (ap_cp(argc, argv)) return 1; unlink(argv[1]); return 0; }
+static const char *cp_base(const char *p) {
+    const char *b = p;
+    for (const char *q = p; *q; q++) if (*q == '/') b = q + 1;
+    return b;
+}
+static int cp_is_dir(const char *p) {
+    struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+/* copy one regular file src -> dst (full paths); routes across /, /mnt, /usb */
+static int cp_file(const char *src, const char *dst) {
+    int s = open(src, O_RDONLY);
+    if (s < 0) { outs(2, "cp: cannot open "); outs(2, src); outs(2, "\n"); return 1; }
+    int d = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+    if (d < 0) { close(s); outs(2, "cp: cannot create "); outs(2, dst); outs(2, "\n"); return 1; }
+    char b[512]; int n, rc = 0;
+    while ((n = read(s, b, sizeof b)) > 0) if (write(d, b, n) != n) { rc = 1; break; }
+    if (n < 0) rc = 1;
+    close(s); close(d);
+    return rc;
+}
+/* copy src -> dst; recurse into directories when rflag is set */
+static int cp_tree(const char *src, const char *dst, int rflag) {
+    struct stat st;
+    if (stat(src, &st) != 0) { outs(2, "cp: "); outs(2, src); outs(2, ": not found\n"); return 1; }
+    if (!S_ISDIR(st.st_mode)) return cp_file(src, dst);
+    if (!rflag) { outs(2, "cp: omitting directory "); outs(2, src); outs(2, " (use -r)\n"); return 1; }
+    mkdir(dst, 0755);                                  /* ok if it already exists */
+    DIR *dir = opendir(src);
+    if (!dir) { outs(2, "cp: cannot read "); outs(2, src); outs(2, "\n"); return 1; }
+    struct dirent *e; int rc = 0;
+    while ((e = readdir(dir))) {
+        if (e->d_name[0] == '.' && (e->d_name[1] == 0 || (e->d_name[1] == '.' && e->d_name[2] == 0))) continue;
+        char sp[288], dp[288];
+        cp_join(sp, sizeof sp, src, e->d_name);
+        cp_join(dp, sizeof dp, dst, e->d_name);
+        if (cp_tree(sp, dp, rflag)) rc = 1;
+    }
+    closedir(dir);
+    return rc;
+}
+/* cp [-r] SRC... DST  — like coreutils cp: recursive, multiple sources into a
+ * directory, and works across the /, /mnt and /usb filesystems. */
+static int ap_cp(int argc, char **argv) {
+    int rflag = 0, i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++)
+        for (const char *f = argv[i] + 1; *f; f++) {
+            if (*f == 'r' || *f == 'R' || *f == 'a') rflag = 1;
+            else { outs(2, "cp: unknown option -"); write(2, f, 1); outs(2, "\n"); return 1; }
+        }
+    if (argc - i < 2) { outs(2, "usage: cp [-r] SRC... DST\n"); return 1; }
+    const char *dst = argv[argc - 1];
+    int into_dir = cp_is_dir(dst);
+    if (argc - i > 2 && !into_dir) { outs(2, "cp: target '"); outs(2, dst); outs(2, "' is not a directory\n"); return 1; }
+    int rc = 0;
+    for (int k = i; k < argc - 1; k++) {
+        if (into_dir) {
+            char dp[288]; cp_join(dp, sizeof dp, dst, cp_base(argv[k]));
+            if (cp_tree(argv[k], dp, rflag)) rc = 1;
+        } else if (cp_tree(argv[k], dst, rflag)) rc = 1;
+    }
+    return rc;
+}
+/* mv [-r] SRC... DST  — copy then remove the sources (files only). */
+static int ap_mv(int argc, char **argv) {
+    if (ap_cp(argc, argv)) return 1;
+    int i = 1; for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {}
+    for (int k = i; k < argc - 1; k++) unlink(argv[k]);
+    return 0;
+}
 static int ap_rm(int argc, char **argv) {
     int rc = 0, i = 1; while (i < argc && argv[i][0] == '-') i++;
     for (; i < argc; i++) if (unlink(argv[i]) < 0) { outs(2, "rm: "); outs(2, argv[i]); outs(2, ": failed\n"); rc = 1; }
@@ -398,15 +469,15 @@ static int ap_expr(int argc, char **argv) {
  * Normal: h j k l / arrows move; 0 $ line ends; i a A insert; o open; x del;
  * dd del line; : ex (:w :q :wq :x :q!).  Insert: type, Tab, Enter, Backspace,
  * arrows, ESC.  Line-number gutter + long-line wrapping like the native vi. */
-#define VI_MAXL 512
-#define VI_MAXC 200
-#define VI_GUT  4
+#define VI_MAXL (512 * 3)
+#define VI_MAXC (200 * 2)
+#define VI_GUT  5
 #define VK_UP 0x80
 #define VK_DOWN 0x81
 #define VK_LEFT 0x82
 #define VK_RIGHT 0x83
 static char vbuf[VI_MAXL][VI_MAXC + 2];
-static int  vlen[VI_MAXL], vnl, vcx, vcy, vtop, vVH = 23, vVW = 76, vdirty;
+static int  vlen[VI_MAXL], vnl, vcx, vcy, vtop, vVH = 23, vVW = 75, vdirty;
 static char vfname[128];
 
 static void vout(const char *s) { int n = 0; while (s[n]) n++; if (n) write(1, s, n); }
@@ -484,10 +555,11 @@ static void vi_redraw(const char *status) {
         for (int k = 0; k < rows && r < vVH; k++, r++) {
             char num[VI_GUT];
             if (k == 0) { int ln = i + 1;
-                num[0] = (ln >= 100) ? (char)('0' + (ln / 100) % 10) : ' ';
-                num[1] = (ln >= 10)  ? (char)('0' + (ln / 10) % 10)  : ' ';
-                num[2] = (char)('0' + ln % 10); num[3] = ' ';
-            } else { num[0] = num[1] = num[2] = num[3] = ' '; }
+                num[0] = (ln >= 1000) ? (char)('0' + (ln / 1000) % 10) : ' ';
+                num[1] = (ln >= 100)  ? (char)('0' + (ln / 100) % 10)  : ' ';
+                num[2] = (ln >= 10)   ? (char)('0' + (ln / 10) % 10)   : ' ';
+                num[3] = (char)('0' + ln % 10); num[4] = ' ';
+            } else { num[0] = num[1] = num[2] = num[3] = num[4] = ' '; }
             vxy(r + 1, 1); write(1, num, VI_GUT);
             int start = k * vVW, n = vlen[i] - start; if (n > vVW) n = vVW;
             if (n > 0) write(1, vbuf[i] + start, n);
@@ -512,7 +584,7 @@ static int ap_vi(int argc, char **argv) {
     raw.c_lflag &= ~(ICANON | ECHO | ISIG);
     tcsetattr(0, TCSANOW, &raw);
 
-    int ins = 0, run = 1;
+    int ins = 0, run = 1, count = 0;           /* count = pending numeric prefix, e.g. 10G */
     while (run) {
         char st[128]; int p = 0;               /* status line (native-style) */
         if (ins) { const char *m = "-- INSERT --  (ESC=normal)"; while (*m && p < 127) st[p++] = *m++; }
@@ -537,12 +609,16 @@ static int ap_vi(int argc, char **argv) {
             else if (c == '\t') { int n = 4 - (vcx & 3); while (n-- > 0) vi_ins(' '); }
             else if (c >= 32 && c < 127) vi_ins((char)c);
         } else {                               /* ---- NORMAL ---- */
+            if ((c >= '1' && c <= '9') || (c == '0' && count > 0)) { count = count * 10 + (c - '0'); continue; }
+            int cnt = count; count = 0;        /* consume any pending [count] for this command */
             if (c == 'h' || c == VK_LEFT) { if (vcx > 0) vcx--; }
             else if (c == 'l' || c == VK_RIGHT) { if (vcx < vlen[vcy]) vcx++; }
             else if (c == 'j' || c == VK_DOWN) { if (vcy < vnl - 1) { vcy++; if (vcx > vlen[vcy]) vcx = vlen[vcy]; } }
             else if (c == 'k' || c == VK_UP) { if (vcy > 0) { vcy--; if (vcx > vlen[vcy]) vcx = vlen[vcy]; } }
             else if (c == '0') vcx = 0;
             else if (c == '$') vcx = vlen[vcy] ? vlen[vcy] - 1 : 0;
+            else if (c == 'G') { vcy = cnt > 0 ? cnt - 1 : vnl - 1; if (vcy >= vnl) vcy = vnl - 1; if (vcy < 0) vcy = 0; vcx = 0; }
+            else if (c == 'g') { char g2; if (read(0, &g2, 1) > 0 && g2 == 'g') { vcy = cnt > 0 ? cnt - 1 : 0; if (vcy >= vnl) vcy = vnl - 1; if (vcy < 0) vcy = 0; vcx = 0; } }
             else if (c == 'i') ins = 1;
             else if (c == 'a') { if (vcx < vlen[vcy]) vcx++; ins = 1; }
             else if (c == 'A') { vcx = vlen[vcy]; ins = 1; }

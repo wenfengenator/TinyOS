@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 kernel console: COM1 serial + GOP linear framebuffer.
  *
  * Runs after ExitBootServices, so it touches only hardware the firmware left in
@@ -5,7 +7,7 @@
  * mirrored to both, so the boot can be verified headlessly over serial while a
  * VM/monitor shows the same output on screen. */
 #include "boot64.h"
-#include "font8x8.h"
+#include "font8x16.h"
 
 /* Freestanding memcpy/memset so the compiler always has a real symbol to call
  * (built as -fno-builtin so these loops are not turned back into self-calls). */
@@ -84,29 +86,57 @@ void fb_get(uint32_t *w, uint32_t *h) { if (w) *w = g_w; if (h) *h = g_h; }
 
 /* Blit a tightly-packed w*h back buffer (device pixels) onto the framebuffer,
  * accounting for the hardware row stride. */
+/* Copy `npx` 32-bit pixels to the (uncached / write-combining) GOP framebuffer
+ * with 64-bit stores: half the bus transactions of a dword copy and an eighth of
+ * the byte-wise memcpy the blit used to use — the difference between ~3 FPS and a
+ * fluid desktop when the framebuffer is uncached on real hardware. */
+static inline void fb_blit_row(volatile uint32_t *dst, const uint32_t *src, uint32_t npx) {
+    volatile uint64_t *d64 = (volatile uint64_t *)dst;
+    const uint64_t *s64 = (const uint64_t *)src;
+    uint32_t n64 = npx >> 1;
+    for (uint32_t i = 0; i < n64; i++) d64[i] = s64[i];
+    if (npx & 1) dst[npx - 1] = src[npx - 1];      /* odd trailing pixel */
+}
+
+/* Push the CPU write-combining buffers out to the panel so a WC-mapped
+ * framebuffer refreshes on its own.  sfence drains the WC buffers; the extra
+ * IN evicts them too (Intel SDM 11.3) — which is precisely why the display used
+ * to update only when a key was pressed (PS/2 handling does port I/O).  Doing it
+ * here means every present is visible without waiting for a keystroke. */
+static inline void fb_flush(void) {
+    __asm__ volatile("sfence" ::: "memory");
+    (void)inb(0x80);                               /* I/O-port read: forces WC eviction */
+}
+
 void fb_present(const uint32_t *back) {
     if (!g_fb) return;
     for (uint32_t y = 0; y < g_h; y++)
-        memcpy((void *)(g_fb + y * g_pitch), back + y * g_w, (unsigned long)g_w * 4);
+        fb_blit_row(g_fb + y * g_pitch, back + y * g_w, g_w);
+    fb_flush();
 }
 
 /* Present only the scanlines that differ from `shadow` (updated in place), so a
  * mostly-static screen skips the slow framebuffer / Hyper-V synthvid writes for
- * unchanged rows.  `back` and `shadow` are tight w*h buffers. */
+ * unchanged rows.  Within a changed row only the [x0,x1) span that actually
+ * differs is blitted, so a blinking cursor or a ticking clock costs a handful of
+ * pixel writes rather than a full 1920-wide row.  `back`/`shadow` are tight w*h. */
 void fb_present_diff(const uint32_t *back, uint32_t *shadow, uint32_t w, uint32_t h) {
     if (!g_fb) return;
     for (uint32_t y = 0; y < h; y++) {
         const uint32_t *b = back + (uint64_t)y * w;
         uint32_t *s = shadow + (uint64_t)y * w;
-        uint32_t x = 0;
-        while (x < w && b[x] == s[x]) x++;
-        if (x == w) continue;                         /* row unchanged: skip FB write */
-        memcpy((void *)(g_fb + (uint64_t)y * g_pitch), b, (unsigned long)w * 4);
-        memcpy(s, b, (unsigned long)w * 4);
+        uint32_t x0 = 0;
+        while (x0 < w && b[x0] == s[x0]) x0++;
+        if (x0 == w) continue;                         /* row unchanged: skip FB write */
+        uint32_t x1 = w;
+        while (x1 > x0 && b[x1 - 1] == s[x1 - 1]) x1--;   /* trim the matching suffix */
+        fb_blit_row(g_fb + (uint64_t)y * g_pitch + x0, b + x0, x1 - x0);
+        for (uint32_t i = x0; i < x1; i++) s[i] = b[i];   /* shadow tracks only the change */
     }
+    fb_flush();
 }
 
-/* Draw a string into a tight w-pitched buffer at pixel (x,y), each 8x8 glyph
+/* Draw a string into a tight w-pitched buffer at pixel (x,y), each 8x16 glyph
  * magnified by an integer `scale` (nearest-neighbour, so it stays crisp). */
 void fb_text_to_s(uint32_t *buf, uint32_t x, uint32_t y,
                   const char *s, uint32_t fg_rgb, uint32_t bg_rgb, uint32_t scale) {
@@ -115,10 +145,10 @@ void fb_text_to_s(uint32_t *buf, uint32_t x, uint32_t y,
     for (; *s; s++) {
         unsigned uc = (unsigned char)*s;
         if (uc < FONT_FIRST || uc > FONT_LAST) uc = '?';
-        const unsigned char *g = font8x8[uc - FONT_FIRST];
-        for (uint32_t row = 0; row < 8; row++) {
+        const unsigned char *g = font8x16[uc - FONT_FIRST];
+        for (uint32_t row = 0; row < FONT_H; row++) {
             unsigned char bits = g[row];
-            for (uint32_t col = 0; col < 8; col++) {
+            for (uint32_t col = 0; col < FONT_W; col++) {
                 uint32_t px = (bits & (1u << col)) ? fg : bg;
                 for (uint32_t sy = 0; sy < scale; sy++) {
                     uint32_t yy = y + row * scale + sy;
@@ -130,7 +160,7 @@ void fb_text_to_s(uint32_t *buf, uint32_t x, uint32_t y,
                 }
             }
         }
-        x += 8 * scale;
+        x += FONT_W * scale;
     }
 }
 
@@ -140,36 +170,37 @@ void fb_text_to(uint32_t *buf, uint32_t x, uint32_t y,
     fb_text_to_s(buf, x, y, s, fg_rgb, bg_rgb, 1);
 }
 
-/* boot console glyph cell: the 8x8 font magnified CON_SCALE times */
-#define CON_SCALE 2
-#define CON_CELL  (8 * CON_SCALE)
+/* boot console glyph cell: the 8x16 font magnified CON_SCALE times */
+#define CON_SCALE 1
+#define CON_CW    (FONT_W * CON_SCALE)
+#define CON_CH    (FONT_H * CON_SCALE)
 
 static void draw_glyph(char c, uint32_t cx, uint32_t cy) {
     unsigned uc = (unsigned char)c;
     if (uc < FONT_FIRST || uc > FONT_LAST) uc = '?';
-    const unsigned char *g = font8x8[uc - FONT_FIRST];
+    const unsigned char *g = font8x16[uc - FONT_FIRST];
     uint32_t fg = pack(g_fg), bg = pack(g_bg);
-    for (uint32_t row = 0; row < 8; row++) {
+    for (uint32_t row = 0; row < FONT_H; row++) {
         unsigned char bits = g[row];
-        for (uint32_t col = 0; col < 8; col++) {
+        for (uint32_t col = 0; col < FONT_W; col++) {
             uint32_t px = (bits & (1u << col)) ? fg : bg;
             for (uint32_t sy = 0; sy < CON_SCALE; sy++)
                 for (uint32_t sx = 0; sx < CON_SCALE; sx++)
-                    putpx(cx * CON_CELL + col * CON_SCALE + sx, cy * CON_CELL + row * CON_SCALE + sy, px);
+                    putpx(cx * CON_CW + col * CON_SCALE + sx, cy * CON_CH + row * CON_SCALE + sy, px);
         }
     }
 }
 static void fb_scroll(void) {
-    uint32_t rows = g_h / CON_CELL;
-    for (uint32_t y = 0; y < (rows - 1) * CON_CELL; y++)
+    uint32_t rows = g_h / CON_CH;
+    for (uint32_t y = 0; y < (rows - 1) * CON_CH; y++)
         for (uint32_t x = 0; x < g_w; x++)
-            g_fb[y * g_pitch + x] = g_fb[(y + CON_CELL) * g_pitch + x];
+            g_fb[y * g_pitch + x] = g_fb[(y + CON_CH) * g_pitch + x];
     uint32_t bg = pack(g_bg);
-    for (uint32_t y = (rows - 1) * CON_CELL; y < g_h; y++)
+    for (uint32_t y = (rows - 1) * CON_CH; y < g_h; y++)
         for (uint32_t x = 0; x < g_w; x++) g_fb[y * g_pitch + x] = bg;
 }
 static void fb_putc(char c) {
-    uint32_t cols = g_w / CON_CELL, rows = g_h / CON_CELL;
+    uint32_t cols = g_w / CON_CW, rows = g_h / CON_CH;
     if (c == '\n')       { g_cx = 0; g_cy++; }
     else if (c == '\r')  { g_cx = 0; }
     else {
@@ -231,3 +262,91 @@ void kput_u32dec(uint32_t v) {
     while (v) { b[n++] = '0' + (v % 10); v /= 10; }
     while (n--) kputc(b[n]);
 }
+
+/* ---- fatal-fault panic screen (kernel/arch/arch64.c:isr_c) -----------------
+ * Draw the exception straight to the framebuffer, bypassing BOTH the console
+ * cursor and the g_wm_active gate, so a fatal kernel fault is visible on real
+ * hardware even after the desktop has taken the screen (where kputc goes only to
+ * serial + the invisible scrollback — a headless laptop would otherwise just
+ * freeze with no diagnostics).  Direct pixel writes only: no locks, no
+ * allocation, no scrolling, so it is safe to call from an exception context. */
+#define PANIC_SCALE 2
+#define PANIC_ADV   (FONT_W * PANIC_SCALE)
+static void panic_glyph(uint32_t x, uint32_t y, char c, uint32_t fg, uint32_t bg) {
+    unsigned uc = (unsigned char)c;
+    if (uc < FONT_FIRST || uc > FONT_LAST) uc = '?';
+    const unsigned char *g = font8x16[uc - FONT_FIRST];
+    for (uint32_t row = 0; row < FONT_H; row++) {
+        unsigned char bits = g[row];
+        for (uint32_t col = 0; col < FONT_W; col++) {
+            uint32_t px = (bits & (1u << col)) ? fg : bg;
+            for (uint32_t sy = 0; sy < PANIC_SCALE; sy++)
+                for (uint32_t sx = 0; sx < PANIC_SCALE; sx++)
+                    putpx(x + col * PANIC_SCALE + sx, y + row * PANIC_SCALE + sy, px);
+        }
+    }
+}
+static uint32_t panic_str(uint32_t x, uint32_t y, const char *s, uint32_t fg, uint32_t bg) {
+    for (; *s; s++) { panic_glyph(x, y, *s, fg, bg); x += PANIC_ADV; }
+    return x;
+}
+static uint32_t panic_hex(uint32_t x, uint32_t y, uint64_t v, uint32_t fg, uint32_t bg) {
+    x = panic_str(x, y, "0x", fg, bg);
+    for (int i = 60; i >= 0; i -= 4) {
+        int d = (int)((v >> i) & 0xF);
+        panic_glyph(x, y, (char)(d < 10 ? '0' + d : 'A' + d - 10), fg, bg);
+        x += PANIC_ADV;
+    }
+    return x;
+}
+static uint32_t panic_soff(uint32_t x, uint32_t y, int64_t v, uint32_t fg, uint32_t bg) {
+    panic_glyph(x, y, v < 0 ? '-' : '+', fg, bg); x += PANIC_ADV;
+    return panic_hex(x, y, (uint64_t)(v < 0 ? -v : v), fg, bg);
+}
+static const char *panic_vec_name(uint64_t v) {
+    switch (v) {
+        case 0:  return "#DE divide error";
+        case 1:  return "#DB debug";
+        case 2:  return "NMI";
+        case 3:  return "#BP breakpoint";
+        case 6:  return "#UD invalid opcode";
+        case 7:  return "#NM device-not-available";
+        case 8:  return "#DF double fault";
+        case 10: return "#TS invalid TSS";
+        case 11: return "#NP segment not present";
+        case 12: return "#SS stack-segment fault";
+        case 13: return "#GP general protection";
+        case 14: return "#PF page fault";
+        case 16: return "#MF x87 fp error";
+        case 17: return "#AC alignment check";
+        case 18: return "#MC machine check";
+        case 19: return "#XM simd fp";
+        default: return "exception";
+    }
+}
+void fb_panic(uint64_t vec, uint64_t err, uint64_t rip, uint64_t cr2, uint64_t cs,
+              int64_t rip_off, const int64_t *bt, int nbt, int64_t mapoff) {
+    if (!g_fb) return;
+    uint32_t bg = pack(0x300000), fg = pack(0xFFFFFF), hd = pack(0xFFE060);
+    uint32_t band = g_h < 400 ? g_h : 400;
+    for (uint32_t y = 0; y < band; y++)
+        for (uint32_t x = 0; x < g_w; x++) g_fb[y * g_pitch + x] = bg;
+    uint32_t lh = PANIC_ADV + 6, x0 = 16, y = 12;
+    panic_str(x0, y, "*** TINYOS KERNEL PANIC ***", hd, bg); y += lh;
+    uint32_t x = panic_str(x0, y, "vector ", fg, bg);
+    x = panic_hex(x, y, vec, fg, bg);
+    panic_str(x + PANIC_ADV, y, panic_vec_name(vec), fg, bg); y += lh;
+    x = panic_str(x0, y, "err ", fg, bg); x = panic_hex(x, y, err, fg, bg);
+    x = panic_str(x, y, "  cs ", fg, bg); panic_hex(x, y, cs, fg, bg); y += lh;
+    x = panic_str(x0, y, "rip ", fg, bg); panic_hex(x, y, rip, fg, bg); y += lh;
+    x = panic_str(x0, y, "cr2 ", fg, bg); panic_hex(x, y, cr2, fg, bg); y += lh;
+    x = panic_str(x0, y, "rip@isr_c ", hd, bg); panic_soff(x, y, rip_off, hd, bg); y += lh;
+    x = panic_str(x0, y, "mapoff ", fg, bg); panic_soff(x, y, mapoff, fg, bg); y += lh;
+    x = panic_str(x0, y, "bt ", fg, bg);
+    for (int i = 0; i < nbt; i++) { x = panic_soff(x, y, bt[i], fg, bg); x += PANIC_ADV; }
+    y += lh;
+    panic_str(x0, y, "system halted - power-cycle to reboot", hd, bg);
+    fb_flush();          /* sfence + I/O: guarantee the panel shows it under WC */
+}
+
+

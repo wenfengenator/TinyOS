@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 process model (Cycle 6, Tier 1 Phase A).
  *
  * `struct proc` is the per-process object that replaces the old set of
@@ -65,6 +67,7 @@ struct proc {
     uint8_t *code;                  /* loaded image frames (Linux ABI)*/
     uint8_t *stk;                   /* user stack frames              */
     uint8_t *kstack_top;            /* SYSCALL kernel stack top       */
+    int      pane;                  /* terminal split-pane index (0..3) this shell owns */
     char name[16];                  /* for `ps`                       */
 };
 

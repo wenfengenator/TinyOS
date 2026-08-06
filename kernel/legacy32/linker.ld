@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos kernel linker script — flat binary loaded at 0x10000.
  * entry.s (.text.boot) is placed first so _start is exactly at 0x10000.
  * The C++ user layer is linked last (see Makefile object order). */

@@ -1,6 +1,6 @@
 # tinyos
 
-**Release: v1.0.0**
+**Release: v2.0.0**
 
 A teaching operating system built from scratch, in two editions that show its
 evolution:
@@ -126,16 +126,92 @@ application (`BOOTX64.EFI`). It boots on `qemu-system-x86_64` + OVMF and on
   that runs stock **musl** binaries and an **on-device TinyCC** — building
   ordinary/K&R C against the full musl standard-library headers, and
   recompiling itself.
+* **Concurrent processes** — real `fork`/`execve`/`wait4`, `pipe`, and signal
+  delivery, with a preemptive scheduler and **per-process frame reclamation**
+  (dead processes return their pages to the allocator).
+* **A tmux-style multi-pane terminal** — up to four **concurrent shells** in a
+  grid; **F5** splits a new pane, **F4** cycles focus. Each pane has its own
+  line discipline, history, and cursor, so you can edit in one pane while a
+  build runs in another.
+* **Power management for battery life** — an **HLT-based idle** (idle cores draw
+  ~0% instead of spinning), render-on-change compositing, a live **CPU %** meter,
+  and **sleep** (screen off + deep idle) on **F3**, **lid close**, or the
+  **power button**; a wake on lid-open or keypress.
+* **Runs on real hardware** — bring-up and stability hardening on a **ThinkPad
+  T440s** (Haswell): **AHCI** persistence at `/mnt`, **xHCI USB mass-storage**
+  read/write at `/usb` (the file bridge to the outside world), EC battery/AC
+  reporting, and a firmware-safe page-table teardown (see the release notes).
 
 ```bash
+make setup-tcc                # one-time: build musl + TinyCC from vendored source (third_party/)
+make setup-micropython        # build pinned MicroPython v1.26.1 as a static musl binary
 make ARCH=x64                 # build/BOOTX64.EFI (one PE32+ image)
 make run-x64-headless         # QEMU + OVMF, serial only (CI/sandbox)
 make tinyos.vhdx              # Hyper-V Gen 2 disk (attach; Secure Boot OFF)
-make setup-tcc                # stage musl + TinyCC for the on-device compiler
+make usb                      # tinyos-usb.img — GPT/UEFI image to dd onto a USB stick
+make run-x64-disk             # boot the GPT image itself in QEMU (real-hardware path)
 ```
 
+`make setup-tcc` is a **one-time prerequisite** that builds the musl libc and
+TinyCC entirely from source vendored under [`third_party/`](third_party/) — no
+network access or distro packages, just a standard host toolchain (`gcc`,
+`make`, binutils, Python). It stages the result under `/tmp`, so re-run it if
+`/tmp` is cleared (e.g. after a reboot).
+
+`make setup-micropython` fetches the official pinned MicroPython v1.26.1
+source, builds `mpy-cross`, and produces a static minimal Unix-port interpreter
+at `/tmp/tinyos-micropython/micropython`. Subsequent filesystem and USB builds
+package it as `/PYTHON.BIN`. The interpreter includes native `tgl` and `taudio`
+modules, and the images include `/hello.py`, `/tgl.py`, `/audio.py`, and the
+graphical, audio-enabled `/reversi.py`. On TinyOS:
+
+```sh
+python /hello.py
+python -c print(6*7)
+python /audio.py
+python /tgl.py
+python /reversi.py
+```
+
+Script files are preferred for multi-word expressions because the current
+TinyOS shell does not yet group quoted arguments.
+
+The minimal build currently imports `builtins`, `os`, `sys`, `tgl`, and
+`taudio`; it intentionally omits most optional standard-library modules. See
+[`docs/MICROPYTHON.md`](docs/MICROPYTHON.md) for the complete build, packaging,
+runtime, native-module, and extension walkthrough.
+
+### Boot on a real PC (USB)
+
+`tinyos-usb.img` (built by `make usb`) is a raw **GPT disk** whose FAT32 **EFI
+System Partition** holds `/EFI/BOOT/BOOTX64.EFI` — exactly what UEFI firmware
+boots from a USB stick. Write it and boot with **Secure Boot disabled**:
+
+```bash
+sudo dd if=tinyos-usb.img of=/dev/sdX bs=4M conv=fsync status=progress   # ERASES /dev/sdX
+```
+
+A physical PC has no virtio-blk/StorVSC, so TinyOS runs **live from a RAM disk**
+embedded in the loader (the mbb shell + coreutils, local `git`, standalone
+syntax-highlighting `vim`, Tetris/2048/Pac-Man/Sudoku/Snake/15-Puzzle/Reversi,
+MicroPython, the TinyGL demos, and an Intel HDA `audio` test). See
+[`docs/AUDIO.md`](docs/AUDIO.md) for the game sound API. On machines with a
+**SATA (AHCI)** controller — e.g. the
+ThinkPad T440s — the internal disk is mounted read/write at **`/mnt`** and
+persists across reboots, and a plugged-in **USB stick** is mounted at **`/usb`**
+(xHCI mass-storage) as the bridge for moving files in and out. A **PS/2 or
+legacy-USB keyboard** is required (no USB-HID stack yet); NVMe-only laptops have
+no persistence path yet.
+
 Sign in as `root` / `root`. From the terminal, `./musl.bin`,
-`./tcc.bin file.c -o out.bin`, and `./out.bin` exercise the Linux-ABI path.
+`./tcc.bin file.c -o out.bin`, and `./out.bin` exercise the Linux-ABI path;
+`./vim.bin file.c` opens the modal editor (`i`, Esc, `dd`, `yy`, `p`, `/`, and
+`:w`/`:q` are supported in the proof of concept). Use `:help` for its command
+reference; syntax highlighting is selected automatically for C/C++, Python,
+shell scripts, and Makefiles;
+`cp kr.c /usb/kr.c` copies a file out to the USB stick. Press **F5** to split
+the terminal into concurrent panes (**F4** to cycle focus), and **F3** (or close
+the lid) to sleep.
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 
 ## Layout
@@ -145,10 +221,10 @@ boot.asm          boot sector (assembly)
 kernel/           C kernel: mm/paging, fs, ramdisk, procs, sched, timer, kbd,
                   ata (disk), fat (FAT16), vfs (unified tree), entry.s
 user/             in-kernel ring-3 tasks (login, worker) + ulib.h
-programs/         standalone ramdisk programs: shell, hello, count, vi (editor)
+programs/         standalone ramdisk programs, games, mbb vi, and colored vim
 disk/             source tree baked into the FAT16 image (fs.img)
 tools/            emulate.py (Unicorn PC), mkramdisk.py, mkfatfs.py, xcc/xcxx
-docs/             GUIDE (beginner walkthrough), DESIGN, PROJECT_PLAN, TEST_PLAN, TEST_RESULTS
+docs/             GUIDE, ARCHITECTURE, MICROPYTHON, AUDIO, plans and test records
 Makefile
 ```
 
@@ -158,11 +234,15 @@ written for entry-level OS developers.
 
 Documentation map:
 
+* [`CHANGELOG.md`](CHANGELOG.md) — release notes per version (v2.0.0, v1.0.0).
 * [`docs/GUIDE.md`](docs/GUIDE.md) — beginner, concept-first walkthrough (32-bit).
 * [`docs/DESIGN.md`](docs/DESIGN.md) — architecture reference for the 32-bit kernel
   (memory map, boot flow, privilege model, `int 0x80` ABI, scheduler, emulator).
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the full **64-bit UEFI** system
   design (boot flow, SMP, display, storage, filesystem, Linux ABI, toolchain).
+* [`docs/MICROPYTHON.md`](docs/MICROPYTHON.md) — static interpreter integration,
+  native `tgl`/`taudio` modules, APIs, packaging, extension, and validation.
+* [`docs/AUDIO.md`](docs/AUDIO.md) — Intel HDA design and C/Python sound APIs.
 * [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) — objectives, phases, milestones
   across every cycle.
 * [`docs/TEST_PLAN.md`](docs/TEST_PLAN.md) / [`docs/TEST_RESULTS.md`](docs/TEST_RESULTS.md)
@@ -172,3 +252,13 @@ Documentation map:
   [`docs/CYCLE8_PLAN.md`](docs/CYCLE8_PLAN.md) — per-cycle plans (x64/graphics;
   compiler substrate; Tier 1 mini-Unix / busybox-static; **TinyGL** graphics
   stack; connectivity / TCP-IP / USB).
+
+## License
+
+TinyOS-authored source code and documentation are licensed under the GNU
+General Public License, version 2 only (`GPL-2.0-only`). See
+[`LICENSE`](LICENSE) for the complete terms.
+
+Files under [`third_party/`](third_party/) and other files carrying their own
+license notice remain under their respective upstream licenses. Generated
+images and bundled binaries may contain components under those separate terms.

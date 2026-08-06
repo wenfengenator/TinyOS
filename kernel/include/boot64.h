@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 boot handoff + kernel console API (shared by the UEFI loader in
  * boot/efi_main.c and the 64-bit kernel in kernel/kmain64.c, kernel/fb64.c). */
 #ifndef TINYOS_BOOT64_H
@@ -6,7 +8,7 @@
 #include <stdint.h>
 
 /* TinyOS product version. */
-#define TINYOS_VERSION "1.0.0"
+#define TINYOS_VERSION "2.0.0"
 
 /* Handoff block: the UEFI loader fills this before ExitBootServices and passes
  * a pointer to the 64-bit kernel entry. */
@@ -25,6 +27,9 @@ typedef struct {
     uint64_t rsdp;           /* ACPI RSDP physical address (for SMP/MADT), or 0 */
     uint32_t gop_modes;      /* count of GOP modes the firmware offered (diag)   */
     uint64_t boot_epoch;     /* UEFI GetTime() wall clock at boot (Unix sec), or 0 */
+    uint64_t efi_base;       /* loader's own \EFI\BOOT\BOOTX64.EFI in memory, or 0  */
+    uint64_t efi_size;       /* its size in bytes (for the disk installer)          */
+    uint64_t booted_removable; /* 1 = booted from removable media (USB), 0 = fixed disk */
 } boot_info_t;
 
 /* 32-bpp pixel formats (values match EFI_GRAPHICS_PIXEL_FORMAT 0 and 1). */
@@ -39,6 +44,8 @@ typedef struct {
 #define KEY_F1    0x84
 #define KEY_F2    0x85
 #define KEY_F3    0x86
+#define KEY_F4    0x87
+#define KEY_F5    0x88
 #define KEY_ESC   0x1B
 
 /* ---- kernel console: serial (COM1) + GOP framebuffer (kernel/fb64.c) ---- */
@@ -47,6 +54,9 @@ void     fb_init(const boot_info_t *bi);
 void     fb_fill(uint32_t rgb);
 void     fb_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t rgb);
 uint32_t fb_peek(uint32_t x, uint32_t y);      /* read a pixel back (verification) */
+void     fb_panic(uint64_t vec, uint64_t err, uint64_t rip,
+                  uint64_t cr2, uint64_t cs, int64_t rip_off,
+                  const int64_t *bt, int nbt, int64_t mapoff);  /* fatal-fault screen */
 void     kputc(char c);                        /* writes to serial + framebuffer   */
 void     kputs(const char *s);
 void     kput_u64hex(uint64_t v);
@@ -99,6 +109,7 @@ void     heap_init(const boot_info_t *bi);
 void    *kmalloc(uint64_t n);
 void     kfree(void *p);
 void    *page_alloc(uint64_t pages);           /* 4KB-aligned zeroed pages         */
+void    *page_base(void);                      /* heap arena base (VA==EFI PhysStart)*/
 void     page_free(void *p, uint64_t pages);   /* return a page run for reuse      */
 void    *memset(void *d, int c, unsigned long n);
 void    *memcpy(void *d, const void *s, unsigned long n);
@@ -117,6 +128,7 @@ uint64_t tsc_freq_hz(void);
 /* ---- polled PS/2 keyboard (kernel/kbd64.c) ---- */
 void     kbd64_init(void);
 int      kbd64_getkey(void);                   /* ASCII/KEY_* code, or -1 if none  */
+void     arch_load_cpu_tables(void);           /* load shared GDT+IDT on a secondary CPU */
 
 /* ---- graphics demo (kernel/demo64.c) + pong game (kernel/pong64.c) ---- */
 void     demo_run(boot_info_t *bi);
@@ -139,9 +151,37 @@ void     sched_block(int chan);                /* block the running task on a wa
 void     sched_wake(int chan);                 /* wake tasks blocked on a channel          */
 void     sched_wait(volatile int *addr, int want, int chan); /* race-free block until *addr==want */
 void     sched_exit(void);                     /* retire the running task (never returns)  */
+int      sched_is_running(void);               /* 1 while the LAPIC timer is live (safe to HLT) */
+int      lapic_ready(void);                    /* LAPIC timer calibrated (idle-tick usable) */
+void     lapic_idle_arm(void);                 /* arm a periodic tick to wake a native-console HLT */
+void     lapic_idle_disarm(void);             /* mask it again after waking */
+uint64_t cpu_idle_ms(void);                    /* accumulated CPU-halted milliseconds (for CPU%%) */
+void     cpu_idle_add_ms(uint64_t ms);         /* add halted time from a HLT outside idle_wait */
 
 /* composite + present one desktop frame (kernel/wm64.c); used by blocking syscalls */
 void     wm_pump(void);
+/* A ring-3 graphics app (TinyGL) just presented a full-screen frame; the WM
+ * compositor stands down briefly so it does not overdraw the app's output with
+ * the desktop chrome / pane grid.  Called from gfx_present (kernel/arch64.c). */
+void     wm_note_gfx_present(void);
+/* Note UI activity (keypress / terminal output) so wm_pump repaints at 30 FPS
+ * briefly, then drops to ~2 FPS when idle to save power. */
+void     ui_note_activity(void);
+/* terminal split panes: concurrent shells (kernel/arch64.c + kernel/term64.c) */
+int      arch_run_panes(void *pane0_term);     /* router loop; returns when all shells exit */
+int      arch_pane_count(void);                /* number of active panes (0 = native console) */
+void    *arch_cur_pane_term(void);             /* running shell's pane terminal (usys_write target) */
+void     arch_panes_draw(uint32_t *back, int cx, int cy, int cw, int ch);   /* render the pane grid */
+/* Low-power sleep: blank the panel + stop compositing (deep HLT idle) on lid
+ * close, restore on lid open / keypress.  power_poll() samples the lid. */
+void     wm_sleep_set(int on);
+int      wm_is_sleeping(void);
+void     power_poll(void);
+int      acpi_lid_open(void);                  /* 1 = lid open (or EC absent), 0 = closed */
+int      acpi_power_button(void);              /* 1 on a fresh power-button press (latch cleared) */
+/* Handle a WM hotkey (F1 focus / F2 move / arrows for move+log-scroll) even while
+ * a foreground app owns the keyboard; returns 1 if the key was consumed. */
+int      wm_hotkey(int key);
 
 /* ---- multi-core SMP bring-up (kernel/smp64.c) ---- */
 void     smp_init(boot_info_t *bi);
@@ -149,10 +189,96 @@ int      smp_cpu_count(void);      /* CPUs the firmware/ACPI reported */
 int      smp_online_count(void);   /* cores that reached long-mode kernel code */
 uint64_t smp_lapic_base(void);     /* Local APIC MMIO base (from ACPI MADT)     */
 
+/* ---- ACPI power management + Embedded Controller (kernel/acpi64.c) ---- */
+typedef struct { int present, ac_online, charging, percent, voltage_mv; uint8_t raw[8]; } acpi_batt_t;
+void     acpi_init(uint64_t rsdp);            /* parse FADT/ECDT/DSDT, probe EC       */
+int      acpi_battery(acpi_batt_t *b);        /* fill battery/AC state; <0 if no EC   */
+int      acpi_ec_read(uint8_t off, uint8_t *out);  /* raw EC RAM read (battery calibration) */
+int      acpi_poweroff(void);                 /* ACPI S5 soft-off; <0 if unavailable  */
+void     acpi_reset(void);                    /* reset register / 0xCF9 / 8042        */
+int      acpi_s3_available(void);             /* 1 if S3 SLP_TYP + PM1 known          */
+
 /* ---- virtio-blk persistent disk (kernel/vblk64.c) ---- */
 int      vblk_init(void);                    /* 1 if a virtio-blk device is present */
 int      vblk_read(uint32_t lba, void *buf);         /* one 512-byte sector          */
 int      vblk_write(uint32_t lba, const void *buf);
+/* ---- AHCI/SATA real-hardware disk (kernel/ahci64.c) ---- */
+int      ahci_init(void);                            /* 1 if a SATA disk was found    */
+int      ahci_read(uint64_t lba, uint32_t count, void *buf);
+int      ahci_write(uint64_t lba, uint32_t count, const void *buf);
+uint64_t ahci_sectors(void);                         /* disk size in 512-byte sectors */
+int      ahci_present(void);
+
+/* ---- Intel High Definition Audio (kernel/drivers/hda64.c) ---- */
+typedef struct hda_diag {
+    uint32_t stage, gcap, codecs;
+    int32_t codec, afg, dac, pin;
+    uint32_t volume;
+} hda_diag_t;
+int      hda_init(void);                              /* 1 when an analog output is ready */
+int      hda_ready(void);
+int      hda_get_diag(hda_diag_t *diag);
+int      hda_set_volume(int volume);                  /* software master volume, 0..100 */
+int      hda_get_volume(void);
+int      hda_play(const int16_t *samples, uint32_t frames); /* 48 kHz S16 stereo, synchronous */
+int      hda_tone(uint32_t hz, uint32_t duration_ms, uint32_t volume);
+void     hda_stop(void);
+
+/* ---- USB host (xHCI) + Mass Storage block device (kernel/drivers/usb64.c) ---- */
+int      usb_init(void);                             /* 1 if a USB mass-storage device is ready */
+int      usb_present(void);
+int      usb_gen(void);                              /* bumps on connect/disconnect (mount invalidation) */
+uint64_t usb_sectors(void);                          /* stick size in 512-byte sectors */
+int      usb_read(uint64_t lba, uint32_t count, void *buf);
+int      usb_write(uint64_t lba, uint32_t count, const void *buf);
+
+/* ---- FAT32 reader for the internal-disk ESP over AHCI (kernel/fs/esp64.c) ---- */
+typedef void (*esp_dirent_cb)(const char *name, uint32_t size, int isdir,
+                              uint32_t first_cluster, void *ctx);
+int      esp_mount(void);                            /* 1 if the internal ESP mounted */
+uint32_t esp_root_cluster(void);
+void     esp_list(uint32_t dir_cluster, esp_dirent_cb cb, void *ctx);
+int      esp_find(const char *path, uint32_t *clus, uint32_t *size, int *isdir);
+int      esp_install(const uint8_t *efi, uint32_t efi_len);   /* clean-install to the SATA disk */
+
+/* ---- FAT32 read/write data volume on the internal disk (kernel/fs/datavol64.c) ---- */
+/* Generic FAT32 engine over a selectable 512B block backend (AHCI or USB).
+ * NOTE: a backend *tag* is used rather than function pointers on purpose — this
+ * PE/EFI kernel is built -fPIC and runtime function-address materialization
+ * (&func passed as a value) is miscompiled to a GOT-style load that the mi386pep
+ * linker resolves to the code itself, so runtime function pointers crash. */
+#define FV_AHCI 0
+#define FV_USB  1
+typedef struct fatvol {
+    int      mnt;
+    int      backend;                                /* FV_AHCI | FV_USB */
+    uint64_t part, fat, data;
+    uint32_t spc, root, fatsz, maxclus, alloc_hint;
+} fatvol_t;
+int      fv_mount(fatvol_t *v, int backend);         /* find + mount a FAT32 volume */
+int      fv_resolve(fatvol_t *v, const char *path, uint32_t *clus, uint32_t *size, int *isdir);
+int      fv_read(fatvol_t *v, uint32_t first, uint32_t size, void *buf, uint32_t max);
+int      fv_readdir(fatvol_t *v, uint32_t dir_clus, int idx, char *name);
+int      fv_readdir_m(fatvol_t *v, uint32_t dir_clus, int idx, char *name,
+                      uint8_t *attr, uint32_t *clus, uint32_t *size);
+int      fv_write(fatvol_t *v, const char *path, const void *data, uint32_t len);
+int      fv_pread(fatvol_t *v, const char *path, void *buf, uint32_t len, uint32_t off);
+int      fv_pwrite(fatvol_t *v, const char *path, const void *buf, uint32_t len, uint32_t off);
+int      fv_truncate(fatvol_t *v, const char *path, uint32_t newsize);
+int      fv_mkdir(fatvol_t *v, const char *path);
+int      fv_unlink(fatvol_t *v, const char *path);
+int      fv_rmdir(fatvol_t *v, const char *path);
+fatvol_t *dv_vol(void);                              /* internal /mnt volume, or 0 if unavailable */
+fatvol_t *uv_vol(void);                              /* USB /usb volume, or 0 if unavailable */
+
+int      dv_mount(void);                             /* 1 if the data partition mounted */
+int      dv_ready(void);
+int      dv_resolve(const char *path, uint32_t *clus, uint32_t *size, int *isdir);
+int      dv_read(uint32_t first, uint32_t size, void *buf, uint32_t max);
+int      dv_readdir(uint32_t dir_clus, int idx, char *name);
+int      dv_write(const char *path, const void *data, uint32_t len);
+int      dv_mkdir(const char *path);
+int      dv_unlink(const char *path);
 /* ---- VMBus primitives shared by synthetic drivers (kernel/vmbus64.c) ---- */
 int      vmbus_ready(void);                   /* VMBus connected + offers enumerated */
 void    *vmbus_palloc(unsigned pages);

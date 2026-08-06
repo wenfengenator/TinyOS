@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 scheduler test battery (smoke + stress).
  *
  * Split out of kernel/sched/sched64.c so the scheduler core stays lean.  These

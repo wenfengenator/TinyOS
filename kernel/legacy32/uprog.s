@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos ring-3 self-test payload (Cycle 4, Phase B).
  *
  * A minimal position-independent user program: it issues SYS_WRITE to print a

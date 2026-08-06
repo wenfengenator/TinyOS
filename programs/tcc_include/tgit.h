@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyOS userspace git plumbing — Cycle 9 C6b/C6c (git over HTTPS).
  *
  * The transport-independent half of a git client: the smart-HTTP pkt-line

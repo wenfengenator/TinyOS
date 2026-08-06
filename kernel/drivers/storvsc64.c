@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 Hyper-V synthetic SCSI (StorVSC) block driver — Stage 2 persistence.
  *
  * Hyper-V Gen 2 VMs reach their disks only through synthetic SCSI over VMBus, so

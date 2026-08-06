@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 FAT16 filesystem (kernel/fat64.c) — persistent block device when
  * available, embedded RAM image otherwise.  Supports whole-file and offset I/O. */
 #ifndef TINYOS_FAT64_H
@@ -33,5 +35,6 @@ int  fat_rmdir(const char *sub);          /* 0 ok, -1 not found, -2 not-dir, -3 
 void fs_resolve(const char *path, char *out);   /* -> absolute path (out >= 80B) */
 int  fs_chdir(const char *path);                /* 0 ok, -1 not a directory      */
 void fs_getcwd(char *out);                      /* copy cwd into out (>= 80B)    */
+void fs_setcwd(const char *abs);                /* set cwd to a validated abs path */
 
 #endif /* TINYOS_FAT64_H */

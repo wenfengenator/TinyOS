@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos in-RAM filesystem: a tiny fixed table of named files. */
 #include "kernel.h"
 

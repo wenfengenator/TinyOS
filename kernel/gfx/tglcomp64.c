@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyGL compositor (Cycle 7 G5): composite surfaces as layers with position,
  * z-order, and per-layer alpha, redrawing only the damaged region and presenting
  * through the display backend (whose scanline-diff then blits only changed rows).

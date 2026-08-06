@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos ATA (IDE) PIO driver — reads 512-byte sectors from the second disk
  * (QEMU: -hdb file.img => primary bus, slave).  Enough to mount a filesystem
  * image.  Under the Unicorn emulator the same port I/O is emulated in

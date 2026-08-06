@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 privilege-level plumbing (Cycle 4, Phase B).
  *
  * All the assembly the ring-0/ring-3 split needs that cannot be expressed in C:
@@ -51,6 +53,16 @@ arch_isr_addr:
     movq    (%rax,%rdi,8), %rax
     ret
 1:  leaq    isr_default(%rip), %rax
+    ret
+
+/* NMI (vector 2): ignore on real HW (watchdog/thermal/spurious) rather than
+ * halting or (on an AP with no IDT) triple-faulting; fatal HW errors are #MC. */
+    .global isr_nmi
+isr_nmi:
+    iretq
+    .global arch_nmi_addr
+arch_nmi_addr:
+    leaq    isr_nmi(%rip), %rax
     ret
 
 /* void arch_setup_syscall_msrs(void) — enable SYSCALL and point LSTAR at us.
@@ -111,6 +123,10 @@ syscall_entry:
     movq    %rax, (%rsp)
     movq    %rax, %rdi                     /* signal_check(retval) -> handler or 0  */
     call    signal_check
+    cli                                    /* close the SYSRET/IRETQ window: a timer IRQ
+                                            * between `popq %rsp` and sysretq would push a
+                                            * CPL0 frame onto the USER stack.  IF is restored
+                                            * from r11 (sysret) / the frame (iretq) below. */
     testq   %rax, %rax
     jz      .Lsyscall_ret
     movq    %rax, %rdi                     /* deliver a custom handler (never returns) */
@@ -497,6 +513,8 @@ isr_common:
     movq    0(%rsp), %rdi                  /* vector    */
     movq    8(%rsp), %rsi                  /* err code  */
     movq    16(%rsp), %rdx                 /* fault rip */
+    movq    24(%rsp), %rcx                 /* fault cs (CPL: ring-3 faults recover) */
+    movq    40(%rsp), %r8                  /* interrupted rsp (for the panic backtrace) */
     call    isr_c
 1:  cli
     hlt

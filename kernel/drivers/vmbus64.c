@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 Hyper-V VMBus synthetic keyboard.
  *
  * Hyper-V Gen 2 VMs have no PS/2 i8042 — the keyboard is a synthetic VMBus
@@ -299,7 +301,8 @@ int hvkbd_getkey(void) {
         switch (make) { case 0x48: return KEY_UP; case 0x50: return KEY_DOWN;
                         case 0x4B: return KEY_LEFT; case 0x4D: return KEY_RIGHT; default: return -1; }
     }
-    switch (make) { case 0x3B: return KEY_F1; case 0x3C: return KEY_F2; case 0x3D: return KEY_F3; }
+    switch (make) { case 0x3B: return KEY_F1; case 0x3C: return KEY_F2; case 0x3D: return KEY_F3;
+                    case 0x3E: return KEY_F4; case 0x3F: return KEY_F5; }
     if (make < 128) {
         char c = s_shift ? sc_shift[make] : sc_ascii[make];
         if (!c) return -1;

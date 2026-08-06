@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 Hyper-V synthetic NIC (netvsc + RNDIS) — Cycle 8 N-hyperv.
  *
  * Hyper-V Gen 2 VMs have no virtio; their NIC is a synthetic VMBus device driven

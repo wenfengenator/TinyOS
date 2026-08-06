@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 # tinyos x64 AP startup trampoline (R8 SMP).
 #
 # Application processors come out of INIT-SIPI-SIPI in 16-bit real mode at

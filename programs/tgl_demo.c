@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyGL demo — a userspace app that renders through the TinyGL client library
  * (programs/tcc_include/tinygl.h) and asks the kernel to present it.
  *

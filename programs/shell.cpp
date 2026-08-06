@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 // tinyos shell (C++), a ramdisk program run in its own isolated address space.
 // Reads commands from the keyboard; navigates the unified VFS (ram fs + /mnt
 // FAT16 disk) with a current working directory.

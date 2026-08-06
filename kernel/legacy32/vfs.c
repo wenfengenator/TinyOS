@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos VFS: unifies the in-RAM filesystem (fs.c) and the FAT16 mount (fat.c)
  * under one path namespace so the shell can cd / ls / cat across both.
  *   /mnt, /mnt/...  -> FAT16 disk (read/write; edits persist to the image)

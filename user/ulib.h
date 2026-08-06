@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 // tinyos user-space runtime (C++), ring 3.
 // The only channel to the kernel is `int 0x80` (see syscall() below).
 #ifndef TINYOS_ULIB_H

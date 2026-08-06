@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* A small K&R-style showcase: exercises <stdio.h>, <ctype.h>, <stdlib.h>, and
  * <string.h> from the on-device musl headers.  Self-contained (no stdin) so it
  * can be built and run non-interactively. */

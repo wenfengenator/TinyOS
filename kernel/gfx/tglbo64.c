@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* TinyGL buffer objects (Cycle 7 G6): GEM-lite BOs with refcounting, fences,
  * and zero-copy sharing.
  *

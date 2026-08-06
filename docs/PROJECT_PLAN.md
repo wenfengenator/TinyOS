@@ -143,3 +143,36 @@ graphics, persistence, and eventually a self-hosting on-device C compiler.
 | Shared double-buffered display driver (`disp64`) with scanline-diff present | ✅ |
 
 Verified on both `qemu-system-x86_64` + OVMF and a real 10-core Hyper-V Gen 2 VM.
+
+## 10. Current 64-bit userland and language runtime
+
+The project continued beyond the compiler substrate into a usable static
+userland, graphics/audio applications, networking, real-hardware support, and
+an interpreted language runtime.
+
+| Deliverable | Status |
+|---|---|
+| Scheduled static-musl processes: `fork`/`execve`/`wait4`, pipes, signals, tty | ✅ |
+| Multi-pane mbb shell and syntax-highlighting `vim` | ✅ |
+| TinyGL 2D/3D, buffer objects, compositor takeover, games | ✅ |
+| Intel HDA analog output, tones, master volume, diagnostics | ✅ QEMU + T440s |
+| TCP/IP, DNS, HTTP/HTTPS clients and server, Git/SSH userland | ✅ |
+| AHCI persistence and xHCI USB mass-storage on the ThinkPad T440s | ✅ HW |
+| Official MicroPython v1.26.1 minimal Unix port as a static musl ELF | ✅ |
+| Built-in Python `tgl` and `taudio` modules | ✅ QEMU |
+| Graphical, audio-enabled Python Reversi with depth-4 AI | ✅ QEMU |
+| MicroPython included in live RAM, persistent FAT, GPT, VHDX, and USB images | ✅ |
+
+MicroPython deliberately reuses the Linux-compatible userspace substrate
+instead of introducing a kernel-resident interpreter. See
+[`MICROPYTHON.md`](MICROPYTHON.md) for the architecture and extension workflow.
+
+## 11. Next language-runtime work
+
+* Decide which additional MicroPython standard modules justify increasing the
+  minimal interpreter size; likely candidates are `math`, `time`, `random`,
+  `json`, and selected container helpers.
+* Add asynchronous or queued audio so effects never pause Python game loops.
+* Expand the Python game/tool collection on the stable `tgl` and `taudio` APIs.
+* Keep CPython compatibility expectations explicit: TinyOS currently targets
+  MicroPython's compact language/runtime model, not the full CPython ecosystem.

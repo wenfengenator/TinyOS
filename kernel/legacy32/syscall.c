@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos syscall implementations (hardware path).
  *
  * Reached from entry.s:syscall_stub with a `struct regs *`.  The Unicorn

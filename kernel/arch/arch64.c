@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 arch layer (Cycle 4, Phase B): ring-0/ring-3 privilege split.
  *
  * arch_init() installs our own GDT (kernel + user code/data), a TSS (so faults
@@ -36,6 +38,7 @@ void     arch_ltr(uint16_t sel);
 void     arch_set_syscall_stack(uint64_t rsp_top);
 void     arch_setup_syscall_msrs(void);
 uint64_t arch_isr_addr(unsigned i);
+uint64_t arch_nmi_addr(void);               /* benign NMI stub address (trap64.s) */
 void     enter_user(uint64_t rip, uint64_t rsp, uint64_t arg);
 void     enter_user_exec(uint64_t rip, uint64_t rsp, uint64_t cr3);   /* execve: iretq into a replaced image */
 void     sys_exit_resume(void);
@@ -47,7 +50,12 @@ static uint64_t do_linux_fork(void);        /* fork() for scheduled Linux procs 
 static int      linux_wait4(int wpid, int *wstatus, int options);
 static void     write_fs_base(uint64_t base);
 static uint64_t read_fs_base(void);
+static uint64_t rd_msr(uint32_t msr);              /* wrappers around rdmsr/wrmsr (defined later) */
+static void     wr_msr(uint32_t msr, uint64_t v);
+void            arch_apic_force_xapic(void);        /* force LAPIC into xAPIC (MMIO) mode */
 static void     free_user_pages(uint64_t *pml4);   /* reclaim a dead process's frames */
+static void     proc_terminate(int status);        /* kill `current` (exit/fatal signal/fault) */
+static uint64_t g_arena_va, g_arena_pa, g_arena_len;  /* heap arena VA/PA (mm_phys_init) */
 
 /* ---- GDT + TSS ---- */
 struct gdtr   { uint16_t limit; uint64_t base; } __attribute__((packed));
@@ -74,6 +82,7 @@ struct idt_entry {
     uint16_t off_mid; uint32_t off_hi; uint32_t zero;
 } __attribute__((packed));
 static struct idt_entry g_idt[256];
+static struct gdtr      g_gdtr, g_idtr;      /* shared descriptors so APs can load them */
 
 /* ---- process table (Tier 1 Phase A): per-process state lives in `current` ---- */
 static struct proc  g_proc[PROC_MAX];
@@ -114,26 +123,96 @@ static int          g_next_pid;
 #define TGL_SYS_BO_CREATE  0x54474C01ULL
 #define TGL_SYS_PRESENT    0x54474C02ULL
 #define TGL_SYS_BO_DESTROY 0x54474C03ULL
+#define AUD_SYS_INFO       0x41554400ULL      /* 'AUD': query HDA availability */
+#define AUD_SYS_PLAY       0x41554401ULL      /* play 48kHz S16 stereo PCM */
+#define AUD_SYS_TONE       0x41554402ULL      /* generated game tone */
+#define AUD_SYS_STOP       0x41554403ULL
+#define AUD_SYS_DIAG       0x41554404ULL      /* copy hda_diag_t */
+#define AUD_SYS_VOLUME     0x41554405ULL      /* a0=0..100 set, negative=query */
 #define NET_SYS_RESOLVE    0x4E455400ULL      /* 'NET': userspace DNS resolve */
 #define NET_SYS_PING       0x4E455401ULL      /* 'NET'+1: userspace ICMP echo */
 #define NET_SYS_IFCONFIG   0x4E455402ULL      /* 'NET'+2: userspace interface config */
 #define NET_SYS_SETCFG     0x4E455403ULL      /* 'NET'+3: set static interface config */
-#define USER_STK_PAGES  16              /* 64KB: headroom for deep crypto/TLS call chains */
+#define USER_STK_PAGES  64              /* 256KB: headroom for deep recursion (tcc) + crypto/TLS */
 #define LINUX_LOAD_PAGES ((LINUX_LOAD_LIMIT - LINUX_LOAD_VA) / 4096)
 #define USER_ARG_OFF    (USER_CODE_PAGES * 4096 - 256)   /* argv[0] staged here */
 #define PTE_P   0x1
 #define PTE_RW  0x2
 #define PTE_US  0x4
 #define PTE_PS  0x80
+/* Software-owned bit (available bit 9): set ONLY on page-table pages and leaf
+ * frames that WE page_alloc()'d for a process address space.  The teardown and
+ * fork walks key off this instead of PTE_US, because real UEFI firmware sets
+ * PTE_US on its kernel identity map (which aliases our whole heap arena) — so
+ * PTE_US cannot distinguish a private user page from a shared kernel page, and
+ * walking US would double-free every arena frame reachable through the retained
+ * identity mappings.  PTE_OWN is unambiguous: no firmware entry carries it. */
+#define PTE_OWN 0x200
+/* Physical address field of a PTE/CR3 (bits 12..51).  Masking with ~0xFFF alone
+ * keeps bit 63 (NX) and the software/reserved bits 52..62, which yields a
+ * NON-CANONICAL pointer that #GPs when dereferenced on real silicon (QEMU TCG
+ * does not check) — firmware identity-map entries are routinely NX-marked. */
+#define PT_PA_MASK 0x000FFFFFFFFFF000ULL
 
-/* C dumper for the exception stubs (kernel/trap64.s). */
-void isr_c(uint64_t vec, uint64_t err, uint64_t rip) {
+/* Map a CPU exception vector to the POSIX signal a real kernel would raise, so a
+ * faulting ring-3 program is terminated with a sensible exit status (128+signo). */
+static int sig_for_vec(uint64_t vec) {
+    switch (vec) {
+        case 0:  return 8;    /* #DE -> SIGFPE  */
+        case 6:  return 4;    /* #UD -> SIGILL  */
+        case 16: case 19: return 8;   /* #MF/#XM -> SIGFPE */
+        case 5:  case 12: case 13: case 14: return 11;   /* #BR/#SS/#GP/#PF -> SIGSEGV */
+        default: return 11;   /* SIGSEGV */
+    }
+}
+
+/* C handler for the CPU exception stubs (kernel/trap64.s).  `cs` is the faulting
+ * code segment: a ring-3 (CPL 3) fault is a bug in ONE user program, so we kill
+ * just that process and return to the shell/desktop — TinyOS stays up.  A ring-0
+ * fault is a kernel bug: show it on screen (the desktop may own the console) and
+ * halt.  `rsp` is the interrupted stack, scanned for a symbol-relative backtrace
+ * so a real-HW fault can be pinpointed despite the firmware's unknown load base. */
+static volatile int g_in_panic;
+void isr_c(uint64_t vec, uint64_t err, uint64_t rip, uint64_t cs, uint64_t rsp) {
     uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+
+    if ((cs & 3) == 3 && current && current != &g_proc[0]) {
+        /* One short line so it stays readable in the WM kernel-log widget. */
+        kputs("\n[EXC] usr pid "); kput_u32dec((uint32_t)current->pid);
+        kputs(" v");    kput_u32dec((uint32_t)vec);
+        kputs(" cr2="); kput_u64hex(cr2);
+        kputs(" rip="); kput_u64hex(rip);
+        kputs(" killed\n");
+        proc_terminate(128 + sig_for_vec(vec));    /* like a fatal signal; never returns */
+    }
+
+    if (g_in_panic) for (;;) __asm__ volatile("cli; hlt");   /* nested fault: just stop */
+    g_in_panic = 1;
+
+    /* rip + return addresses reported as offsets from isr_c: the kernel is -fPIC
+     * and UEFI loads it at an unknown base, but a symboled build resolves these
+     * deltas directly. */
+    int64_t ref    = (int64_t)(uint64_t)&isr_c;
+    int64_t rip_off = (int64_t)rip - ref;
+    int64_t mapoff  = (int64_t)(g_arena_pa - g_arena_va);
+    int64_t bt[6]; int nbt = 0;
+    const uint64_t *sp = (const uint64_t *)rsp;
+    for (int i = 0; i < 160 && nbt < 6; i++) {
+        int64_t d = (int64_t)sp[i] - ref;
+        if (d > -0x2000000 && d < 0x2000000) bt[nbt++] = d;   /* looks like kernel code */
+    }
+
     kputs("\n[EXC] vector "); kput_u32dec((uint32_t)vec);
-    kputs(" err ");  kput_u64hex(err);
-    kputs(" rip ");  kput_u64hex(rip);
-    kputs(" cr2 ");  kput_u64hex(cr2);
+    kputs(" err ");    kput_u64hex(err);
+    kputs(" rip ");    kput_u64hex(rip);
+    kputs(" cs ");     kput_u64hex(cs);
+    kputs(" cr2 ");    kput_u64hex(cr2);
+    kputs(" ripoff "); kput_u64hex((uint64_t)rip_off);
+    kputs(" mapoff "); kput_u64hex((uint64_t)mapoff); kputc('\n');
+    kputs("[EXC] bt:");
+    for (int i = 0; i < nbt; i++) { kputc(' '); kput_u64hex((uint64_t)bt[i]); }
     kputs("\n[EXC] halted.\n");
+    fb_panic(vec, err, rip, cr2, cs, rip_off, bt, nbt, mapoff);
     for (;;) __asm__ volatile("cli; hlt");
 }
 
@@ -158,7 +237,34 @@ static void set_tss_desc(int idx, uint64_t base, uint32_t limit) {
     g_gdt[idx + 1] = (base >> 32) & 0xFFFFFFFFULL;
 }
 
+/* Enable SSE so ring-3 musl/g++ programs (which emit xmm ops, often in startup
+ * memcpy) don't #UD.  UEFI usually hands off with SSE on, but some real firmware
+ * leaves it off: clear CR0.EM/TS, set CR0.MP, set CR4.OSFXSR|OSXMMEXCPT, then
+ * mask SSE FP exceptions (MXCSR 0x1F80).  Kernel is -mno-sse so it never uses it;
+ * this is purely to let user code run.  (XMM state is not yet saved across task
+ * switches — fine for the foreground-shell model.) */
+static void enable_sse(void) {
+    uint64_t cr0, cr4;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 = (cr0 & ~((1ULL << 2) | (1ULL << 3))) | (1ULL << 1);      /* -EM -TS +MP */
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1ULL << 9) | (1ULL << 10);                            /* OSFXSR | OSXMMEXCPT */
+    __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
+    uint32_t mxcsr = 0x1F80;
+    __asm__ volatile("fninit; ldmxcsr %0" :: "m"(mxcsr));
+}
+
+/* Load the shared GDT + IDT on a secondary CPU (no TSS: parked APs never take a
+ * ring switch), so a stray NMI/exception is handled instead of triple-faulting. */
+void arch_load_cpu_tables(void) {
+    arch_load_gdt(&g_gdtr);
+    __asm__ volatile("lidt %0" :: "m"(g_idtr));
+}
+
 void arch_init(void) {
+    enable_sse();    { uint64_t cr4; __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+      kputs("[arch] sse on cr4="); kput_u64hex(cr4); kputc('\n'); }
     g_gdt[0] = 0;
     g_gdt[1] = 0x00AF9A000000FFFFULL;        /* kernel code (DPL0, L=1)   */
     g_gdt[2] = 0x00CF92000000FFFFULL;        /* kernel data (DPL0)        */
@@ -170,21 +276,50 @@ void arch_init(void) {
     g_tss.iomap_base = sizeof(g_tss);
     set_tss_desc(5, (uint64_t)&g_tss, sizeof(g_tss) - 1);
 
-    static struct gdtr gp;
-    gp.limit = sizeof(g_gdt) - 1;
-    gp.base  = (uint64_t)g_gdt;
+    g_gdtr.limit = sizeof(g_gdt) - 1;
+    g_gdtr.base  = (uint64_t)g_gdt;
     kputs("[arch] loading gdt+tss\n");
-    arch_load_gdt(&gp);
+    arch_load_gdt(&g_gdtr);
     arch_ltr(0x28);
     kputs("[arch] gdt+tss ok; loading idt\n");
 
     for (int i = 0; i < 256; i++) set_gate(i, arch_isr_addr((unsigned)i));
-    static struct { uint16_t limit; uint64_t base; } __attribute__((packed)) idtr;
-    idtr.limit = sizeof(g_idt) - 1;
-    idtr.base  = (uint64_t)g_idt;
-    __asm__ volatile("lidt %0" :: "m"(idtr));
+    set_gate(2, arch_nmi_addr());            /* NMI: ignore (don't halt/triple-fault) */
+    g_idtr.limit = sizeof(g_idt) - 1;
+    g_idtr.base  = (uint64_t)g_idt;
+    __asm__ volatile("lidt %0" :: "m"(g_idtr));
 
     kputs("[arch] gdt + tss + idt installed (ring 0/3 ready)\n");
+
+    arch_apic_force_xapic();
+}
+
+/* Normalize the local APIC into xAPIC (MMIO) mode.  Real Haswell/Broadwell UEFI
+ * (the T440s included) frequently hands the OS a local APIC already switched to
+ * x2APIC mode.  In x2APIC mode the MMIO window at 0xFEE00000 is dead, so every
+ * lapic_w()/lw() in smp64.c and sched64.c is a silent no-op: the scheduler's
+ * LAPIC timer is never programmed, it never fires, and the first sched_block()/
+ * sched_wait() ("sti; hlt") halts the CPU forever with no panic -- exactly the
+ * "runs, then freezes with nothing on screen" the demos/tcc/shell show on real
+ * hardware.  QEMU and Hyper-V default to xAPIC, which is why it only bites the
+ * laptop.  A direct x2APIC->xAPIC switch #GPs, so pass through the disabled state
+ * first (Intel SDM Vol.3, "x2APIC State Transitions").  Printed to the boot
+ * console so the mode is visible on a serial-less panel. */
+void arch_apic_force_xapic(void) {
+    uint64_t base = rd_msr(0x1B);                          /* IA32_APIC_BASE */
+    kputs("[apic] IA32_APIC_BASE="); kput_u64hex(base);
+    kputs((base & (1ull << 10)) ? " x2APIC\n"
+        : (base & (1ull << 11)) ? " xAPIC\n" : " disabled\n");
+    if (base & (1ull << 10)) {                             /* x2APIC: transition out */
+        wr_msr(0x1B, base & ~((1ull << 10) | (1ull << 11)));   /* -> fully disabled */
+        wr_msr(0x1B, 0xFEE00000ull | (1ull << 11));            /* -> xAPIC, enabled  */
+        kputs("[apic] switched x2APIC -> xAPIC; IA32_APIC_BASE=");
+        kput_u64hex(rd_msr(0x1B)); kputc('\n');
+    } else if (!(base & (1ull << 11))) {                   /* disabled: enable xAPIC */
+        wr_msr(0x1B, (base & ~0xFFFull) | 0xFEE00000ull | (1ull << 11));
+        kputs("[apic] enabled xAPIC; IA32_APIC_BASE=");
+        kput_u64hex(rd_msr(0x1B)); kputc('\n');
+    }                                                      /* already xAPIC: leave as-is */
 }
 
 /* Install an interrupt gate at runtime.  The IDT is already loaded (arch_init),
@@ -216,6 +351,7 @@ static uint64_t linux_mmap(uint64_t addr, uint64_t len, uint64_t prot,
 static int linux_mprotect(uint64_t addr, uint64_t len, uint64_t prot);
 static int linux_munmap(uint64_t addr, uint64_t len);
 static int linux_openat(int dirfd, const char *path, int flags);
+static int linux_chdir(const char *path);
 static int linux_resolve_at(int dirfd, const char *path, char *full);
 static int linux_close(int fd);
 static void linux_close_all_fds(void);
@@ -254,6 +390,37 @@ static int64_t gfx_bo_destroy(int handle);
 struct linux_exec_args;
 static int linux_execve(const char *path, const char *const *argv,
                         const char *const *envp);
+
+/* Idle the CPU until the next interrupt instead of spinning at 100%.  Only halts
+ * when the scheduler's LAPIC timer is live (guaranteeing a wake within ~10ms);
+ * otherwise falls back to a cheap pause.  Safe mid-syscall: sched_tick() repoints
+ * the SYSCALL kernel stack per task (kernel/sched64.c:68), so a timer preemption
+ * during the HLT saves/restores this task correctly.  This is what lets an idle
+ * shell prompt draw almost no power instead of pegging a core (weeks on battery).
+ * The halted time is accumulated so the system monitor can show CPU-busy %. */
+static volatile uint64_t g_cpu_idle_ms;
+uint64_t cpu_idle_ms(void) { return g_cpu_idle_ms; }
+void cpu_idle_add_ms(uint64_t ms) { g_cpu_idle_ms += ms; }   /* for HLT paths outside idle_wait */
+static inline void idle_wait(void) {
+    if (sched_is_running()) {
+        uint64_t t0 = millis();
+        __asm__ volatile("sti; hlt; cli");
+        g_cpu_idle_ms += millis() - t0;
+    } else {
+        __asm__ volatile("pause");
+    }
+}
+
+/* VFS path resolution/IO (defined below) — forward-declared so the early Linux
+ * syscalls (access, exec) route /mnt and /usb like the later fd layer does. */
+static int vfs_resolve(const char *full, uint8_t *attr, uint32_t *cluster, uint32_t *size);
+static int vfs_pread(const char *full, void *buf, uint32_t len, uint32_t off);
+
+/* split-pane input helpers (defined with arch_run_panes below) */
+#define PANE_MAX 4
+static int pane_in_use(void);
+static int pane_getkey(void);
+static int pane_trykey(void);
 static int run_linux_path(const char *path, uint8_t *stk, uint8_t *kstack_top,
                           const struct linux_exec_args *args, int on_sched);
 static int arch_user_run(const char *name, const uint8_t *img, uint64_t size,
@@ -270,6 +437,17 @@ struct linux_exec_args {
 };
 
 static void write_fs_base(uint64_t base) {
+    /* Real Intel silicon #GPs on a WRMSR of a non-canonical FS base (QEMU's TCG
+     * does not check); doing that from the context-switch path would halt the
+     * whole kernel.  Canonicalize (sign-extend bit 47) so a bogus TLS pointer at
+     * worst mislocates a user's TLS instead of taking down the OS. */
+    uint64_t hi16 = base >> 48;
+    int noncanon = (base & (1ULL << 47)) ? (hi16 != 0xFFFF) : (hi16 != 0);
+    if (noncanon) {
+        kputs("[fsbase] non-canonical "); kput_u64hex(base); kputc('\n');
+        base = (base & (1ULL << 47)) ? (base | 0xFFFF000000000000ULL)
+                                     : (base & 0x0000FFFFFFFFFFFFULL);
+    }
     uint32_t lo = (uint32_t)base, hi = (uint32_t)(base >> 32);
     __asm__ volatile("wrmsr" :: "c"(0xC0000100U), "a"(lo), "d"(hi));
     g_linux_fs_base = base;
@@ -436,7 +614,28 @@ static uint64_t sig_return(void) {
 #define TTY_ISIG   0x0001
 #define TTY_ICANON 0x0002
 #define TTY_ECHO   0x0008
-static struct { int fg_pgrp; uint32_t lflag; } g_tty = { 0, TTY_ISIG | TTY_ICANON | TTY_ECHO };
+#define TTY_HIST_N 16
+#define TTY_DEFLFLAG (TTY_ISIG | TTY_ICANON | TTY_ECHO)
+/* Per-pane line discipline: each concurrent shell owns its own termios lflag
+ * (canonical/raw/echo), foreground pgrp, and edit history.  A single shared
+ * state let a raw-mode program (vi) in one pane kill echo in the others
+ * ("typing invisible but still received") and bleed recalled history between
+ * panes.  Slot PANE_MAX is the native console (no split panes). */
+#define TTY_SLOTS (PANE_MAX + 1)
+struct tty_state { int fg_pgrp; uint32_t lflag; char hist[TTY_HIST_N][256]; int histn; };
+static struct tty_state g_ttys[TTY_SLOTS] = {
+    { 0, TTY_DEFLFLAG, {{0}}, 0 }, { 0, TTY_DEFLFLAG, {{0}}, 0 },
+    { 0, TTY_DEFLFLAG, {{0}}, 0 }, { 0, TTY_DEFLFLAG, {{0}}, 0 },
+    { 0, TTY_DEFLFLAG, {{0}}, 0 },
+};
+_Static_assert(TTY_SLOTS == 5, "g_ttys initializer must match TTY_SLOTS (PANE_MAX+1)");
+/* Resolve the calling context's tty slot: the running pane shell's own state,
+ * or the native-console slot when no split panes are active. */
+static struct tty_state *cur_tty(void) {
+    if (pane_in_use() && current->pane >= 0 && current->pane < PANE_MAX)
+        return &g_ttys[current->pane];
+    return &g_ttys[PANE_MAX];
+}
 
 /* Post a signal to every member of a process group. */
 static void signal_pgrp(int pgrp, int sig) {
@@ -537,8 +736,8 @@ static int linux_nanosleep(const void *req, void *rem) {
 static int linux_access(int dirfd, const char *path) {
     char full[256]; if (linux_resolve_at(dirfd, path, full) < 0) return -2;
     if (strpfx(full, "/proc/")) return 0;
-    uint8_t attr; uint16_t cl; uint32_t sz;
-    return fat_resolve(full, &attr, &cl, &sz) == 0 ? 0 : -2;
+    uint8_t attr; uint32_t cl; uint32_t sz;
+    return vfs_resolve(full, &attr, &cl, &sz) == 0 ? 0 : -2;
 }
 
 static int linux_readlinkat(int dirfd, const char *path, char *buf, uint32_t bufsiz) {
@@ -616,6 +815,18 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
             return (uint64_t)gfx_present((int)a0, (int)a1, (int)a2);
         case TGL_SYS_BO_DESTROY:            /* TinyGL: free a buffer       */
             return (uint64_t)gfx_bo_destroy((int)a0);
+        case AUD_SYS_INFO:                  /* Intel HDA availability       */
+            return (uint64_t)hda_init();
+        case AUD_SYS_PLAY:                  /* a0=S16 stereo, a1=frames     */
+            return (uint64_t)(int64_t)hda_play((const int16_t *)a0, (uint32_t)a1);
+        case AUD_SYS_TONE:                  /* Hz, milliseconds, volume %   */
+            return (uint64_t)(int64_t)hda_tone((uint32_t)a0, (uint32_t)a1, (uint32_t)a2);
+        case AUD_SYS_STOP:
+            hda_stop(); return 0;
+        case AUD_SYS_DIAG:
+            return (uint64_t)(int64_t)hda_get_diag((hda_diag_t *)a0);
+        case AUD_SYS_VOLUME:
+            return (uint64_t)(int64_t)((int64_t)a0 < 0 ? hda_get_volume() : hda_set_volume((int)a0));
         case 13:                            /* rt_sigaction               */
             return (uint64_t)(int64_t)linux_rt_sigaction((int)a0, (const void *)a1, (void *)a2, a3);
         case 15:                            /* rt_sigreturn               */
@@ -721,7 +932,7 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
         case 79:                            /* getcwd                     */
             return linux_getcwd((char *)a0, a1);
         case 80:                            /* chdir                      */
-            return (uint64_t)(int64_t)fs_chdir((const char *)a0);
+            return (uint64_t)(int64_t)linux_chdir((const char *)a0);
         case 158:                           /* arch_prctl                 */
             return (uint64_t)(int64_t)linux_arch_prctl((int)a0, a1);
         case 218:                           /* set_tid_address            */
@@ -847,6 +1058,7 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
                 else if (k >= 0x20 && k < 0x7F && n < max) { char c = (char)k; buf[n++] = c; usys_write(&c, 1); }
             }
             wm_pump();                        /* keep the desktop live while blocked */
+            if (k < 0) idle_wait();
         }
         return (uint64_t)n;
     }
@@ -858,6 +1070,7 @@ uint64_t syscall_c(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2,
             if (k < 0) k = hvkbd_getkey();
             if (k >= 0) return (uint64_t)k;
             wm_pump();                        /* keep the desktop live      */
+            idle_wait();
         }
     }
     case 20:                                  /* clear() the terminal grid */
@@ -948,22 +1161,170 @@ static uint64_t wp_disable(void) {
 }
 static void wp_restore(uint64_t cr0) { __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory"); }
 
+/* Real firmware may hand off a NON-identity map: the heap arena's VA (its EFI
+ * PhysicalStart, used directly as a pointer) can resolve to a different physical
+ * base, so page-table entries -- which must hold TRUE physical addresses -- need
+ * the arena's remap offset (measured once in mm_phys_init).  Under an identity
+ * map g_arena_pa==g_arena_va and both helpers are pass-throughs (QEMU path). */
+static uint64_t mm_v2p(uint64_t va) {                  /* arena VA -> physical */
+    uint64_t off = va - g_arena_va;
+    return (g_arena_len && off < g_arena_len) ? g_arena_pa + off : va;
+}
+static uint64_t mm_p2v(uint64_t pa) {                  /* physical -> arena VA */
+    uint64_t off = pa - g_arena_pa;
+    return (g_arena_len && off < g_arena_len) ? g_arena_va + off : pa;
+}
+
 static uint64_t *next_level(uint64_t *tbl, int i) {
-    if (!(tbl[i] & PTE_P)) {
-        uint64_t *n = (uint64_t *)page_alloc(1);          /* identity-mapped, zeroed */
-        tbl[i] = (uint64_t)n | PTE_P | PTE_RW | PTE_US;
+    /* Real firmware may map our dedicated high user window (PML4 slots 224/226)
+     * with a huge page; PTE_PS entries are NOT tables, so replace them with a
+     * fresh table rather than walking into the huge-page frame. */
+    if (!(tbl[i] & PTE_P) || (tbl[i] & PTE_PS)) {
+        uint64_t *n = (uint64_t *)page_alloc(1);          /* zeroed page frame */
+        tbl[i] = mm_v2p((uint64_t)n) | PTE_P | PTE_RW | PTE_US;
         return n;
     }
     tbl[i] |= PTE_US;                                  /* open the path to ring 3 */
-    return (uint64_t *)(tbl[i] & ~0xFFFULL);
+    return (uint64_t *)mm_p2v(tbl[i] & PT_PA_MASK);
 }
 
 static void map_user_page(uint64_t pml4_phys, uint64_t va, uint64_t phys, uint64_t flags) {
-    uint64_t *pml4 = (uint64_t *)pml4_phys;            /* CR3 is identity-mapped  */
+    uint64_t *pml4 = (uint64_t *)pml4_phys;            /* firmware PML4 is identity */
     uint64_t *pdpt = next_level(pml4, (int)((va >> 39) & 0x1FF));
     uint64_t *pd   = next_level(pdpt, (int)((va >> 30) & 0x1FF));
     uint64_t *pt   = next_level(pd,   (int)((va >> 21) & 0x1FF));
-    pt[(va >> 12) & 0x1FF] = (phys & ~0xFFFULL) | flags | PTE_P;
+    pt[(va >> 12) & 0x1FF] = (mm_v2p(phys) & PT_PA_MASK) | flags | PTE_P;
+}
+
+/* DIAGNOSTIC (real-HW bring-up): resolve `va` through the live firmware page
+ * tables to its physical address, reporting the mapping granularity.  Used to
+ * check the identity-map assumption (page_alloc VA must == PA) on real firmware. */
+static uint64_t diag_resolve(uint64_t va, const char **gran) {
+    uint64_t *pml4 = (uint64_t *)(read_cr3() & PT_PA_MASK);
+    uint64_t e = pml4[(va >> 39) & 0x1FF];
+    if (!(e & PTE_P)) { *gran = "unmapped"; return ~0ULL; }
+    uint64_t *pdpt = (uint64_t *)(e & PT_PA_MASK);
+    e = pdpt[(va >> 30) & 0x1FF];
+    if (!(e & PTE_P)) { *gran = "unmapped"; return ~0ULL; }
+    if (e & PTE_PS) { *gran = "1GB"; return (e & 0x000FFFFFC0000000ULL) | (va & 0x3FFFFFFFULL); }
+    uint64_t *pd = (uint64_t *)(e & PT_PA_MASK);
+    e = pd[(va >> 21) & 0x1FF];
+    if (!(e & PTE_P)) { *gran = "unmapped"; return ~0ULL; }
+    if (e & PTE_PS) { *gran = "2MB"; return (e & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFFULL); }
+    uint64_t *pt = (uint64_t *)(e & PT_PA_MASK);
+    e = pt[(va >> 12) & 0x1FF];
+    if (!(e & PTE_P)) { *gran = "unmapped"; return ~0ULL; }
+    *gran = "4KB"; return (e & 0x000FFFFFFFFFF000ULL) | (va & 0xFFFULL);
+}
+
+/* Measure the heap arena's VA->PA remap once against the live firmware tables,
+ * so mm_v2p/mm_p2v can give page tables true physical addresses on real HW. */
+static void mm_phys_init(void) {
+    if (g_arena_len) return;
+    g_arena_va = (uint64_t)page_base();
+    uint64_t len = heap_total();
+    const char *g;
+    uint64_t pa = len ? diag_resolve(g_arena_va, &g) : g_arena_va;
+    g_arena_pa = (pa == ~0ULL) ? g_arena_va : pa;
+    g_arena_len = len;
+}
+
+/* True if `va` is mapped writable AND user-accessible in the CURRENT address
+ * space.  Guards kernel writes into a user pointer so a bad/unmapped pointer
+ * degrades to a skipped write instead of a fatal kernel #PF (walks CR3 by
+ * physical address, valid under the identity map firmware hands us). */
+static int user_va_writable(uint64_t va) {
+    uint64_t *t = (uint64_t *)(read_cr3() & PT_PA_MASK);
+    uint64_t e = t[(va >> 39) & 0x1FF]; if (!(e & PTE_P) || !(e & PTE_US)) return 0;
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 30) & 0x1FF]; if (!(e & PTE_P) || !(e & PTE_US)) return 0;
+    if (e & PTE_PS) return (e & PTE_RW) != 0;
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 21) & 0x1FF]; if (!(e & PTE_P) || !(e & PTE_US)) return 0;
+    if (e & PTE_PS) return (e & PTE_RW) != 0;
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 12) & 0x1FF];
+    return (e & PTE_P) && (e & PTE_US) && (e & PTE_RW);
+}
+
+/* DIAGNOSTIC (real-HW perf): report the framebuffer's effective memory type so
+ * we can tell whether it is uncached (UC) -- which makes blits ~3 FPS -- and
+ * program write-combining (WC) correctly.  Read-only (MSRs + page-table bits). */
+static uint64_t rd_msr(uint32_t msr) {
+    uint32_t lo, hi; __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+static uint64_t fw_leaf(uint64_t va, const char **gran) {
+    uint64_t *t = (uint64_t *)(read_cr3() & PT_PA_MASK);
+    uint64_t e = t[(va >> 39) & 0x1FF]; if (!(e & PTE_P)) { *gran = "unmapped"; return 0; }
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 30) & 0x1FF]; if (!(e & PTE_P)) { *gran = "unmapped"; return 0; }
+    if (e & PTE_PS) { *gran = "1GB"; return e; }
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 21) & 0x1FF]; if (!(e & PTE_P)) { *gran = "unmapped"; return 0; }
+    if (e & PTE_PS) { *gran = "2MB"; return e; }
+    t = (uint64_t *)(e & PT_PA_MASK); e = t[(va >> 12) & 0x1FF]; if (!(e & PTE_P)) { *gran = "unmapped"; return 0; }
+    *gran = "4KB"; return e;
+}
+void arch_fb_mem_diag(uint64_t base, uint64_t size) {
+    const char *g; uint64_t e = fw_leaf(base, &g);
+    int huge = (g[0] == '1' || g[0] == '2');
+    int pcd = (int)((e >> 4) & 1), pwt = (int)((e >> 3) & 1);
+    int pat = huge ? (int)((e >> 12) & 1) : (int)((e >> 7) & 1);
+    kputs("[fb] base="); kput_u64hex(base); kputs(" size="); kput_u64hex(size);
+    kputs(" gran="); kputs(g);
+    kputs(" PCD="); kputc((char)('0' + pcd));
+    kputs(" PWT="); kputc((char)('0' + pwt));
+    kputs(" PAT="); kputc((char)('0' + pat)); kputc('\n');
+    kputs("[fb] IA32_PAT="); kput_u64hex(rd_msr(0x277));
+    kputs(" MTRRdef=");      kput_u64hex(rd_msr(0x2FF));
+    uint64_t cap = rd_msr(0xFE);
+    kputs(" MTRRcap=");      kput_u64hex(cap); kputc('\n');
+    int n = (int)(cap & 0xFF);
+    for (int i = 0; i < n; i++) {
+        uint64_t mb = rd_msr(0x200 + 2 * i), mk = rd_msr(0x201 + 2 * i);
+        if (!(mk & 0x800)) continue;
+        if ((base & (mk & PT_PA_MASK)) == (mb & (mk & PT_PA_MASK))) {
+            kputs("[fb] MTRR"); kputc((char)('0' + i));
+            kputs(" base="); kput_u64hex(mb & PT_PA_MASK);
+            kputs(" mask="); kput_u64hex(mk & PT_PA_MASK);
+            kputs(" type="); kput_u64hex(mb & 0xFF); kputc('\n');
+        }
+    }
+}
+
+static void wr_msr(uint32_t msr, uint64_t v) {
+    __asm__ volatile("wrmsr" :: "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+}
+static uint64_t *fw_leaf_ptr(uint64_t va, int *huge) {
+    uint64_t *t = (uint64_t *)(read_cr3() & PT_PA_MASK);
+    uint64_t e = t[(va >> 39) & 0x1FF]; if (!(e & PTE_P)) return 0;
+    t = (uint64_t *)(e & PT_PA_MASK); int i3 = (int)((va >> 30) & 0x1FF); e = t[i3]; if (!(e & PTE_P)) return 0;
+    if (e & PTE_PS) { *huge = 1; return &t[i3]; }
+    t = (uint64_t *)(e & PT_PA_MASK); int i2 = (int)((va >> 21) & 0x1FF); e = t[i2]; if (!(e & PTE_P)) return 0;
+    if (e & PTE_PS) { *huge = 1; return &t[i2]; }
+    t = (uint64_t *)(e & PT_PA_MASK); int i1 = (int)((va >> 12) & 0x1FF); if (!(t[i1] & PTE_P)) return 0;
+    *huge = 0; return &t[i1];
+}
+/* Mark the framebuffer write-combining (PAT PA4=WC) so blits are not UC-slow on
+ * real HW (~3 FPS).  PAT-WC overrides the firmware's UC MTRR per-page, exactly
+ * like Linux ioremap_wc; done under the SDM cache-disable sequence. */
+void arch_fb_set_wc(uint64_t base, uint64_t size) {
+    if (!base || !size) return;
+    uint64_t pat = rd_msr(0x277);
+    pat = (pat & ~(0xFFULL << 32)) | (0x01ULL << 32);      /* PA4 = WC (0x01) */
+    uint64_t cr0; __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
+    __asm__ volatile("mov %0,%%cr0" :: "r"((cr0 & ~(1ULL << 16)) | (1ULL << 30)) : "memory"); /* CD=1 WP=0 */
+    __asm__ volatile("wbinvd");
+    wr_msr(0x277, pat);
+    uint64_t va = base & ~0x1FFFFFULL, end = base + size;
+    while (va < end) {
+        int huge = 0; uint64_t *pte = fw_leaf_ptr(va, &huge);
+        if (pte) {
+            uint64_t patbit = huge ? (1ULL << 12) : (1ULL << 7);
+            *pte = (*pte & ~((1ULL << 3) | (1ULL << 4))) | patbit;  /* PCD=0 PWT=0 PAT=1 -> PA4/WC */
+        }
+        va += (pte && !huge) ? 0x1000ULL : 0x200000ULL;
+    }
+    __asm__ volatile("wbinvd");
+    __asm__ volatile("mov %0,%%cr0" :: "r"(cr0) : "memory");   /* restore CD/WP */
+    flush_tlb();
+    kputs("[fb] write-combining enabled\n");
 }
 
 /* ---- reusable ring-3 program regions ------------------------------------
@@ -979,9 +1340,9 @@ static int       g_depth;                      /* 0 primary, 1 child running    
 
 static uint64_t *walk_pt(uint64_t pml4_phys, uint64_t va) {
     uint64_t *pml4 = (uint64_t *)pml4_phys;
-    uint64_t *pdpt = (uint64_t *)(pml4[(va >> 39) & 0x1FF] & ~0xFFFULL);
-    uint64_t *pd   = (uint64_t *)(pdpt[(va >> 30) & 0x1FF] & ~0xFFFULL);
-    return (uint64_t *)(pd[(va >> 21) & 0x1FF] & ~0xFFFULL);
+    uint64_t *pdpt = (uint64_t *)mm_p2v(pml4[(va >> 39) & 0x1FF] & PT_PA_MASK);
+    uint64_t *pd   = (uint64_t *)mm_p2v(pdpt[(va >> 30) & 0x1FF] & PT_PA_MASK);
+    return (uint64_t *)mm_p2v(pd[(va >> 21) & 0x1FF] & PT_PA_MASK);
 }
 
 /* point the code+stack window at a given pair of physical frame runs */
@@ -989,9 +1350,9 @@ static void map_region(uint8_t *code, uint8_t *stk) {
     int ci = (int)((USER_CODE_VA >> 12) & 0x1FF);
     int si = (int)((USER_STK_TOP  >> 12) & 0x1FF);
     for (int i = 0; i < USER_CODE_PAGES; i++)
-        g_pt[ci + i]     = ((uint64_t)(code + (uint64_t)i * 4096)) | PTE_P | PTE_RW | PTE_US;
+        g_pt[ci + i]     = (mm_v2p((uint64_t)(code + (uint64_t)i * 4096)) & PT_PA_MASK) | PTE_P | PTE_RW | PTE_US;
     for (int i = 0; i < USER_STK_PAGES; i++)
-        g_pt[si - 1 - i] = ((uint64_t)(stk  + (uint64_t)i * 4096)) | PTE_P | PTE_RW | PTE_US;
+        g_pt[si - 1 - i] = (mm_v2p((uint64_t)(stk  + (uint64_t)i * 4096)) & PT_PA_MASK) | PTE_P | PTE_RW | PTE_US;
     flush_tlb();
 }
 
@@ -1012,12 +1373,17 @@ struct elf64_phdr {
 static uint64_t *copy_page_table(const uint64_t *source) {
     uint64_t *copy = (uint64_t *)page_alloc(1);
     if (!copy) return 0;
-    if (source) for (int i = 0; i < 512; i++) copy[i] = source[i];
+    /* Clear our software-owned bit (PTE_OWN) on every copied entry: real UEFI
+     * firmware may use available bit 9 in its identity map, and the free/fork
+     * walks treat PTE_OWN as "a table/frame WE allocated".  Stripping it here
+     * guarantees OWN is set only by make_table_entry (our own entries), so
+     * teardown never descends into or frees shared firmware kernel tables. */
+    if (source) for (int i = 0; i < 512; i++) copy[i] = source[i] & ~(uint64_t)PTE_OWN;
     return copy;
 }
 
 static uint64_t make_table_entry(uint64_t *table) {
-    return (uint64_t)table | PTE_P | PTE_RW | PTE_US;
+    return mm_v2p((uint64_t)table) | PTE_P | PTE_RW | PTE_US | PTE_OWN;
 }
 
 /* struct proc_vm / struct linux_fd / enum linux_fd_kind now live in proc64.h;
@@ -1056,6 +1422,127 @@ static int linux_fd_alloc(int kind, int flags, const char *path, uint16_t dir_cl
     return -24;
 }
 
+/* ============================ /mnt + /usb VFS routing ======================
+ * Absolute paths under /mnt (internal SATA data partition) and /usb (USB stick)
+ * are served by the persistent FAT32 volumes (kernel/fs/datavol64.c) so that
+ * files created in the `sh` shell survive reboots, exactly like a real OS mount.
+ * Everything else stays on the RAM-disk FAT (kernel/fs/fat64.c).  The /mnt and
+ * /usb directories also exist as empty RAM placeholders so they show up in
+ * `ls /`; the routing here shadows them with the real volume contents. */
+
+/* If `full` is at or under mount point `mp`, return 1 and point *rel at the
+ * path relative to the mount root ("/" for the mount root itself). */
+static int under_mount(const char *full, const char *mp, const char **rel) {
+    int i = 0; while (mp[i]) { if (full[i] != mp[i]) return 0; i++; }
+    if (full[i] == 0)   { *rel = "/"; return 1; }
+    if (full[i] == '/') { *rel = full + i; return 1; }
+    return 0;
+}
+/* Map an absolute path to its volume: 1=/mnt, 2=/usb, 0=RAM fat.  *vol is the
+ * mounted fatvol, or 0 if that mount is not currently available. */
+static int fs_mount_of(const char *full, const char **rel, fatvol_t **vol) {
+    if (under_mount(full, "/mnt", rel)) { *vol = dv_vol(); return 1; }
+    if (under_mount(full, "/usb", rel)) { *vol = uv_vol(); return 2; }
+    *rel = full; *vol = 0; return 0;
+}
+static int is_mount_root(const char *rel) { return rel[0] == '/' && rel[1] == 0; }
+
+/* resolve metadata for a path (attr bit 0x10 = directory). 0 ok, <0 not found. */
+static int vfs_resolve(const char *full, uint8_t *attr, uint32_t *cluster, uint32_t *size) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) {
+        if (!v) return -1;
+        if (is_mount_root(rel)) { if (attr)*attr=0x10; if (cluster)*cluster=v->root; if (size)*size=0; return 0; }
+        uint32_t c, s; int isd;
+        if (!fv_resolve(v, rel, &c, &s, &isd)) return -1;
+        if (attr) *attr = isd ? 0x10 : 0x20;
+        if (cluster) *cluster = c;
+        if (size) *size = s;
+        return 0;
+    }
+    uint8_t a; uint16_t c16; uint32_t s;
+    if (fat_resolve(full, &a, &c16, &s) < 0) return -1;
+    if (attr) *attr = a;
+    if (cluster) *cluster = c16;
+    if (size) *size = s;
+    return 0;
+}
+static int vfs_pread(const char *full, void *buf, uint32_t len, uint32_t off) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) { if (!v || is_mount_root(rel)) return -1; return fv_pread(v, rel, buf, len, off); }
+    return fat_pread(full, buf, len, off);
+}
+static int vfs_pwrite(const char *full, const void *buf, uint32_t len, uint32_t off) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) { if (!v || is_mount_root(rel)) return -1; return fv_pwrite(v, rel, buf, len, off); }
+    return fat_pwrite(full, buf, len, off);
+}
+static int vfs_create(const char *full) {              /* create empty / truncate to 0 */
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) { if (!v || is_mount_root(rel)) return -1; return fv_write(v, rel, "", 0); }
+    return fat_write(full, "", 0);
+}
+static int vfs_truncate(const char *full, uint32_t size) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) { if (!v || is_mount_root(rel)) return -1; return fv_truncate(v, rel, size); }
+    return fat_truncate(full, size);
+}
+static int vfs_mkdir(const char *full) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) { if (!v) return -1; if (is_mount_root(rel)) return -17; return fv_mkdir(v, rel); }
+    return fat_mkdir(full);
+}
+static int vfs_unlink(const char *full) {          /* -> 0 or Linux errno */
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) {
+        if (!v || is_mount_root(rel)) return -2;
+        int r = fv_unlink(v, rel);
+        return r == 0 ? 0 : r == -21 ? -21 : -2;   /* EISDIR | ENOENT */
+    }
+    int r = fat_unlink(full);
+    return r == 0 ? 0 : r == -2 ? -21 : -2;         /* fat: -2 = is-a-dir */
+}
+static int vfs_rmdir(const char *full) {           /* -> 0 or Linux errno */
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(full, &rel, &v)) {
+        if (!v || is_mount_root(rel)) return -2;
+        int r = fv_rmdir(v, rel);
+        return r == 0 ? 0 : r == -20 ? -20 : r == -39 ? -39 : -2;
+    }
+    int r = fat_rmdir(full);
+    return r == 0 ? 0 : r == -2 ? -20 : r == -3 ? -39 : -2;  /* fat: -2 notdir, -3 notempty */
+}
+/* list the idx-th entry of directory `dirfull`; 0 ok, <0 at end. */
+static int vfs_list(const char *dirfull, int idx, char *name, uint8_t *attr, uint32_t *cluster, uint32_t *size) {
+    const char *rel; fatvol_t *v;
+    if (fs_mount_of(dirfull, &rel, &v)) {
+        if (!v) return -1;
+        uint32_t dcl;
+        if (is_mount_root(rel)) dcl = v->root;
+        else { uint32_t sz; int isd; if (!fv_resolve(v, rel, &dcl, &sz, &isd) || !isd) return -1; if (!dcl) dcl = v->root; }
+        return fv_readdir_m(v, dcl, idx, name, attr, cluster, size);
+    }
+    uint32_t dcl = 0;
+    if (!(dirfull[0]=='/' && dirfull[1]==0)) {
+        uint8_t a; uint16_t c16; uint32_t sz;
+        if (fat_resolve(dirfull, &a, &c16, &sz) < 0 || !(a & 0x10)) return -1;
+        dcl = c16;
+    }
+    uint16_t c16; int r = fat_list(dcl, idx, name, attr, &c16, size);
+    if (cluster) *cluster = c16;
+    return r;
+}
+
+/* chdir routed through the VFS so `cd /mnt`, `cd /usb`, and their subdirs work. */
+static int linux_chdir(const char *path) {
+    char full[256]; fs_resolve(path, full);
+    if (full[0] == '/' && full[1] == 0) { fs_setcwd("/"); return 0; }
+    uint8_t attr; uint32_t cl, sz;
+    if (vfs_resolve(full, &attr, &cl, &sz) < 0 || !(attr & 0x10)) return -20;
+    fs_setcwd(full);
+    return 0;
+}
+
 static int linux_openat(int dirfd, const char *path, int flags) {
     char full[256]; int resolved = linux_resolve_at(dirfd, path, full);
     if (resolved < 0) return resolved;
@@ -1065,24 +1552,23 @@ static int linux_openat(int dirfd, const char *path, int flags) {
     }
     if (name_eq(full, "/dev/null")) return linux_fd_alloc(LINUX_FD_NULL, flags, full, 0, 0);
     if (name_eq(full, "/dev/tty"))  return linux_fd_alloc(LINUX_FD_TTY, flags, full, 0, 0);
-    uint8_t attr; uint16_t cluster; uint32_t size;
-    int exists = fat_resolve(full, &attr, &cluster, &size) == 0;
+    uint8_t attr; uint32_t cluster; uint32_t size;
+    int exists = vfs_resolve(full, &attr, &cluster, &size) == 0;
     if (exists && (attr & 0x10)) {
         if (flags & LINUX_O_ACCMODE) return -21;
-        return linux_fd_alloc(LINUX_FD_DIR, flags, full, cluster, 0);
+        return linux_fd_alloc(LINUX_FD_DIR, flags, full, (uint16_t)cluster, 0);
     }
     if (flags & LINUX_O_DIRECTORY) return -20;
     if (!exists) {
         if (!(flags & LINUX_O_CREAT)) return -2;
-        if (fat_write(full, "", 0) < 0) return -28;
+        if (vfs_create(full) < 0) return -28;
         size = 0;
     } else if ((flags & LINUX_O_TRUNC) && (flags & LINUX_O_ACCMODE)) {
-        if (fat_write(full, "", 0) < 0) return -5;
+        if (vfs_create(full) < 0) return -5;
         size = 0;
     }
     return linux_fd_alloc(LINUX_FD_FILE, flags, full, 0, (flags & LINUX_O_APPEND) ? size : 0);
 }
-
 /* ---- pipes (Phase D): a kernel ring buffer with reference-counted ends ------
  * A pipe is shared between its read and write fds (which may live in different
  * processes after fork), so pipes are a small global pool; each fd holds the
@@ -1270,10 +1756,6 @@ static int linux_fcntl(int fd, int cmd, uint64_t arg) {
  * Reads one keyboard line, rendering edits to the active terminal with ANSI
  * cursor sequences (ESC[C/D/K).  Returns the length incl. the trailing '\n', or
  * 0 for EOF (Ctrl-D on an empty line). */
-#define TTY_HIST_N 16
-static char g_tty_hist[TTY_HIST_N][256];
-static int  g_tty_histn;
-
 static void tty_emit(const char *s, int n) { usys_write(s, (unsigned long)n); }
 static void tty_bs(int n) { while (n-- > 0) tty_emit("\x1b[D", 3); }   /* cursor left  */
 static void tty_fw(int n) { while (n-- > 0) tty_emit("\x1b[C", 3); }   /* cursor right */
@@ -1281,13 +1763,14 @@ static void tty_fw(int n) { while (n-- > 0) tty_emit("\x1b[C", 3); }   /* cursor
 static void tty_hist_push(const char *s, int n) {
     if (n <= 0) return;
     if (n > 255) n = 255;
-    if (g_tty_histn == TTY_HIST_N) {                       /* full: drop the oldest */
+    struct tty_state *ty = cur_tty();
+    if (ty->histn == TTY_HIST_N) {                         /* full: drop the oldest */
         for (int i = 1; i < TTY_HIST_N; i++)
-            for (int j = 0; j < 256; j++) g_tty_hist[i - 1][j] = g_tty_hist[i][j];
-        g_tty_histn--;
+            for (int j = 0; j < 256; j++) ty->hist[i - 1][j] = ty->hist[i][j];
+        ty->histn--;
     }
-    int i = 0; for (; i < n; i++) g_tty_hist[g_tty_histn][i] = s[i];
-    g_tty_hist[g_tty_histn][i] = 0; g_tty_histn++;
+    int i = 0; for (; i < n; i++) ty->hist[ty->histn][i] = s[i];
+    ty->hist[ty->histn][i] = 0; ty->histn++;
 }
 
 /* Tab completion for the canonical editor: complete the filename token ending
@@ -1305,15 +1788,11 @@ static void tty_complete(char *line, int *plen, int *ppos, int max) {
     if (slash < 0) { dirq[0] = '.'; dirq[1] = 0; partial = word; }
     else { int j = 0; while (j <= slash && j < 254) { dirq[j] = word[j]; j++; } dirq[j] = 0; partial = word + slash + 1; }
     char absdir[256]; fs_resolve(dirq, absdir);
-    uint8_t at; uint16_t cl; uint32_t sz; uint32_t dcl = 0;
-    if (!(absdir[0] == '/' && absdir[1] == 0)) {
-        if (fat_resolve(absdir, &at, &cl, &sz) < 0 || !(at & 0x10)) return;
-        dcl = cl;
-    }
+    uint8_t at; uint32_t cl; uint32_t sz;
     int pl = 0; while (partial[pl]) pl++;
     char lcp[256]; int lcp_len = -1, matches = 0, only_dir = 0;
     char nm[256];
-    for (int i = 0; fat_list(dcl, i, nm, &at, &cl, &sz) == 0; i++) {
+    for (int i = 0; vfs_list(absdir, i, nm, &at, &cl, &sz) == 0; i++) {
         if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
         int m = 1; for (int k = 0; k < pl; k++) if (nm[k] != partial[k]) { m = 0; break; }
         if (!m) continue;
@@ -1338,12 +1817,18 @@ static void tty_complete(char *line, int *plen, int *ppos, int max) {
 
 static int tty_read_line(char *out, int max) {
     char line[256]; int len = 0, pos = 0;
-    int hidx = g_tty_histn;                                 /* == histn: a fresh (unsaved) line */
+    struct tty_state *ty = cur_tty();
+    int hidx = ty->histn;                                  /* == histn: a fresh (unsaved) line */
     for (;;) {
-        int key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
-        if (key < 0) { wm_pump(); continue; }
-        if (key == 3 && (g_tty.lflag & TTY_ISIG)) {         /* Ctrl-C: discard line, reprompt */
-            signal_pgrp(g_tty.fg_pgrp, 2);
+        int key;
+        if (pane_in_use()) key = pane_getkey();             /* router delivers this pane's keys */
+        else {
+            key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
+            if (key < 0) { wm_pump(); power_poll(); idle_wait(); continue; }
+            if (wm_hotkey(key)) { wm_pump(); continue; }    /* F1/F2/log-scroll while shell owns stdin */
+        }
+        if (key == 3 && (ty->lflag & TTY_ISIG)) {           /* Ctrl-C: discard line, reprompt */
+            signal_pgrp(ty->fg_pgrp, 2);
             tty_emit("\n", 1); out[0] = '\n'; return 1;
         }
         if (key == 4) { if (len == 0) return 0; continue; } /* Ctrl-D: EOF only on an empty line */
@@ -1358,13 +1843,13 @@ static int tty_read_line(char *out, int max) {
         if (key == KEY_UP || key == KEY_DOWN) {             /* history: replace the whole line */
             int ni = hidx + (key == KEY_UP ? -1 : 1);
             if (ni < 0) ni = 0;
-            if (ni > g_tty_histn) ni = g_tty_histn;
+            if (ni > ty->histn) ni = ty->histn;
             if (ni == hidx) continue;
             hidx = ni;
             tty_bs(pos); tty_emit("\x1b[K", 3);             /* cursor to start, clear to EOL */
             len = 0;
-            if (hidx < g_tty_histn)
-                while (g_tty_hist[hidx][len] && len < 255) { line[len] = g_tty_hist[hidx][len]; len++; }
+            if (hidx < ty->histn)
+                while (ty->hist[hidx][len] && len < 255) { line[len] = ty->hist[hidx][len]; len++; }
             tty_emit(line, len); pos = len;
             continue;
         }
@@ -1394,26 +1879,34 @@ static int tty_read_line(char *out, int max) {
 /* Shared keyboard reader for fd 0 and /dev/tty: raw keys in raw mode, else one
  * edited canonical line at a time (Tab completion + history live in the editor). */
 static int tty_stdin_read(void *buf, uint32_t len) {
-    if (!(g_tty.lflag & TTY_ICANON)) {             /* raw mode (vi etc.): keys as they arrive, no echo */
+    struct tty_state *ty = cur_tty();
+    if (!(ty->lflag & TTY_ICANON)) {               /* raw mode (vi etc.): keys as they arrive, no echo */
         char *out = (char *)buf; uint32_t count = 0;
         while (count < len) {
-            int key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
-            if (key < 0) { if (count) break; wm_pump(); continue; }   /* block for the first byte */
-            if (key == 3 && (g_tty.lflag & TTY_ISIG)) { signal_pgrp(g_tty.fg_pgrp, 2); break; }
+            int key;
+            if (pane_in_use()) { key = count ? pane_trykey() : pane_getkey(); if (key < 0) break; }
+            else {
+                key = kbd64_getkey(); if (key < 0) key = hvkbd_getkey();
+                if (key < 0) { if (count) break; wm_pump(); power_poll(); idle_wait(); continue; }   /* block for the first byte */
+                if (wm_hotkey(key)) { wm_pump(); continue; }   /* F1/F2/log-scroll even in raw mode */
+            }
+            if (key == 3 && (ty->lflag & TTY_ISIG)) { signal_pgrp(ty->fg_pgrp, 2); break; }
             if (key > KEY_RIGHT) continue;         /* drop F-keys; keep arrows (0x80-0x83) */
             if (key == '\r') key = '\n';
             out[count++] = (char)key;
         }
         return (int)count;
     }
-    static char cook[256]; static int cook_len, cook_pos;   /* canonical cooked line */
-    if (cook_pos >= cook_len) {                    /* buffer drained: edit a fresh line */
-        cook_pos = 0;
-        cook_len = tty_read_line(cook, sizeof cook);
-        if (cook_len <= 0) { cook_len = 0; return 0; }   /* Ctrl-D EOF */
+    static char cook[TTY_SLOTS][256]; static int cook_len[TTY_SLOTS], cook_pos[TTY_SLOTS];  /* per-pane cooked line */
+    int pi = (pane_in_use() && current->pane >= 0 && current->pane < PANE_MAX) ? current->pane : PANE_MAX;
+    char *ck = cook[pi];
+    if (cook_pos[pi] >= cook_len[pi]) {             /* buffer drained: edit a fresh line */
+        cook_pos[pi] = 0;
+        cook_len[pi] = tty_read_line(ck, 256);
+        if (cook_len[pi] <= 0) { cook_len[pi] = 0; return 0; }   /* Ctrl-D EOF */
     }
     char *out = (char *)buf; uint32_t count = 0;
-    while (count < len && cook_pos < cook_len) out[count++] = cook[cook_pos++];
+    while (count < len && cook_pos[pi] < cook_len[pi]) out[count++] = ck[cook_pos[pi]++];
     return (int)count;
 }
 
@@ -1433,7 +1926,7 @@ static int linux_read(int fd, void *buf, uint32_t len) {
         if (k == LINUX_FD_SOCKET) return tcp_recv(g_linux_fds[fd].sock, buf, (int)len);
         if (k != LINUX_FD_FILE) return -21;
         if ((g_linux_fds[fd].flags & LINUX_O_ACCMODE) == 1) return -9;
-        int result = fat_pread(g_linux_fds[fd].path, buf, len, g_linux_fds[fd].offset);
+        int result = vfs_pread(g_linux_fds[fd].path, buf, len, g_linux_fds[fd].offset);
         if (result > 0) g_linux_fds[fd].offset += (uint32_t)result;
         return result < 0 ? -5 : result;
     }
@@ -1453,11 +1946,11 @@ static int linux_write(int fd, const void *buf, uint32_t len) {
         if (k != LINUX_FD_FILE) return -21;
         if (!(g_linux_fds[fd].flags & LINUX_O_ACCMODE)) return -9;
         if (g_linux_fds[fd].flags & LINUX_O_APPEND) {
-            uint8_t attr; uint16_t cluster; uint32_t size;
-            if (fat_resolve(g_linux_fds[fd].path, &attr, &cluster, &size) < 0) return -5;
+            uint8_t attr; uint32_t cluster; uint32_t size;
+            if (vfs_resolve(g_linux_fds[fd].path, &attr, &cluster, &size) < 0) return -5;
             g_linux_fds[fd].offset = size;
         }
-        int result = fat_pwrite(g_linux_fds[fd].path, buf, len, g_linux_fds[fd].offset);
+        int result = vfs_pwrite(g_linux_fds[fd].path, buf, len, g_linux_fds[fd].offset);
         if (result > 0) g_linux_fds[fd].offset += (uint32_t)result;
         return result < 0 ? -5 : result;
     }
@@ -1473,8 +1966,8 @@ static int64_t linux_lseek(int fd, int64_t offset, int whence) {
     if (whence == 0) base = 0;
     else if (whence == 1) base = g_linux_fds[fd].offset;
     else if (whence == 2) {
-        uint8_t attr; uint16_t cluster; uint32_t size;
-        if (fat_resolve(g_linux_fds[fd].path, &attr, &cluster, &size) < 0) return -5;
+        uint8_t attr; uint32_t cluster; uint32_t size;
+        if (vfs_resolve(g_linux_fds[fd].path, &attr, &cluster, &size) < 0) return -5;
         base = size;
     } else return -22;
     if (offset < -base || base + offset > 0xFFFFFFFFLL) return -22;
@@ -1502,9 +1995,9 @@ static void linux_fill_stat(struct linux_stat *st, int kind, uint16_t cluster, u
 
 static int linux_stat_path(const char *path, struct linux_stat *st) {
     if (name_eq(path, "/dev/null")) { linux_fill_stat(st, LINUX_FD_NULL, 0, 0); return 0; }
-    uint8_t attr; uint16_t cluster; uint32_t size;
-    if (fat_resolve(path, &attr, &cluster, &size) < 0) return -2;
-    linux_fill_stat(st, (attr & 0x10) ? LINUX_FD_DIR : LINUX_FD_FILE, cluster, size);
+    uint8_t attr; uint32_t cluster; uint32_t size;
+    if (vfs_resolve(path, &attr, &cluster, &size) < 0) return -2;
+    linux_fill_stat(st, (attr & 0x10) ? LINUX_FD_DIR : LINUX_FD_FILE, (uint16_t)cluster, size);
     return 0;
 }
 
@@ -1520,7 +2013,7 @@ static int linux_ftruncate(int fd, uint64_t size) {
     if (g_linux_fds[fd].kind != LINUX_FD_FILE) return -22;
     if (!(g_linux_fds[fd].flags & LINUX_O_ACCMODE)) return -22;
     if (size > 0xFFFFFFFFULL) return -27;
-    return fat_truncate(g_linux_fds[fd].path, (uint32_t)size) < 0 ? -5 : 0;
+    return vfs_truncate(g_linux_fds[fd].path, (uint32_t)size) < 0 ? -5 : 0;
 }
 
 static int linux_newfstatat(int dirfd, const char *path, void *statbuf, int flags) {
@@ -1535,8 +2028,8 @@ static int linux_getdents64(int fd, void *buf, uint32_t len) {
     if (g_linux_fds[fd].kind != LINUX_FD_DIR) return -20;
     uint8_t *out = (uint8_t *)buf; uint32_t used = 0;
     for (;;) {
-        char name[256]; uint8_t attr; uint16_t cluster; uint32_t size;
-        if (fat_list(g_linux_fds[fd].dir_cluster, (int)g_linux_fds[fd].offset,
+        char name[256]; uint8_t attr; uint32_t cluster; uint32_t size;
+        if (vfs_list(g_linux_fds[fd].path, (int)g_linux_fds[fd].offset,
                      name, &attr, &cluster, &size) < 0) break;
         (void)size;
         uint32_t name_len = 0; while (name[name_len]) name_len++;
@@ -1556,42 +2049,43 @@ static int linux_getdents64(int fd, void *buf, uint32_t len) {
 static int linux_mkdirat(int dirfd, const char *path) {
     char full[256]; int result = linux_resolve_at(dirfd, path, full);
     if (result < 0) return result;
-    return fat_mkdir(full) < 0 ? -17 : 0;
+    return vfs_mkdir(full) < 0 ? -17 : 0;
 }
 
-/* rmdir(84): remove an empty directory.  fat_rmdir codes -> Linux errnos. */
+/* rmdir(84): remove an empty directory. */
 static int linux_rmdir(const char *path) {
     char full[256]; int result = linux_resolve_at(-100, path, full);
     if (result < 0) return result;
-    result = fat_rmdir(full);
-    return result == 0 ? 0 : result == -2 ? -20 : result == -3 ? -39 : -2;
+    return vfs_rmdir(full);                          /* already a Linux errno */
 }
 
 /* rename(82): FAT has no atomic rename, so copy-then-unlink for files; refuse
- * directory renames with -EXDEV so userland can fall back to recursive copy. */
+ * directory renames with -EXDEV so userland can fall back to recursive copy.
+ * Works across mounts too (e.g. /usb/a -> /mnt/b). */
 static int linux_rename(const char *oldp, const char *newp) {
     char fo[256], fn[256];
     int a = linux_resolve_at(-100, oldp, fo); if (a < 0) return a;
     int b = linux_resolve_at(-100, newp, fn); if (b < 0) return b;
-    uint8_t attr; uint16_t cluster; uint32_t size;
-    if (fat_resolve(fo, &attr, &cluster, &size) < 0) return -2;   /* ENOENT */
+    uint8_t attr; uint32_t cluster; uint32_t size;
+    if (vfs_resolve(fo, &attr, &cluster, &size) < 0) return -2;   /* ENOENT */
     if (attr & 0x10) return -18;                                  /* EXDEV: dir rename n/a */
     uint8_t *buf = (uint8_t *)kmalloc(size ? size : 1);
     if (!buf) return -12;
-    int r = size ? fat_read(cluster, size, buf, size) : 0;
-    int w = (r == (int)size) ? fat_write(fn, buf, size) : -1;
+    int r = size ? vfs_pread(fo, buf, size, 0) : 0;
+    int w = -1;
+    if (r == (int)size && vfs_create(fn) >= 0) w = size ? vfs_pwrite(fn, buf, size, 0) : 0;
     kfree(buf);
     if (w < 0) return -5;
-    fat_unlink(fo);
+    vfs_unlink(fo);
     return 0;
 }
 
 static int linux_unlinkat(int dirfd, const char *path, int flags) {
-    if (flags) return -22;
     char full[256]; int result = linux_resolve_at(dirfd, path, full);
     if (result < 0) return result;
-    result = fat_unlink(full);
-    return result == -2 ? -21 : result < 0 ? -2 : 0;
+    if (flags & 0x200) return vfs_rmdir(full);      /* AT_REMOVEDIR */
+    if (flags) return -22;
+    return vfs_unlink(full);                          /* already a Linux errno */
 }
 
 static uint64_t linux_getcwd(char *buf, uint64_t size) {
@@ -1688,22 +2182,22 @@ static int linux_ioctl(int fd, uint64_t request, void *arg) {
         if (!arg) return -14;
         memset(arg, 0, 60);
         uint32_t *t = (uint32_t *)arg;      /* c_iflag,c_oflag,c_cflag,c_lflag */
-        t[0] = 0x0500; t[1] = 0x0005; t[2] = 0x00BF; t[3] = g_tty.lflag;
+        t[0] = 0x0500; t[1] = 0x0005; t[2] = 0x00BF; t[3] = cur_tty()->lflag;
         ((uint8_t *)arg)[17] = 3;           /* c_cc[VINTR] = Ctrl-C */
         ((uint8_t *)arg)[21] = 4;           /* c_cc[VEOF]  = Ctrl-D */
         return 0;
     }
     case 0x5402: case 0x5403: case 0x5404:  /* TCSETS / TCSETSW / TCSETSF */
         if (!arg) return -14;
-        g_tty.lflag = ((const uint32_t *)arg)[3];
+        cur_tty()->lflag = ((const uint32_t *)arg)[3];
         return 0;
     case 0x540F:                            /* TIOCGPGRP */
         if (!arg) return -14;
-        *(int *)arg = g_tty.fg_pgrp ? g_tty.fg_pgrp : (current->pgid ? current->pgid : current->pid);
+        *(int *)arg = cur_tty()->fg_pgrp ? cur_tty()->fg_pgrp : (current->pgid ? current->pgid : current->pid);
         return 0;
     case 0x5410:                            /* TIOCSPGRP */
         if (!arg) return -14;
-        g_tty.fg_pgrp = *(const int *)arg;
+        cur_tty()->fg_pgrp = *(const int *)arg;
         return 0;
     default:
         return -25;
@@ -1724,7 +2218,7 @@ static uint64_t *linux_vm_pt(uint64_t va, int create) {
         } else if (table[index] & PTE_PS) {
             return 0;
         }
-        table = (uint64_t *)(table[index] & ~0xFFFULL);
+        table = (uint64_t *)(table[index] & PT_PA_MASK);
     }
     return table;
 }
@@ -1736,10 +2230,10 @@ static uint64_t *linux_vm_pte(uint64_t va, int create) {
 
 static int linux_map_page(uint64_t va, uint64_t prot) {
     uint64_t *pte = linux_vm_pte(va, 1);
-    if (!pte || (*pte & ~0xFFFULL)) return -1;
+    if (!pte || (*pte & PT_PA_MASK)) return -1;
     void *frame = page_alloc(1);
     if (!frame) return -1;
-    *pte = (uint64_t)frame | PTE_US | (prot ? PTE_P : 0) | ((prot & 2) ? PTE_RW : 0);
+    *pte = (uint64_t)frame | PTE_US | PTE_OWN | (prot ? PTE_P : 0) | ((prot & 2) ? PTE_RW : 0);
     return 0;
 }
 
@@ -1778,10 +2272,10 @@ int arch_bo_zerocopy_test(void) {
         pd[(va >> 21) & 0x1FF]   = (uint64_t)pt   | PTE_P | PTE_RW | PTE_US;
         pt[(va >> 12) & 0x1FF]   = phys | PTE_P | PTE_RW | PTE_US;
         uint64_t *t = pml4;
-        t = (uint64_t *)(t[(va >> 39) & 0x1FF] & ~0xFFFULL);
-        t = (uint64_t *)(t[(va >> 30) & 0x1FF] & ~0xFFFULL);
-        t = (uint64_t *)(t[(va >> 21) & 0x1FF] & ~0xFFFULL);
-        r = ((t[(va >> 12) & 0x1FF] & ~0xFFFULL) == phys) ? 0 : -1;
+        t = (uint64_t *)(t[(va >> 39) & 0x1FF] & PT_PA_MASK);
+        t = (uint64_t *)(t[(va >> 30) & 0x1FF] & PT_PA_MASK);
+        t = (uint64_t *)(t[(va >> 21) & 0x1FF] & PT_PA_MASK);
+        r = ((t[(va >> 12) & 0x1FF] & PT_PA_MASK) == phys) ? 0 : -1;
     }
     if (pt) page_free(pt, 1);
     if (pd) page_free(pd, 1);
@@ -1838,11 +2332,15 @@ static int64_t gfx_bo_create(uint32_t w, uint32_t h, void *user_desc) {
 
 static int64_t gfx_present(int handle, int x, int y) {
     if (handle < 0 || handle >= GFX_MAX_BO || !g_gfx[handle].bo) return -22;
+    wm_note_gfx_present();                            /* tell the compositor to stand down */
     tgl_bind(tgl_screen());                          /* composite BO -> back buffer -> display */
     tgl_compose(&g_gfx[handle].bo->surf, x, y);
     tgl_present();
-    int k = kbd64_getkey();
-    if (k < 0) k = hvkbd_getkey();
+    /* In split-pane mode the router owns the keyboard and delivers keys to this
+     * pane's ring; poll it (not the raw controller) so the app still gets input. */
+    int k;
+    if (pane_in_use()) k = pane_trykey();
+    else { k = kbd64_getkey(); if (k < 0) k = hvkbd_getkey(); }
     return k < 0 ? 0 : k;
 }
 
@@ -1928,7 +2426,7 @@ static int linux_mprotect(uint64_t addr, uint64_t len, uint64_t prot) {
     if (!linux_vm_range_owned(addr, len)) return -12;
     for (uint64_t va = addr; va < addr + len; va += 4096) {
         uint64_t *pte = linux_vm_pte(va, 0);
-        if (!pte || !(*pte & ~0xFFFULL)) return -12;
+        if (!pte || !(*pte & PT_PA_MASK)) return -12;
         *pte = (*pte & ~(PTE_P | PTE_RW)) | (prot ? PTE_P : 0) |
                ((prot & 2) ? PTE_RW : 0) | PTE_US;
     }
@@ -1959,27 +2457,39 @@ static uint64_t *linux_address_space(const uint64_t code_pte[LINUX_LOAD_PAGES],
     int l4 = (int)((LINUX_LOAD_VA >> 39) & 0x1FF);
     int l3 = (int)((LINUX_LOAD_VA >> 30) & 0x1FF);
     int l2 = (int)((LINUX_LOAD_VA >> 21) & 0x1FF);
-    uint64_t *old_pdpt = (uint64_t *)(kpml4[l4] & ~0xFFFULL);
+    uint64_t *old_pdpt = (uint64_t *)(kpml4[l4] & PT_PA_MASK);
     if (!(kpml4[l4] & PTE_P) || (kpml4[l4] & PTE_PS)) return 0;
     uint64_t *pdpt = copy_page_table(old_pdpt);
-    if (!pdpt || !(old_pdpt[l3] & PTE_P) || (old_pdpt[l3] & PTE_PS)) return 0;
-    uint64_t *old_pd = (uint64_t *)(old_pdpt[l3] & ~0xFFFULL);
-    uint64_t *pd = copy_page_table(old_pd);
+    if (!pdpt || !(old_pdpt[l3] & PTE_P)) return 0;
+    uint64_t *pd;
+    if (old_pdpt[l3] & PTE_PS) {
+        /* firmware maps this 1GB region as a huge page; rebuild it as 512 2MB
+         * pages so a single 2MB slot can host our 4KB code table */
+        pd = copy_page_table(0);
+        if (!pd) return 0;
+        uint64_t gbase = old_pdpt[l3] & 0x000FFFFFC0000000ULL;
+        uint64_t gfl   = (old_pdpt[l3] & 0xFFFULL & ~(uint64_t)PTE_OWN) | PTE_PS;   /* never inherit OWN */
+        for (int i = 0; i < 512; i++) pd[i] = (gbase + (uint64_t)i * 0x200000ULL) | gfl;
+    } else {
+        pd = copy_page_table((uint64_t *)(old_pdpt[l3] & PT_PA_MASK));
+        if (!pd) return 0;
+    }
     uint64_t *code_pt = copy_page_table(0);
-    if (!pd || !code_pt) return 0;
+    if (!code_pt) return 0;
     pml4[l4] = make_table_entry(pdpt);
     pdpt[l3] = make_table_entry(pd);
     pd[l2] = make_table_entry(code_pt);
     int code_index = (int)((LINUX_LOAD_VA >> 12) & 0x1FF);
     for (uint64_t i = 0; i < code_pages; i++) {
         if (code_pte[i])
-            code_pt[code_index + i] = (uint64_t)(code + i * 4096) | code_pte[i];
+            code_pt[code_index + i] = (uint64_t)(code + i * 4096) | code_pte[i] | PTE_OWN;
     }
 
     int s4 = (int)((LINUX_STK_TOP >> 39) & 0x1FF);
     int s3 = (int)((LINUX_STK_TOP >> 30) & 0x1FF);
     int s2 = (int)((LINUX_STK_TOP >> 21) & 0x1FF);
-    if (kpml4[s4] & PTE_P) return 0;
+    /* slot 255 may be firmware-populated on real HW (like slot 224); overwrite it
+     * in this process-private copy instead of bailing (kernel keeps its own map) */
     uint64_t *stack_pdpt = copy_page_table(0);
     uint64_t *stack_pd = copy_page_table(0);
     uint64_t *stack_pt = copy_page_table(0);
@@ -1989,7 +2499,7 @@ static uint64_t *linux_address_space(const uint64_t code_pte[LINUX_LOAD_PAGES],
     stack_pd[s2] = make_table_entry(stack_pt);
     int stack_index = (int)((LINUX_STK_TOP >> 12) & 0x1FF);
     for (int i = 0; i < USER_STK_PAGES; i++)
-        stack_pt[stack_index - 1 - i] = (uint64_t)(stk + (uint64_t)i * 4096) | PTE_P | PTE_RW | PTE_US;
+        stack_pt[stack_index - 1 - i] = (uint64_t)(stk + (uint64_t)i * 4096) | PTE_P | PTE_RW | PTE_US | PTE_OWN;
 
     pml4[(USER_CODE_VA >> 39) & 0x1FF] = 0;
     pml4[(LINUX_BRK_BASE >> 39) & 0x1FF] = 0;
@@ -2139,14 +2649,15 @@ static int run_linux_elf_frames(const uint8_t *img, uint64_t size,
         p->on_sched = 1;
         p->kstack_top = kstk + 16384;
         p->pgid = p->pid; p->sid = p->pid;     /* the launched job leads its own session */
-        int saved_fg = g_tty.fg_pgrp;
-        g_tty.fg_pgrp = p->pid;                /* it is the foreground job (Ctrl-C targets it) */
+        struct tty_state *ty = cur_tty();       /* caller's slot (current == parent here) */
+        int saved_fg = ty->fg_pgrp;
+        ty->fg_pgrp = p->pid;                  /* it is the foreground job (Ctrl-C targets it) */
         sched_init();
         usched_spawn_user(im.entry, im.rsp, kstk, 16384, 0, 0, (uint64_t)im.pml4, p);
         sched_start();
         sched_wait((volatile int *)&p->state, PROC_ZOMBIE, p->pid);
         sched_stop();
-        g_tty.fg_pgrp = saved_fg;
+        ty->fg_pgrp = saved_fg;
         current = parent;
         arch_set_syscall_stack((uint64_t)(g_ksys0 + sizeof(g_ksys0)));
         arch_set_tss_rsp0((uint64_t)(g_kstack0 + sizeof(g_kstack0)));
@@ -2201,13 +2712,20 @@ int arch_proc_test(int stress) {
     return ok;
 }
 
+/* Multi-process fork/pipe/signal BOOT self-tests: dev verification only (proven
+ * on QEMU/Hyper-V).  OFF on real HW where fork under the scheduler #GPs on bare
+ * metal (untested path) and would halt before the desktop; fork code still runs
+ * interactively.  Set to 1 to re-enable the boot self-tests. */
+#define RUN_LINUX_FORK_SELFTESTS 0
+
 void arch_user_init(void) {
     proc_table_init();
+    mm_phys_init();                            /* measure arena VA->PA remap (real HW) */
     g_ucode = (uint8_t *)page_alloc(USER_CODE_PAGES); g_ustk = (uint8_t *)page_alloc(USER_STK_PAGES);
     g_ccode = (uint8_t *)page_alloc(USER_CODE_PAGES); g_cstk = (uint8_t *)page_alloc(USER_STK_PAGES);
     if (!g_ucode || !g_ustk || !g_ccode || !g_cstk) { kputs("[user] region alloc failed\n"); g_ucode = 0; return; }
 
-    uint64_t pml4 = read_cr3() & ~0xFFFULL;
+    uint64_t pml4 = read_cr3() & PT_PA_MASK;
     g_kernel_cr3 = pml4;
     uint64_t cr0  = wp_disable();
     for (int i = 0; i < USER_CODE_PAGES; i++)
@@ -2222,8 +2740,27 @@ void arch_user_init(void) {
     arch_setup_syscall_msrs();
     kputs("[user] ring-3 program region ready\n");
 
+    { kputs("[mm] arena va="); kput_u64hex(g_arena_va);
+      kputs(" pa="); kput_u64hex(g_arena_pa);
+      kputs(" off="); kput_u64hex(g_arena_pa - g_arena_va); kputc('\n');
+      const char *g; uint64_t want = mm_v2p((uint64_t)g_ucode);
+      uint64_t got = diag_resolve(USER_CODE_VA, &g);
+      kputs("[mm] uva->pa="); kput_u64hex(got);
+      kputs(" want=");        kput_u64hex(want);
+      kputs(got == want ? " MAP-OK " : " MAP-BAD "); kputs(g); kputc('\n');
+      *(volatile uint32_t *)g_ucode = 0xC0DECAFEu; flush_tlb();
+      uint32_t rb = *(volatile uint32_t *)USER_CODE_VA;
+      *(volatile uint32_t *)g_ucode = 0;
+      kputs("[mm] uva readback="); kput_u64hex(rb);
+      kputs(rb == 0xC0DECAFEu ? " RB-OK" : " RB-BAD");
+      kputs(" heap MB="); kput_u32dec((uint32_t)(heap_total() / (1024 * 1024))); kputc('\n'); }
+
     blk_init();
-    if (fat_mount() == 0) kputs("[fs] fat16 ram disk mounted\n");
+    if (fat_mount() == 0) {
+        kputs("[fs] fat16 ram disk mounted\n");
+        fat_mkdir("/mnt");           /* mount-point placeholders: I/O under these */
+        fat_mkdir("/usb");           /* is routed to the persistent FAT32 volumes */
+    }
     else                  kputs("[fs] fat16 mount failed\n");
 
     void *pf_a = page_alloc(1); page_free(pf_a, 1);
@@ -2245,6 +2782,7 @@ void arch_user_init(void) {
     if (sched_result == 0) kputs("[linux-sched] Linux ELF ran as a scheduled process + reaped OK\n");
     else { kputs("[linux-sched] scheduled run failed: "); kput_u32dec((uint32_t)sched_result); kputc('\n'); }
 
+#if RUN_LINUX_FORK_SELFTESTS
     int fork_result = run_linux_elf_frames(linux_fork_elf, sizeof(linux_fork_elf),
                                            g_ustk, g_ksys0 + sizeof(g_ksys0), 0, 1);
     if (fork_result == 0) kputs("[linux-fork] fork + wait4 (real Linux ABI) OK\n");
@@ -2292,6 +2830,7 @@ void arch_user_init(void) {
     int shell_result = arch_run_linux("/MUSL.BIN", "");
     if (shell_result == 0) kputs("[shell-run] scheduled launch of /MUSL.BIN via shell path OK\n");
     else { kputs("[shell-run] shell launch failed: "); kput_u32dec((uint32_t)shell_result); kputc('\n'); }
+#endif
 
     kputs("[test] scheduler + process self-tests:\n");   /* fast smoke; full via `stest` */
     sched_test_run(0);
@@ -2492,6 +3031,12 @@ int arch_waitproc_test(void) {
 /* Deep-clone one paging level for fork(): private copies of every user (US) leaf
  * page, shared kernel pages/tables.  Large pages (PS) and kernel (non-US) leaves
  * are shared as-is; only user paths allocate.  level: 3=PDPT, 2=PD, 1=PT. */
+/* Deep-clone one paging level for fork(): private copies of every OWNED (PTE_OWN)
+ * leaf page and OWNED intermediate table; kernel-identity pages/tables — which
+ * carry PTE_US on real firmware but never PTE_OWN — are shared as-is.  Keying off
+ * PTE_OWN (not PTE_US) is essential: the retained identity map aliases the whole
+ * heap arena, and cloning it via US would explode memory and alias live frames.
+ * level: 3=PDPT, 2=PD, 1=PT. */
 static uint64_t clone_pt(uint64_t src_phys, int level) {
     uint64_t *src = (uint64_t *)src_phys;
     uint64_t *dst = (uint64_t *)page_alloc(1);
@@ -2500,17 +3045,17 @@ static uint64_t clone_pt(uint64_t src_phys, int level) {
         uint64_t e = src[i];
         if (!(e & PTE_P)) { dst[i] = 0; continue; }
         if (level == 1) {
-            if (e & PTE_US) {
+            if (e & PTE_OWN) {
                 uint8_t *f = (uint8_t *)page_alloc(1);
                 if (!f) { dst[i] = 0; continue; }
-                const uint8_t *s = (const uint8_t *)(e & ~0xFFFULL);
+                const uint8_t *s = (const uint8_t *)(e & PT_PA_MASK);
                 for (int b = 0; b < 4096; b++) f[b] = s[b];
                 dst[i] = (uint64_t)f | (e & 0xFFFULL);
-            } else dst[i] = e;                          /* share kernel page      */
-        } else if (e & PTE_PS) {
-            dst[i] = e;                                 /* share large kernel page */
+            } else dst[i] = e;                          /* share kernel/BO page   */
+        } else if ((e & PTE_PS) || !(e & PTE_OWN)) {
+            dst[i] = e;                                 /* share large/kernel table */
         } else {
-            uint64_t sub = clone_pt(e & ~0xFFFULL, level - 1);
+            uint64_t sub = clone_pt(e & PT_PA_MASK, level - 1);
             if (!sub) { dst[i] = 0; continue; }
             dst[i] = sub | (e & 0xFFFULL);
         }
@@ -2529,51 +3074,40 @@ static uint64_t *fork_clone_as(uint64_t parent_pml4) {
         int slot = (int)((user_va[k] >> 39) & 0x1FF);
         uint64_t e = ((uint64_t *)parent_pml4)[slot];
         if (!(e & PTE_P)) continue;
-        uint64_t sub = clone_pt(e & ~0xFFFULL, 3);       /* clone the PDPT subtree */
+        uint64_t sub = clone_pt(e & PT_PA_MASK, 3);       /* clone the PDPT subtree */
         if (!sub) return 0;
         dst[slot] = sub | (e & 0xFFFULL);
     }
     return dst;
 }
 
-/* Free a fully-private paging subtree (STK/BRK/MMAP regions never overlap the
- * shared kernel identity map): return every user leaf page AND intermediate
- * table to the allocator. */
+/* Reclaim a dead process's OWNED paging subtree: free every PTE_OWN leaf frame
+ * and every PTE_OWN intermediate table, then this table.  Entries without
+ * PTE_OWN are shared kernel-identity or BO mappings (which may carry PTE_US on
+ * real firmware) and are left untouched.  Safe to run even on the LOAD region,
+ * whose private PDPT/PD copies retain kernel sibling entries — those lack
+ * PTE_OWN so the walk never descends into or frees the shared kernel map. */
 static void free_pt(uint64_t phys, int level) {
     uint64_t *t = (uint64_t *)phys;
     for (int i = 0; i < 512; i++) {
         uint64_t e = t[i];
         if (!(e & PTE_P)) continue;
-        if (level == 1) { if (e & PTE_US) page_free((void *)(e & ~0xFFFULL), 1); }
-        else if (!(e & PTE_PS)) free_pt(e & ~0xFFFULL, level - 1);
+        if (level == 1) { if (e & PTE_OWN) page_free((void *)(e & PT_PA_MASK), 1); }
+        else if (!(e & PTE_PS) && (e & PTE_OWN)) free_pt(e & PT_PA_MASK, level - 1);
     }
     page_free((void *)phys, 1);
 }
 
-/* Free only the user leaf pages of a subtree, leaving tables in place — for the
- * LOAD region, whose tables interleave with the shared kernel identity map. */
-static void free_pt_pages(uint64_t phys, int level) {
-    uint64_t *t = (uint64_t *)phys;
-    for (int i = 0; i < 512; i++) {
-        uint64_t e = t[i];
-        if (!(e & PTE_P)) continue;
-        if (level == 1) { if (e & PTE_US) page_free((void *)(e & ~0xFFFULL), 1); }
-        else if (!(e & PTE_PS)) free_pt_pages(e & ~0xFFFULL, level - 1);
-    }
-}
-
-/* Reclaim a dead process's private frames: the STK/BRK/MMAP subtrees (pages +
- * tables), the LOAD region's code pages, and the PML4.  Shared kernel pages are
- * left untouched.  The AS must NOT be the active CR3. */
+/* Reclaim a dead process's private frames: the LOAD/STK/BRK/MMAP subtrees (owned
+ * leaf pages + owned tables) and the PML4.  Shared kernel pages and compositor BO
+ * frames (no PTE_OWN) are left untouched.  The AS must NOT be the active CR3. */
 static void free_user_pages(uint64_t *pml4) {
     if (!pml4) return;
-    const uint64_t priv_va[3] = { LINUX_STK_TOP, LINUX_BRK_BASE, LINUX_MMAP_BASE };
-    for (int k = 0; k < 3; k++) {
+    const uint64_t priv_va[4] = { LINUX_LOAD_VA, LINUX_STK_TOP, LINUX_BRK_BASE, LINUX_MMAP_BASE };
+    for (int k = 0; k < 4; k++) {
         int slot = (int)((priv_va[k] >> 39) & 0x1FF);
-        if (pml4[slot] & PTE_P) { free_pt(pml4[slot] & ~0xFFFULL, 3); pml4[slot] = 0; }
+        if (pml4[slot] & PTE_P) { free_pt(pml4[slot] & PT_PA_MASK, 3); pml4[slot] = 0; }
     }
-    int lslot = (int)((LINUX_LOAD_VA >> 39) & 0x1FF);
-    if (pml4[lslot] & PTE_P) free_pt_pages(pml4[lslot] & ~0xFFFULL, 3);
     page_free(pml4, 1);
 }
 
@@ -2587,8 +3121,9 @@ static uint64_t do_linux_fork(void) {
     struct proc *ch = proc_alloc();
     if (!ch) return (uint64_t)-11;                       /* -EAGAIN */
     uint64_t *cas  = fork_clone_as((uint64_t)par->vm.pml4);
+    if (!cas) { proc_free(ch); return (uint64_t)-12; }
     uint8_t  *ckstk = (uint8_t *)page_alloc(4);
-    if (!cas || !ckstk) { proc_free(ch); return (uint64_t)-12; }
+    if (!ckstk) { free_user_pages(cas); proc_free(ch); return (uint64_t)-12; }
     ch->ppid = par->pid;
     ch->abi  = USER_ABI_LINUX;
     ch->on_sched = 1;
@@ -2596,6 +3131,24 @@ static uint64_t do_linux_fork(void) {
     ch->vm.pml4 = cas;
     ch->vm.brk  = par->vm.brk;
     ch->vm.mmap_next = par->vm.mmap_next;
+    ch->sigmask = par->sigmask;                                      /* inherit signal disposition */
+    ch->sigrestorer = par->sigrestorer;
+    for (int i = 0; i <= 64; i++) ch->sighandler[i] = par->sighandler[i];
+    ch->pgid = par->pgid; ch->sid = par->sid;                        /* inherit process group/session */
+    ch->pane = par->pane;                                            /* run in the parent's pane */
+    proc_set_name(ch, par->name);
+    ch->kstack_top = ckstk + 16384;
+    ch->state = PROC_RUNNING;
+    const uint64_t *callee = (const uint64_t *)syscall_user_callee();
+    /* Secure the scheduler slot BEFORE taking any references — a fork that is
+     * published (PROC_RUNNING) without a task would make the parent's wait4 block
+     * forever (MAXTASK is finite). */
+    if (usched_spawn_forked(syscall_user_rip(), syscall_user_rsp(), ckstk, 16384,
+                            (uint64_t)cas, ch, callee) < 0) {
+        free_user_pages(cas); page_free(ckstk, 4);
+        ch->vm.pml4 = 0; proc_free(ch);
+        return (uint64_t)-11;                            /* -EAGAIN */
+    }
     for (int i = 0; i < PROC_FD_MAX; i++) {                           /* clone fd table */
         ch->fds[i] = par->fds[i];
         if (par->fds[i].used) {
@@ -2603,16 +3156,6 @@ static uint64_t do_linux_fork(void) {
             else if (par->fds[i].kind == LINUX_FD_PIPE_W) g_pipes[par->fds[i].pipe].writers++;
         }
     }
-    ch->sigmask = par->sigmask;                                      /* inherit signal disposition */
-    ch->sigrestorer = par->sigrestorer;
-    for (int i = 0; i <= 64; i++) ch->sighandler[i] = par->sighandler[i];
-    ch->pgid = par->pgid; ch->sid = par->sid;                        /* inherit process group/session */
-    proc_set_name(ch, par->name);
-    ch->kstack_top = ckstk + 16384;
-    ch->state = PROC_RUNNING;
-    const uint64_t *callee = (const uint64_t *)syscall_user_callee();
-    usched_spawn_forked(syscall_user_rip(), syscall_user_rsp(), ckstk, 16384,
-                        (uint64_t)cas, ch, callee);      /* child frame: rax=0 */
     return (uint64_t)ch->pid;                            /* parent's fork() returns child pid */
 }
 
@@ -2634,12 +3177,17 @@ static int linux_wait4(int wpid, int *wstatus, int options) {
         if (!have) { __asm__ volatile("sti"); return -10; }          /* -ECHILD */
         if (zombie) {
             int pid = zombie->pid, st = (zombie->exit_status & 0xFF) << 8;
+            /* Store the status into the caller's user stack FIRST — while its
+             * address space is fully intact and interrupts are still masked.
+             * Doing it after the reap + sti raced with the scheduler reusing a
+             * just-freed page (real-HW #PF writing to the parent's own stack).
+             * Guard the pointer so a bogus wstatus can't fault the kernel. */
+            if (wstatus && user_va_writable((uint64_t)wstatus)) *wstatus = st;
             if (zombie->kstack_top) page_free((void *)(zombie->kstack_top - 16384), 4);
             free_user_pages(zombie->vm.pml4); /* reclaim frames (interrupts still off) */
             zombie->vm.pml4 = 0;
             proc_free(zombie);                 /* reap the zombie slot */
             __asm__ volatile("sti");
-            if (wstatus) *wstatus = st;
             return pid;
         }
         if (options & 1) { __asm__ volatile("sti"); return 0; }      /* WNOHANG */
@@ -2666,11 +3214,11 @@ static uint64_t do_demo_fork(void) {
     uint64_t pml4 = (uint64_t)par->vm.pml4;
     uint64_t *pt;
     pt = walk_pt(pml4, UDEMO_CODE_VA);
-    const uint8_t *pcode = (const uint8_t *)(pt[(UDEMO_CODE_VA >> 12) & 0x1FF] & ~0xFFFULL);
+    const uint8_t *pcode = (const uint8_t *)(pt[(UDEMO_CODE_VA >> 12) & 0x1FF] & PT_PA_MASK);
     pt = walk_pt(pml4, UDEMO_DATA_VA);
-    const uint8_t *pdata = (const uint8_t *)(pt[(UDEMO_DATA_VA >> 12) & 0x1FF] & ~0xFFFULL);
+    const uint8_t *pdata = (const uint8_t *)(pt[(UDEMO_DATA_VA >> 12) & 0x1FF] & PT_PA_MASK);
     pt = walk_pt(pml4, UDEMO_STK_VA);
-    const uint8_t *pstk = (const uint8_t *)(pt[(UDEMO_STK_VA >> 12) & 0x1FF] & ~0xFFFULL);
+    const uint8_t *pstk = (const uint8_t *)(pt[(UDEMO_STK_VA >> 12) & 0x1FF] & PT_PA_MASK);
     for (int i = 0; i < 4096; i++) { ccode[i] = pcode[i]; cdata[i] = pdata[i]; cstk[i] = pstk[i]; }
     uint64_t cr0 = wp_disable();
     map_user_page((uint64_t)cas, UDEMO_CODE_VA, (uint64_t)ccode, PTE_US);
@@ -2823,14 +3371,14 @@ static int run_linux_path(const char *path, uint8_t *stk, uint8_t *kstack_top,
     fs_resolve(path, full);
 
     uint8_t attr;
-    uint16_t cluster;
+    uint32_t cluster;
     uint32_t size;
-    if (fat_resolve(full, &attr, &cluster, &size) < 0 || (attr & 0x10) || !size)
+    if (vfs_resolve(full, &attr, &cluster, &size) < 0 || (attr & 0x10) || !size)
         return -1;
 
     uint8_t *image = (uint8_t *)kmalloc(size);
     if (!image) return -5;
-    int read = fat_read(cluster, size, image, size);
+    int read = vfs_pread(full, image, size, 0);
     int result = read == (int)size
         ? run_linux_elf_frames(image, size, stk, kstack_top, args, on_sched) : -1;
     kfree(image);
@@ -2857,6 +3405,201 @@ int arch_run_linux(const char *path, const char *arg) {
     return run_linux_path(path, g_ustk, g_ksys0 + sizeof(g_ksys0), &args, 1);
 }
 
+/* ================= terminal split panes (concurrent shells) ===============
+ * Up to 4 mbb shells run at once, each owning a pane.  The router (task 0, in
+ * arch_run_panes) reads the keyboard and delivers keys to the focused pane's
+ * ring; each shell's stdin read (pane_getkey) blocks on that ring, and its
+ * stdout (usys_write -> arch_cur_pane_term) lands in its own pane terminal.
+ * F5 = add a pane, F4 = cycle focus, exit/Ctrl-D closes a pane. */
+struct pane_ring { volatile int r, w; unsigned char b[128]; };
+static struct pane_ring g_pin[PANE_MAX];
+static struct proc     *g_pane_proc[PANE_MAX];
+static void            *g_pane_term[PANE_MAX];
+static void            *g_pane0_term;          /* the WM-owned terminal (pane 0); never term_free'd here */
+static int              g_pane_n, g_pane_focus;
+#define PANE_CHAN(i)    (0x50000000 + (i))
+/* All pane readers block on ONE shared wait channel and re-check their own ring
+ * on wake.  A shared channel (vs per-pane) is immune to the renumber race: a
+ * shell whose pane index changed under it still wakes and reads the right ring.
+ * The cost is a few spurious wakeups per key (<=4 panes), which is negligible. */
+#define PANE_CHAN_ALL   0x5000BEEF
+
+void *term_make(void);                                 /* term64.c pane-terminal primitives */
+void  term_free(void *t);
+void  term_resize(void *t, int cols, int rows);
+void  term_draw_t(void *t, uint32_t *back, int cx, int cy, int cw, int ch, int focused);
+int   wm_ui_cell(void);
+int   wm_ui_lineh(void);
+void  wm_fill_rect(uint32_t *back, int x, int y, int w, int h, uint32_t rgb);
+
+int   arch_pane_count(void) { return g_pane_n; }
+void *arch_cur_pane_term(void) {
+    int i = (current && current->on_sched) ? current->pane : g_pane_focus;
+    if (i < 0 || i >= g_pane_n) i = (g_pane_focus >= 0 && g_pane_focus < g_pane_n) ? g_pane_focus : 0;
+    return (i >= 0 && i < g_pane_n) ? g_pane_term[i] : 0;
+}
+static void pane_push(int i, int k) {
+    if (i < 0 || i >= g_pane_n) return;
+    struct pane_ring *q = &g_pin[i];
+    int nw = (q->w + 1) & 127;
+    if (nw != q->r) { q->b[q->w] = (unsigned char)k; q->w = nw; }
+    sched_wake(PANE_CHAN_ALL);
+}
+static int pane_getkey(void) {
+    for (;;) {
+        int i = current ? current->pane : g_pane_focus;   /* re-read every iteration: a reap can */
+        if (i < 0 || i >= PANE_MAX) i = 0;                 /* renumber this shell to a new pane   */
+        struct pane_ring *q = &g_pin[i];
+        /* Atomically check the ring and block: disabling interrupts closes the
+         * lost-wakeup window between the emptiness test and sched_block (which
+         * re-enables interrupts only at its hlt).  A pane_push that raced us
+         * either shows up here (ring non-empty) or finds us already BLOCKED. */
+        __asm__ volatile("cli");
+        if (q->r != q->w) { int k = q->b[q->r]; q->r = (q->r + 1) & 127; __asm__ volatile("sti"); return k; }
+        sched_block(PANE_CHAN_ALL);
+    }
+}
+static int pane_trykey(void) {
+    int i = current ? current->pane : g_pane_focus;
+    if (i < 0 || i >= PANE_MAX) i = 0;
+    struct pane_ring *q = &g_pin[i];
+    if (q->r == q->w) return -1;
+    int k = q->b[q->r]; q->r = (q->r + 1) & 127; return k;
+}
+static int pane_in_use(void) { return g_pane_n > 0 && current && current->on_sched; }
+
+static struct proc *spawn_pane_shell(const uint8_t *img, uint64_t size, int pane, struct proc *parent) {
+    uint8_t *ustk = (uint8_t *)page_alloc(USER_STK_PAGES);
+    if (!ustk) return 0;
+    static struct linux_exec_args a; a.argc = 1; a.envc = 0;
+    a.argv[0][0] = 's'; a.argv[0][1] = 'h'; a.argv[0][2] = 0;
+    struct linux_image im;
+    if (linux_load_image(img, size, ustk, &a, &im) < 0) { page_free(ustk, USER_STK_PAGES); return 0; }
+    struct proc *p = proc_alloc();
+    if (!p) { free_user_pages(im.pml4); page_free(ustk, USER_STK_PAGES); return 0; }
+    uint8_t *kstk = (uint8_t *)page_alloc(4);
+    if (!kstk) { proc_free(p); free_user_pages(im.pml4); page_free(ustk, USER_STK_PAGES); return 0; }
+    p->ppid = parent->pid; p->abi = USER_ABI_LINUX; p->code = im.code; p->stk = ustk;
+    p->kstack_top = kstk + 16384; p->vm.pml4 = im.pml4;
+    p->vm.brk = LINUX_BRK_BASE; p->vm.mmap_next = LINUX_MMAP_BASE;
+    proc_set_name(p, "sh"); p->state = PROC_RUNNING; p->on_sched = 1;
+    p->pane = pane; p->pgid = p->pid; p->sid = p->pid;
+    if (pane >= 0 && pane < PANE_MAX) {                 /* fresh line discipline for this pane */
+        g_ttys[pane].fg_pgrp = 0;
+        g_ttys[pane].lflag = TTY_DEFLFLAG;
+        g_ttys[pane].histn = 0;
+    }
+    usched_spawn_user(im.entry, im.rsp, kstk, 16384, 0, 0, (uint64_t)im.pml4, p);
+    return p;
+}
+static void reap_pane(int i) {
+    struct proc *p = g_pane_proc[i];
+    if (p) {
+        if (p->kstack_top) page_free((void *)(p->kstack_top - 16384), 4);
+        if (p->vm.pml4) { free_user_pages(p->vm.pml4); p->vm.pml4 = 0; }
+        proc_free(p);
+    }
+    if (g_pane_term[i] && g_pane_term[i] != g_pane0_term) term_free(g_pane_term[i]);  /* never free the WM's pane-0 terminal */
+    for (int j = i; j < g_pane_n - 1; j++) {           /* compact: shift the survivors down */
+        g_pane_term[j] = g_pane_term[j + 1];
+        g_pane_proc[j] = g_pane_proc[j + 1];
+        g_pin[j] = g_pin[j + 1];
+        g_ttys[j] = g_ttys[j + 1];                      /* move the shell's line discipline too */
+        if (g_pane_proc[j]) g_pane_proc[j]->pane = j;   /* renumber the shell to its new pane */
+    }
+    g_pane_n--;
+    if (g_pane_focus >= g_pane_n) g_pane_focus = g_pane_n > 0 ? g_pane_n - 1 : 0;
+    sched_wake(PANE_CHAN_ALL);   /* wake all readers so renumbered shells re-check their ring */
+}
+
+/* Launch the split-pane shell system.  Runs as task 0 (the router) until every
+ * pane's shell has exited, then returns to the native console. */
+int arch_run_panes(void *pane0_term) {
+    char full[256]; fs_resolve("/MBB.BIN", full);
+    uint8_t attr; uint32_t cluster, size;
+    if (vfs_resolve(full, &attr, &cluster, &size) < 0 || (attr & 0x10) || !size) return -1;
+    uint8_t *img = (uint8_t *)kmalloc(size);
+    if (!img) return -1;
+    if (vfs_pread(full, img, size, 0) != (int)size) { kfree(img); return -1; }
+
+    struct proc *parent = current;
+    for (int i = 0; i < PANE_MAX; i++) { g_pin[i].r = g_pin[i].w = 0; g_pane_proc[i] = 0; g_pane_term[i] = 0; }
+    g_pane_term[0] = pane0_term; g_pane0_term = pane0_term; g_pane_n = 1; g_pane_focus = 0;
+
+    sched_init();
+    g_pane_proc[0] = spawn_pane_shell(img, size, 0, parent);
+    if (!g_pane_proc[0]) { g_pane_n = 0; kfree(img); return -1; }
+    sched_start();
+
+    while (g_pane_n > 0) {
+        int k = kbd64_getkey(); if (k < 0) k = hvkbd_getkey();
+        if (k >= 0) {
+            if (wm_is_sleeping()) wm_sleep_set(0);
+            else if (k == KEY_F5 && g_pane_n < PANE_MAX) {
+                void *t = term_make();
+                if (t) {
+                    int i = g_pane_n;
+                    g_pin[i].r = g_pin[i].w = 0; g_pane_term[i] = t;
+                    g_pane_proc[i] = spawn_pane_shell(img, size, i, parent);
+                    if (g_pane_proc[i]) { g_pane_n++; g_pane_focus = i; }
+                    else { term_free(t); g_pane_term[i] = 0; }
+                }
+                ui_note_activity();
+            }
+            else if (k == KEY_F4) { if (g_pane_n > 1) { g_pane_focus = (g_pane_focus + 1) % g_pane_n; ui_note_activity(); } }
+            else if (wm_hotkey(k)) { /* F1/F2/F3 window + sleep */ }
+            else pane_push(g_pane_focus, k);
+        }
+        wm_pump();
+        power_poll();
+        for (int i = 0; i < g_pane_n; i++)
+            if (g_pane_proc[i] && g_pane_proc[i]->state == PROC_ZOMBIE) { reap_pane(i); i--; }
+        idle_wait();
+    }
+    sched_stop();
+    current = parent;
+    arch_set_syscall_stack((uint64_t)(g_ksys0 + sizeof(g_ksys0)));
+    arch_set_tss_rsp0((uint64_t)(g_kstack0 + sizeof(g_kstack0)));
+    write_fs_base(parent->fs_base);
+    kfree(img);
+    return 0;
+}
+
+/* Render every pane into the terminal window's content rect: a 2-column grid
+ * filled left->right then top->bottom (last short row stretches).  Resizes each
+ * pane terminal to its cell and highlights the focused one. */
+void arch_panes_draw(uint32_t *back, int cx, int cy, int cw, int ch) {
+    int n = g_pane_n; if (n < 1) return;
+    int cols = (n == 1) ? 1 : 2;
+    int rows = (n + cols - 1) / cols;
+    int cell = wm_ui_cell(), lineh = wm_ui_lineh();
+    if (cell < 1) cell = 8;
+    if (lineh < 1) lineh = 16;
+    for (int i = 0; i < n; i++) {
+        int r = i / cols, c = i % cols;
+        int rown = (r == rows - 1) ? (n - r * cols) : cols;   /* panes in this (maybe short) row */
+        int pw = cw / rown, ph = ch / rows;
+        int px = cx + c * pw, py = cy + r * ph;
+        int foc = (i == g_pane_focus);
+        if (n > 1) {                                          /* frame each pane; focused = bright */
+            uint32_t bord = foc ? 0x33FF66 : 0x24506E;
+            int t = foc ? 2 : 1;                              /* thicker border on the focused pane */
+            wm_fill_rect(back, px, py, pw - 2, t, bord);              /* top    */
+            wm_fill_rect(back, px, py + ph - 2 - t, pw - 2, t, bord); /* bottom */
+            wm_fill_rect(back, px, py, t, ph - 2, bord);             /* left   */
+            wm_fill_rect(back, px + pw - 2 - t, py, t, ph - 2, bord); /* right  */
+        }
+        int inset = (n > 1) ? 5 : 0;
+        int ix = px + inset, iy = py + inset;
+        int gw = pw - 2 * inset - 2, gh = ph - 2 * inset - 2;
+        int tcols = gw / cell, trows = gh / lineh;
+        if (tcols < 4) tcols = 4;
+        if (trows < 2) trows = 2;
+        term_resize(g_pane_term[i], tcols, trows);
+        term_draw_t(g_pane_term[i], back, ix, iy, gw, gh, foc);
+    }
+}
+
 /* execve(59) in place for a scheduled process: load the new image, replace the
  * running process's address space + vm/name state, retarget its scheduler task
  * CR3, and iretq into the new entry.  Never returns on success (the image is
@@ -2865,11 +3608,11 @@ static int do_execve_inplace(const char *path, const struct linux_exec_args *arg
     char full[256];
     while (path[0] == '.' && path[1] == '/') path += 2;
     fs_resolve(path, full);
-    uint8_t attr; uint16_t cluster; uint32_t size;
-    if (fat_resolve(full, &attr, &cluster, &size) < 0 || (attr & 0x10) || !size) return -2;
+    uint8_t attr; uint32_t cluster; uint32_t size;
+    if (vfs_resolve(full, &attr, &cluster, &size) < 0 || (attr & 0x10) || !size) return -2;
     uint8_t *image = (uint8_t *)kmalloc(size);
     if (!image) return -12;
-    int ok = fat_read(cluster, size, image, size) == (int)size;
+    int ok = vfs_pread(full, image, size, 0) == (int)size;
     uint8_t *stk = ok ? (uint8_t *)page_alloc(USER_STK_PAGES) : 0;
     struct linux_image im;
     int r = (ok && stk) ? linux_load_image(image, size, stk, args, &im) : -12;

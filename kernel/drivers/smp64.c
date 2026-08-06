@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /* tinyos x64 SMP bring-up (R8).
  *
  * Enumerates CPUs from the ACPI MADT, then starts every application processor
@@ -66,6 +68,7 @@ uint64_t smp_lapic_base(void) { return g_lapic; }
 
 /* ---- AP C entry (reached from the trampoline in long mode) ---- */
 void ap_entry(void) {
+    arch_load_cpu_tables();          /* valid GDT+IDT so a stray NMI/exception won't triple-fault */
     uint32_t id = lapic_id();
     spin_lock(&g_console_lock);
     g_online++;
