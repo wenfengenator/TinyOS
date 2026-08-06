@@ -8,3 +8,4 @@ __pycache__/
 .pylibs/
 fs.img
 tinyfs.img
+*.pub
