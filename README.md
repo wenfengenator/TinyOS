@@ -144,6 +144,7 @@ application (`BOOTX64.EFI`). It boots on `qemu-system-x86_64` + OVMF and on
 
 ```bash
 make setup-tcc                # one-time: build musl + TinyCC from vendored source (third_party/)
+make setup-micropython        # build pinned MicroPython v1.26.1 as a static musl binary
 make ARCH=x64                 # build/BOOTX64.EFI (one PE32+ image)
 make run-x64-headless         # QEMU + OVMF, serial only (CI/sandbox)
 make tinyos.vhdx              # Hyper-V Gen 2 disk (attach; Secure Boot OFF)
@@ -156,6 +157,19 @@ TinyCC entirely from source vendored under [`third_party/`](third_party/) — no
 network access or distro packages, just a standard host toolchain (`gcc`,
 `make`, binutils, Python). It stages the result under `/tmp`, so re-run it if
 `/tmp` is cleared (e.g. after a reboot).
+
+`make setup-micropython` fetches the official pinned MicroPython v1.26.1
+source, builds `mpy-cross`, and produces a static minimal Unix-port interpreter
+at `/tmp/tinyos-micropython/micropython`. Subsequent filesystem and USB builds
+package it as `/PYTHON.BIN`, along with `/hello.py`. On TinyOS:
+
+```sh
+python /hello.py
+python -c print(6*7)
+```
+
+Script files are preferred for multi-word expressions because the current
+TinyOS shell does not yet group quoted arguments.
 
 ### Boot on a real PC (USB)
 
@@ -170,7 +184,7 @@ sudo dd if=tinyos-usb.img of=/dev/sdX bs=4M conv=fsync status=progress   # ERASE
 A physical PC has no virtio-blk/StorVSC, so TinyOS runs **live from a RAM disk**
 embedded in the loader (the mbb shell + coreutils, local `git`, standalone
 syntax-highlighting `vim`, Tetris/2048/Pac-Man/Sudoku/Snake/15-Puzzle/Reversi,
-the TinyGL demos, and an Intel HDA `audio` test). See
+MicroPython, the TinyGL demos, and an Intel HDA `audio` test). See
 [`docs/AUDIO.md`](docs/AUDIO.md) for the game sound API. On machines with a
 **SATA (AHCI)** controller — e.g. the
 ThinkPad T440s — the internal disk is mounted read/write at **`/mnt`** and
