@@ -310,7 +310,7 @@ $(BUILD)/musl-gcc.specs: $(MUSL_LIBDIR)/musl-gcc.specs | $(BUILD)
 	    -e 's|-dynamic-linker /lib/x86_64-linux-musl|-dynamic-linker $(MUSL_ROOT)/lib/x86_64-linux-musl|g' $< > $@
 $(BUILD)/musl_probe.elf: programs/musl_probe.c $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
-$(BUILD)/mbb.elf: programs/mbb.c programs/tcc_include/tinygl.h programs/tcc_include/tnet.h $(BUILD)/musl-gcc.specs
+$(BUILD)/mbb.elf: programs/mbb.c programs/tcc_include/tinygl.h programs/tcc_include/tnet.h programs/tcc_include/tglob.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/tgl_demo.elf: programs/tgl_demo.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
@@ -322,6 +322,8 @@ $(BUILD)/2048.elf: programs/2048.c programs/tcc_include/tinygl.h $(BUILD)/musl-g
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/pacman.elf: programs/pacman.c programs/tcc_include/tinygl.h programs/tcc_include/taudio.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/doom.elf: programs/doom.c programs/tcc_include/tinygl.h programs/tcc_include/taudio.h $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/sudoku.elf: programs/sudoku.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/snake.elf: programs/snake.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc.specs
@@ -330,8 +332,14 @@ $(BUILD)/p15.elf: programs/p15.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/reversi.elf: programs/reversi.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/solitaire.elf: programs/solitaire.c programs/tcc_include/tinygl.h $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/reader.elf: programs/reader.c programs/tcc_include/tinygl.h programs/tcc_include/tinflate.h $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/vim.elf: programs/vim.c $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -static -no-pie -fno-pie -Os $< -o $@
+$(BUILD)/bash.elf: programs/bash.c programs/tcc_include/tglob.h $(BUILD)/musl-gcc.specs
+	$(CC) -specs=$(BUILD)/musl-gcc.specs -idirafter programs/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/audio.elf: programs/audio_demo.c programs/tcc_include/taudio.h $(BUILD)/musl-gcc.specs
 	$(CC) -specs=$(BUILD)/musl-gcc.specs -Iprograms/tcc_include -static -no-pie -fno-pie -Os $< -o $@
 $(BUILD)/wget.elf: programs/wget.c programs/tcc_include/tnet.h $(BUILD)/musl-gcc.specs
@@ -358,8 +366,8 @@ $(BUILD)/arch64.o: $(X64PROG_HDRS) $(LINUX_TEST_HDR) $(LINUX_FORK_HDR) $(LINUX_F
 # the same TCC, musl libraries, headers, sources, applications, and audio demo as
 # persistent VM disks. It is copied into writable RAM by kernel/fat64.c.
 FATFS_KB ?= 12288
-$(BUILD)/fatfs.img: tools/mkfatfs.py $(BUILD)/fsroot.stamp $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf $(BUILD)/https.elf $(BUILD)/tetris.elf $(BUILD)/2048.elf $(BUILD)/pacman.elf $(BUILD)/sudoku.elf $(BUILD)/snake.elf $(BUILD)/p15.elf $(BUILD)/reversi.elf $(BUILD)/vim.elf $(BUILD)/audio.elf $(BUILD)/git.elf $(TCC_BIN) $(MICROPY_BIN) | $(BUILD)
-	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(FATFS_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PYTHON.BIN=$(MICROPY_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c PRINTF.RSP=programs/tcc_printf.rsp MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf HTTPS.BIN=$(BUILD)/https.elf TETRIS.BIN=$(BUILD)/tetris.elf 2048.BIN=$(BUILD)/2048.elf PACMAN.BIN=$(BUILD)/pacman.elf SUDOKU.BIN=$(BUILD)/sudoku.elf SNAKE.BIN=$(BUILD)/snake.elf P15.BIN=$(BUILD)/p15.elf REVERSI.BIN=$(BUILD)/reversi.elf VIM.BIN=$(BUILD)/vim.elf AUDIO.BIN=$(BUILD)/audio.elf GIT.BIN=$(BUILD)/git.elf
+$(BUILD)/fatfs.img: tools/mkfatfs.py $(BUILD)/fsroot.stamp $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf $(BUILD)/https.elf $(BUILD)/tetris.elf $(BUILD)/2048.elf $(BUILD)/pacman.elf $(BUILD)/doom.elf $(BUILD)/sudoku.elf $(BUILD)/snake.elf $(BUILD)/p15.elf $(BUILD)/reversi.elf $(BUILD)/solitaire.elf $(BUILD)/reader.elf $(BUILD)/vim.elf $(BUILD)/bash.elf $(BUILD)/audio.elf $(BUILD)/git.elf $(TCC_BIN) $(MICROPY_BIN) | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(FATFS_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PYTHON.BIN=$(MICROPY_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c PRINTF.RSP=programs/tcc_printf.rsp MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf HTTPS.BIN=$(BUILD)/https.elf TETRIS.BIN=$(BUILD)/tetris.elf 2048.BIN=$(BUILD)/2048.elf PACMAN.BIN=$(BUILD)/pacman.elf DOOM.BIN=$(BUILD)/doom.elf SUDOKU.BIN=$(BUILD)/sudoku.elf SNAKE.BIN=$(BUILD)/snake.elf P15.BIN=$(BUILD)/p15.elf REVERSI.BIN=$(BUILD)/reversi.elf SOLITAIRE.BIN=$(BUILD)/solitaire.elf READER.BIN=$(BUILD)/reader.elf VIM.BIN=$(BUILD)/vim.elf BASH.BIN=$(BUILD)/bash.elf AUDIO.BIN=$(BUILD)/audio.elf GIT.BIN=$(BUILD)/git.elf
 $(BUILD)/fatfs.h: $(BUILD)/fatfs.img | $(BUILD)
 	$(PYTHON) -c "d=open('$(BUILD)/fatfs.img','rb').read(); open('$(BUILD)/fatfs.h','w').write('static const unsigned char fatfs_img[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
 $(BUILD)/fat64.o: $(BUILD)/fatfs.h
@@ -379,7 +387,7 @@ esp: $(BUILD)/BOOTX64.EFI
 # Persistent-disk staging root: disk/ plus /lib (crt, libc.a, libtcc1.a), the full
 # musl /include header tree, and a K&R sample so on-device `./tcc.bin a.c -o a.bin`
 # resolves the standard library through TCC's built-in search paths.
-$(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h programs/tcc_kr_demo.c programs/micropython_hello.py programs/micropython_tgl.py programs/micropython_audio.py programs/reversi.py programs/tcc_include/tinygl.h programs/tcc_include/taudio.h programs/audio_demo.c programs/tgl_demo.c programs/tgl3d_demo.c programs/tetris.c programs/2048.c programs/pacman.c programs/sudoku.c programs/snake.c programs/p15.c programs/reversi.c programs/vim.c programs/tcc_include/tnet.h programs/tcc_include/tcrypto.h programs/tcc_include/ttls.h programs/tcc_include/tinflate.h programs/tcc_include/tdeflate.h programs/tcc_include/tgit.h programs/tcc_include/tssh.h programs/wget.c programs/httpd.c programs/https.c programs/git.c $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
+$(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h programs/tcc_kr_demo.c programs/micropython_hello.py programs/micropython_tgl.py programs/micropython_audio.py programs/reversi.py programs/tcc_include/tinygl.h programs/tcc_include/taudio.h programs/audio_demo.c programs/tgl_demo.c programs/tgl3d_demo.c programs/tetris.c programs/2048.c programs/pacman.c programs/doom.c programs/sudoku.c programs/snake.c programs/p15.c programs/reversi.c programs/solitaire.c programs/reader.c programs/vim.c programs/bash.c programs/tcc_include/tnet.h programs/tcc_include/tglob.h programs/tcc_include/tcrypto.h programs/tcc_include/ttls.h programs/tcc_include/tinflate.h programs/tcc_include/tdeflate.h programs/tcc_include/tgit.h programs/tcc_include/tssh.h programs/wget.c programs/httpd.c programs/https.c programs/git.c $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
 	rm -rf $(BUILD)/fsroot
 	mkdir -p $(BUILD)/fsroot/lib $(BUILD)/fsroot/include
 	cp -r disk/. $(BUILD)/fsroot/
@@ -388,6 +396,7 @@ $(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h p
 	cp programs/tcc_include/tinygl.h $(BUILD)/fsroot/include/tinygl.h
 	cp programs/tcc_include/taudio.h $(BUILD)/fsroot/include/taudio.h
 	cp programs/tcc_include/tnet.h $(BUILD)/fsroot/include/tnet.h
+	cp programs/tcc_include/tglob.h $(BUILD)/fsroot/include/tglob.h
 	cp programs/tcc_include/tcrypto.h $(BUILD)/fsroot/include/tcrypto.h
 	cp programs/tcc_include/ttls.h $(BUILD)/fsroot/include/ttls.h
 	cp programs/tcc_include/tinflate.h $(BUILD)/fsroot/include/tinflate.h
@@ -400,11 +409,15 @@ $(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h p
 	cp programs/tetris.c $(BUILD)/fsroot/tetris.c
 	cp programs/2048.c $(BUILD)/fsroot/2048.c
 	cp programs/pacman.c $(BUILD)/fsroot/pacman.c
+	cp programs/doom.c $(BUILD)/fsroot/doom.c
 	cp programs/sudoku.c $(BUILD)/fsroot/sudoku.c
 	cp programs/snake.c $(BUILD)/fsroot/snake.c
 	cp programs/p15.c $(BUILD)/fsroot/p15.c
 	cp programs/reversi.c $(BUILD)/fsroot/reversi.c
+	cp programs/solitaire.c $(BUILD)/fsroot/solitaire.c
+	cp programs/reader.c $(BUILD)/fsroot/reader.c
 	cp programs/vim.c $(BUILD)/fsroot/vim.c
+	cp programs/bash.c $(BUILD)/fsroot/bash.c
 	cp programs/audio_demo.c $(BUILD)/fsroot/audio.c
 	cp programs/micropython_hello.py $(BUILD)/fsroot/hello.py
 	cp programs/micropython_tgl.py $(BUILD)/fsroot/tgl.py
@@ -418,8 +431,8 @@ $(BUILD)/fsroot.stamp: $(wildcard disk/* disk/*/*) $(TCC_SELF)/include/stdio.h p
 
 # persistent filesystem disk: seeded ONCE from the staging root, kept outside
 # build/ so `make clean` won't wipe it.  `rm tinyfs.img` to re-seed.
-tinyfs.img: $(BUILD)/fsroot.stamp | $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf $(BUILD)/https.elf $(BUILD)/tetris.elf $(BUILD)/2048.elf $(BUILD)/pacman.elf $(BUILD)/sudoku.elf $(BUILD)/snake.elf $(BUILD)/p15.elf $(BUILD)/reversi.elf $(BUILD)/vim.elf $(BUILD)/audio.elf $(BUILD)/git.elf $(TCC_BIN) $(MICROPY_BIN)
-	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(PERSIST_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PYTHON.BIN=$(MICROPY_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf HTTPS.BIN=$(BUILD)/https.elf TETRIS.BIN=$(BUILD)/tetris.elf 2048.BIN=$(BUILD)/2048.elf PACMAN.BIN=$(BUILD)/pacman.elf SUDOKU.BIN=$(BUILD)/sudoku.elf SNAKE.BIN=$(BUILD)/snake.elf P15.BIN=$(BUILD)/p15.elf REVERSI.BIN=$(BUILD)/reversi.elf VIM.BIN=$(BUILD)/vim.elf AUDIO.BIN=$(BUILD)/audio.elf GIT.BIN=$(BUILD)/git.elf
+tinyfs.img: $(BUILD)/fsroot.stamp | $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf $(BUILD)/https.elf $(BUILD)/tetris.elf $(BUILD)/2048.elf $(BUILD)/pacman.elf $(BUILD)/doom.elf $(BUILD)/sudoku.elf $(BUILD)/snake.elf $(BUILD)/p15.elf $(BUILD)/reversi.elf $(BUILD)/solitaire.elf $(BUILD)/reader.elf $(BUILD)/vim.elf $(BUILD)/bash.elf $(BUILD)/audio.elf $(BUILD)/git.elf $(TCC_BIN) $(MICROPY_BIN)
+	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(PERSIST_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PYTHON.BIN=$(MICROPY_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf HTTPS.BIN=$(BUILD)/https.elf TETRIS.BIN=$(BUILD)/tetris.elf 2048.BIN=$(BUILD)/2048.elf PACMAN.BIN=$(BUILD)/pacman.elf DOOM.BIN=$(BUILD)/doom.elf SUDOKU.BIN=$(BUILD)/sudoku.elf SNAKE.BIN=$(BUILD)/snake.elf P15.BIN=$(BUILD)/p15.elf REVERSI.BIN=$(BUILD)/reversi.elf SOLITAIRE.BIN=$(BUILD)/solitaire.elf READER.BIN=$(BUILD)/reader.elf VIM.BIN=$(BUILD)/vim.elf BASH.BIN=$(BUILD)/bash.elf AUDIO.BIN=$(BUILD)/audio.elf GIT.BIN=$(BUILD)/git.elf
 	@echo "seeded persistent disk $@ ($(PERSIST_KB) KB) from build/fsroot/"
 
 # boot the x64 build under qemu-system-x86_64 + OVMF in a graphical window so the
@@ -447,8 +460,8 @@ run-x64-headless: esp tinyfs.img
 # tools/mkgptesp.py writes the GPT, FAT32 ESP, and persistent FAT16 data
 # partition by hand (no mkfs.vfat/mtools needed).
 HYPER_DATA_KB ?= 16384
-$(BUILD)/hyper_data.img: tools/mkfatfs.py $(BUILD)/fsroot.stamp $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/tcc_self_probe.elf $(BUILD)/tcc2_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf $(BUILD)/https.elf $(BUILD)/tetris.elf $(BUILD)/2048.elf $(BUILD)/pacman.elf $(BUILD)/sudoku.elf $(BUILD)/snake.elf $(BUILD)/p15.elf $(BUILD)/reversi.elf $(BUILD)/vim.elf $(BUILD)/audio.elf $(BUILD)/git.elf programs/tcc_hello.c programs/tcc_printf_hello.c programs/tcc_printf.rsp programs/tcc_include/stdio.h $(TCC_BIN) $(MICROPY_BIN) $(TCC_SELF)/TCCSELF.I $(TCC_SELF)/BUILD.RSP $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
-	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(HYPER_DATA_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PYTHON.BIN=$(MICROPY_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c PRINTF.RSP=programs/tcc_printf.rsp STDIO.H=programs/tcc_include/stdio.h SELFRUN.BIN=$(BUILD)/tcc_self_probe.elf TCC2RUN.BIN=$(BUILD)/tcc2_probe.elf TCCSELF.I=$(TCC_SELF)/TCCSELF.I BUILD.RSP=$(TCC_SELF)/BUILD.RSP CRT1.O=$(TCC_SELF)/lib/crt1.o CRTI.O=$(TCC_SELF)/lib/crti.o CRTN.O=$(TCC_SELF)/lib/crtn.o LIBC.A=$(TCC_SELF)/lib/libc.a LIBTCC1.A=$(TCC_SELF)/lib/libtcc1.a MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf HTTPS.BIN=$(BUILD)/https.elf TETRIS.BIN=$(BUILD)/tetris.elf 2048.BIN=$(BUILD)/2048.elf PACMAN.BIN=$(BUILD)/pacman.elf SUDOKU.BIN=$(BUILD)/sudoku.elf SNAKE.BIN=$(BUILD)/snake.elf P15.BIN=$(BUILD)/p15.elf REVERSI.BIN=$(BUILD)/reversi.elf VIM.BIN=$(BUILD)/vim.elf AUDIO.BIN=$(BUILD)/audio.elf GIT.BIN=$(BUILD)/git.elf
+$(BUILD)/hyper_data.img: tools/mkfatfs.py $(BUILD)/fsroot.stamp $(BUILD)/musl_probe.elf $(BUILD)/linux_exec_child.elf $(BUILD)/tcc_probe.elf $(BUILD)/tcc_printf_probe.elf $(BUILD)/tcc_self_probe.elf $(BUILD)/tcc2_probe.elf $(BUILD)/mbb.elf $(BUILD)/tgl_demo.elf $(BUILD)/tgl3d_demo.elf $(BUILD)/wget.elf $(BUILD)/httpd.elf $(BUILD)/https.elf $(BUILD)/tetris.elf $(BUILD)/2048.elf $(BUILD)/pacman.elf $(BUILD)/doom.elf $(BUILD)/sudoku.elf $(BUILD)/snake.elf $(BUILD)/p15.elf $(BUILD)/reversi.elf $(BUILD)/solitaire.elf $(BUILD)/reader.elf $(BUILD)/vim.elf $(BUILD)/bash.elf $(BUILD)/audio.elf $(BUILD)/git.elf programs/tcc_hello.c programs/tcc_printf_hello.c programs/tcc_printf.rsp programs/tcc_include/stdio.h $(TCC_BIN) $(MICROPY_BIN) $(TCC_SELF)/TCCSELF.I $(TCC_SELF)/BUILD.RSP $(TCC_SELF)/lib/crt1.o $(TCC_SELF)/lib/crti.o $(TCC_SELF)/lib/crtn.o $(TCC_SELF)/lib/libc.a $(TCC_SELF)/lib/libtcc1.a | $(BUILD)
+	$(PYTHON) tools/mkfatfs.py $@ $(BUILD)/fsroot $(HYPER_DATA_KB) MUSL.BIN=$(BUILD)/musl_probe.elf EXEC.BIN=$(BUILD)/linux_exec_child.elf TCCRUN.BIN=$(BUILD)/tcc_probe.elf HELLO.C=programs/tcc_hello.c TCC.BIN=$(TCC_BIN) PYTHON.BIN=$(MICROPY_BIN) PRINTRUN.BIN=$(BUILD)/tcc_printf_probe.elf PRINTF.C=programs/tcc_printf_hello.c PRINTF.RSP=programs/tcc_printf.rsp STDIO.H=programs/tcc_include/stdio.h SELFRUN.BIN=$(BUILD)/tcc_self_probe.elf TCC2RUN.BIN=$(BUILD)/tcc2_probe.elf TCCSELF.I=$(TCC_SELF)/TCCSELF.I BUILD.RSP=$(TCC_SELF)/BUILD.RSP CRT1.O=$(TCC_SELF)/lib/crt1.o CRTI.O=$(TCC_SELF)/lib/crti.o CRTN.O=$(TCC_SELF)/lib/crtn.o LIBC.A=$(TCC_SELF)/lib/libc.a LIBTCC1.A=$(TCC_SELF)/lib/libtcc1.a MBB.BIN=$(BUILD)/mbb.elf TGL.BIN=$(BUILD)/tgl_demo.elf TGL3D.BIN=$(BUILD)/tgl3d_demo.elf WGET.BIN=$(BUILD)/wget.elf HTTPD.BIN=$(BUILD)/httpd.elf HTTPS.BIN=$(BUILD)/https.elf TETRIS.BIN=$(BUILD)/tetris.elf 2048.BIN=$(BUILD)/2048.elf PACMAN.BIN=$(BUILD)/pacman.elf DOOM.BIN=$(BUILD)/doom.elf SUDOKU.BIN=$(BUILD)/sudoku.elf SNAKE.BIN=$(BUILD)/snake.elf P15.BIN=$(BUILD)/p15.elf REVERSI.BIN=$(BUILD)/reversi.elf SOLITAIRE.BIN=$(BUILD)/solitaire.elf READER.BIN=$(BUILD)/reader.elf VIM.BIN=$(BUILD)/vim.elf BASH.BIN=$(BUILD)/bash.elf AUDIO.BIN=$(BUILD)/audio.elf GIT.BIN=$(BUILD)/git.elf
 $(BUILD)/tinyos.img: esp tools/mkgptesp.py $(BUILD)/hyper_data.img
 	$(PYTHON) tools/mkgptesp.py $@ $(ESP) $(BUILD)/hyper_data.img
 

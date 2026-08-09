@@ -26,8 +26,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <regex.h>
 #include "tinygl.h"        /* TinyGL client library (the UMD under test) */
 #include "tnet.h"          /* kernel DNS resolver + ICMP echo helpers */
+#include "tglob.h"         /* pathname expansion for shell arguments */
 
 extern char **environ;
 
@@ -120,26 +122,588 @@ static int ap_more(int argc, char **argv) {
     if (tty >= 0) close(tty);
     return rc;
 }
-static int ap_grep(int argc, char **argv) {
-    int inv = 0, ic = 0, num = 0, i = 1;
-    for (; i < argc && argv[i][0] == '-'; i++)
-        for (const char *f = argv[i] + 1; *f; f++) { if (*f == 'v') inv = 1; else if (*f == 'i') ic = 1; else if (*f == 'n') num = 1; }
-    if (i >= argc) { outs(2, "usage: grep [-vin] PATTERN [FILE]\n"); return 2; }
-    const char *pat = argv[i]; i++;
-    int fd = in_fd(argc, argv, i, "grep"); if (fd < 0) return 2;
-    char line[1024], low[1024]; int li = 0, found = 0; long ln = 0; char c;
-    for (;;) {
-        int r = read(fd, &c, 1);
-        if (r <= 0 && li == 0) break;
-        if (c == '\n' || r <= 0) {
-            line[li] = 0; ln++;
-            int m; if (ic) { for (int k = 0; k <= li; k++) low[k] = (char)(line[k] | 32); m = contains(low, pat); } else m = contains(line, pat);
-            if (m != inv) { if (num) { outnum(1, ln); write(1, ":", 1); } write(1, line, li); write(1, "\n", 1); found = 1; }
-            li = 0; if (r <= 0) break;
-        } else if (li < 1023) line[li++] = c;
+static int grep_fixed(const char *line, const char *pat, int icase) {
+    if (!icase) return contains(line, pat);
+    if (!*pat) return 1;
+    for (; *line; line++) {
+        const char *a = line, *b = pat;
+        while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) { a++; b++; }
+        if (!*b) return 1;
     }
-    if (fd) close(fd);
-    return found ? 0 : 1;
+    return 0;
+}
+static long read_line_fd(int fd, char **line, size_t *capacity) {
+    size_t length = 0;
+    for (;;) {
+        char ch; int got = read(fd, &ch, 1);
+        if (got <= 0) { if (!length) return -1; break; }
+        if (length + 2 > *capacity) {
+            size_t next = *capacity ? *capacity * 2 : 256;
+            char *grown = realloc(*line, next);
+            if (!grown) return -2;
+            *line = grown; *capacity = next;
+        }
+        (*line)[length++] = ch;
+        if (ch == '\n') break;
+    }
+    (*line)[length] = 0;
+    return (long)length;
+}
+static int grep_file(const char *name, regex_t *regex, const char *pat, int fixed,
+                     int icase, int invert, int number, int count_only,
+                     int list, int quiet, int prefix, int *error) {
+    int fd = name ? open(name, O_RDONLY) : 0;
+    if (fd < 0) { outs(2, "grep: "); outs(2, name); outs(2, ": not found\n"); *error = 1; return 0; }
+    char *line = 0; size_t capacity = 0; long length, line_no = 0, matches = 0;
+    while ((length = read_line_fd(fd, &line, &capacity)) >= 0) {
+        line_no++;
+        int newline = length > 0 && line[length - 1] == '\n';
+        if (newline) line[length - 1] = 0;
+        int matched = fixed ? grep_fixed(line, pat, icase) : regexec(regex, line, 0, 0, 0) == 0;
+        if (matched == invert) continue;
+        matches++;
+        if (quiet || list) break;
+        if (!count_only) {
+            if (prefix) { out1(name); write(1, ":", 1); }
+            if (number) { outnum(1, line_no); write(1, ":", 1); }
+            write(1, line, newline ? length - 1 : length); write(1, "\n", 1);
+        }
+    }
+    if (length == -2) *error = 1;
+    free(line); if (fd) close(fd);
+    if (count_only) { if (prefix) { out1(name); write(1, ":", 1); } outnum(1, matches); write(1, "\n", 1); }
+    if (list && matches) { out1(name ? name : "(standard input)"); write(1, "\n", 1); }
+    return matches != 0;
+}
+static int ap_grep(int argc, char **argv) {
+    int invert = 0, icase = 0, number = 0, fixed = 0, count_only = 0, list = 0, quiet = 0, i = 1;
+    const char *pat = 0;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strcmp(argv[i], "--")) { i++; break; }
+        if (!strcmp(argv[i], "-e")) { if (++i >= argc) break; pat = argv[i]; continue; }
+        for (const char *flag = argv[i] + 1; *flag; flag++) {
+            if (*flag == 'v') invert = 1; else if (*flag == 'i') icase = 1;
+            else if (*flag == 'n') number = 1; else if (*flag == 'F') fixed = 1;
+            else if (*flag == 'c') count_only = 1; else if (*flag == 'l') list = 1;
+            else if (*flag == 'q') quiet = 1; else if (*flag != 'E') {
+                outs(2, "usage: grep [-EFinvclq] [-e pattern] PATTERN [FILE...]\n"); return 2;
+            }
+        }
+    }
+    if (!pat && i < argc) pat = argv[i++];
+    if (!pat) { outs(2, "usage: grep [-EFinvclq] [-e pattern] PATTERN [FILE...]\n"); return 2; }
+    regex_t regex; int compiled = 0;
+    if (!fixed) {
+        int code = regcomp(&regex, pat, REG_EXTENDED | REG_NOSUB | (icase ? REG_ICASE : 0));
+        if (code) { char message[160]; regerror(code, &regex, message, sizeof message); outs(2, "grep: "); outs(2, message); outs(2, "\n"); return 2; }
+        compiled = 1;
+    }
+    int found = 0, error = 0, files = argc - i;
+    if (!files) found = grep_file(0, &regex, pat, fixed, icase, invert, number, count_only, list, quiet, 0, &error);
+    else for (; i < argc; i++) {
+        int matched = grep_file(argv[i], &regex, pat, fixed, icase, invert, number, count_only, list, quiet, files > 1 && !list, &error);
+        if (matched) found = 1;
+        if (quiet && found) break;
+    }
+    if (compiled) regfree(&regex);
+    return error ? 2 : (found ? 0 : 1);
+}
+
+#define SED_MAX_CMD 32
+struct sed_cmd {
+    int address, line, op, global, print, address_compiled, regex_compiled;
+    regex_t address_regex, regex;
+    char *replacement;
+};
+static int sed_delimited(const char **cursor, char delimiter, char **result) {
+    size_t capacity = 64, length = 0; char *text = malloc(capacity);
+    if (!text) return -1;
+    while (**cursor && **cursor != delimiter) {
+        char ch = *(*cursor)++;
+        if (ch == '\\' && **cursor) {
+            char next = **cursor;
+            if (next == delimiter) { ch = next; (*cursor)++; }
+            else { if (length + 1 >= capacity) { capacity *= 2; text = realloc(text, capacity); if (!text) return -1; } text[length++] = ch; ch = *(*cursor)++; }
+        }
+        if (length + 1 >= capacity) { capacity *= 2; text = realloc(text, capacity); if (!text) return -1; }
+        text[length++] = ch;
+    }
+    if (**cursor != delimiter) { free(text); return -1; }
+    (*cursor)++; text[length] = 0; *result = text; return 0;
+}
+static void sed_free(struct sed_cmd *commands, int count) {
+    for (int i = 0; i < count; i++) {
+        if (commands[i].address_compiled) regfree(&commands[i].address_regex);
+        if (commands[i].regex_compiled) regfree(&commands[i].regex);
+        if (commands[i].op == 's') free(commands[i].replacement);
+    }
+}
+static int sed_compile(const char *script, struct sed_cmd *commands, int *count, int extended) {
+    const char *cursor = script; *count = 0;
+    while (*cursor) {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == ';') cursor++;
+        if (!*cursor) break;
+        if (*count >= SED_MAX_CMD) { outs(2, "sed: too many commands\n"); return -1; }
+        struct sed_cmd *command = &commands[(*count)++]; memset(command, 0, sizeof *command);
+        if (isdigit((unsigned char)*cursor)) { command->address = 1; command->line = 0; while (isdigit((unsigned char)*cursor)) command->line = command->line * 10 + *cursor++ - '0'; }
+        else if (*cursor == '$') { command->address = 2; cursor++; }
+        else if (*cursor == '/') {
+            char *pattern; cursor++;
+            if (sed_delimited(&cursor, '/', &pattern) != 0) goto syntax;
+            command->address = 3;
+            int code = regcomp(&command->address_regex, pattern, extended ? REG_EXTENDED | REG_NOSUB : REG_NOSUB);
+            free(pattern); if (code) goto regex_error; command->address_compiled = 1;
+        }
+        while (*cursor == ' ' || *cursor == '\t') cursor++;
+        command->op = *cursor++;
+        if (command->op == 's') {
+            char delimiter = *cursor++, *pattern = 0;
+            if (!delimiter || delimiter == '\n' || sed_delimited(&cursor, delimiter, &pattern) != 0 ||
+                sed_delimited(&cursor, delimiter, &command->replacement) != 0) { free(pattern); goto syntax; }
+            int code = regcomp(&command->regex, pattern, extended ? REG_EXTENDED : 0);
+            free(pattern); if (code) goto regex_error; command->regex_compiled = 1;
+            while (*cursor && *cursor != ';') {
+                if (*cursor == 'g') command->global = 1;
+                else if (*cursor == 'p') command->print = 1;
+                else if (*cursor != ' ' && *cursor != '\t') goto syntax;
+                cursor++;
+            }
+        } else if (command->op != 'p' && command->op != 'd' && command->op != 'q') goto syntax;
+        while (*cursor == ' ' || *cursor == '\t') cursor++;
+        if (*cursor && *cursor != ';') goto syntax;
+        continue;
+regex_error:
+        outs(2, "sed: invalid regular expression\n"); sed_free(commands, *count); return -1;
+syntax:
+        outs(2, "sed: unsupported or malformed command\n"); sed_free(commands, *count); return -1;
+    }
+    return 0;
+}
+static int sed_append(char **output, size_t *length, size_t *capacity, const char *text, size_t amount) {
+    if (*length + amount + 1 > *capacity) {
+        size_t next = *capacity ? *capacity : 128;
+        while (next < *length + amount + 1) next *= 2;
+        char *grown = realloc(*output, next); if (!grown) return -1;
+        *output = grown; *capacity = next;
+    }
+    memcpy(*output + *length, text, amount); *length += amount; (*output)[*length] = 0; return 0;
+}
+static char *sed_substitute(const char *line, struct sed_cmd *command, int *changed) {
+    char *output = 0; size_t length = 0, capacity = 0, offset = 0, line_length = strlen(line);
+    regmatch_t match[10]; *changed = 0;
+    do {
+        int code = regexec(&command->regex, line + offset, 10, match, offset ? REG_NOTBOL : 0);
+        if (code || match[0].rm_so < 0) { if (sed_append(&output, &length, &capacity, line + offset, line_length - offset) != 0) goto fail; break; }
+        size_t start = offset + (size_t)match[0].rm_so, end = offset + (size_t)match[0].rm_eo;
+        if (sed_append(&output, &length, &capacity, line + offset, start - offset) != 0) goto fail;
+        for (const char *replacement = command->replacement; *replacement; replacement++) {
+            if (*replacement == '&') { if (sed_append(&output, &length, &capacity, line + start, end - start) != 0) goto fail; }
+            else if (*replacement == '\\' && replacement[1] >= '1' && replacement[1] <= '9') {
+                int group = *++replacement - '0';
+                if (match[group].rm_so >= 0 && sed_append(&output, &length, &capacity,
+                    line + offset + match[group].rm_so, (size_t)(match[group].rm_eo - match[group].rm_so)) != 0) goto fail;
+            } else if (sed_append(&output, &length, &capacity, replacement, 1) != 0) goto fail;
+        }
+        *changed = 1;
+        if (!command->global) { if (sed_append(&output, &length, &capacity, line + end, line_length - end) != 0) goto fail; break; }
+        if (end == offset) {
+            if (end >= line_length) break;
+            if (sed_append(&output, &length, &capacity, line + end, 1) != 0) goto fail;
+            offset = end + 1;
+        } else offset = end;
+    } while (offset <= line_length);
+    if (!output) output = strdup(line);
+    return output;
+fail:
+    free(output); return 0;
+}
+static int sed_address(struct sed_cmd *command, const char *line, long number, int last) {
+    if (!command->address) return 1;
+    if (command->address == 1) return number == command->line;
+    if (command->address == 2) return last;
+    return regexec(&command->address_regex, line, 0, 0, 0) == 0;
+}
+static int sed_read_all(int argc, char **argv, int first, char ***lines, int *count) {
+    int capacity = 0; *lines = 0; *count = 0;
+    int inputs = argc - first; if (!inputs) inputs = 1;
+    for (int input = 0; input < inputs; input++) {
+        int fd = argc > first ? open(argv[first + input], O_RDONLY) : 0;
+        if (fd < 0) { outs(2, "sed: "); outs(2, argv[first + input]); outs(2, ": not found\n"); return -1; }
+        char *line = 0; size_t line_capacity = 0; long length;
+        while ((length = read_line_fd(fd, &line, &line_capacity)) >= 0) {
+            if (length && line[length - 1] == '\n') line[--length] = 0;
+            if (*count == capacity) { capacity = capacity ? capacity * 2 : 64; *lines = realloc(*lines, (size_t)capacity * sizeof **lines); if (!*lines) return -1; }
+            (*lines)[(*count)++] = strdup(line);
+        }
+        free(line); if (fd) close(fd);
+    }
+    return 0;
+}
+static int ap_sed(int argc, char **argv) {
+    int quiet = 0, extended = 0, i = 1; char *script = 0; size_t script_length = 0, script_capacity = 0;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strcmp(argv[i], "-n")) quiet = 1;
+        else if (!strcmp(argv[i], "-E") || !strcmp(argv[i], "-r")) extended = 1;
+        else if (!strcmp(argv[i], "-e") && i + 1 < argc) {
+            const char *part = argv[++i];
+            if (script_length && sed_append(&script, &script_length, &script_capacity, ";", 1) != 0) { free(script); return 2; }
+            if (sed_append(&script, &script_length, &script_capacity, part, strlen(part)) != 0) { free(script); return 2; }
+        }
+        else { outs(2, "usage: sed [-nE] SCRIPT [FILE...]\n"); return 2; }
+    }
+    if (!script && i < argc) script = strdup(argv[i++]);
+    if (!script) { outs(2, "usage: sed [-nE] [-e SCRIPT] [FILE...]\n"); return 2; }
+    struct sed_cmd commands[SED_MAX_CMD]; int command_count;
+    if (sed_compile(script, commands, &command_count, extended) != 0) { free(script); return 2; }
+    free(script);
+    char **lines; int line_count;
+    if (sed_read_all(argc, argv, i, &lines, &line_count) != 0) { sed_free(commands, command_count); return 2; }
+    int quit = 0;
+    for (int index = 0; index < line_count && !quit; index++) {
+        char *line = lines[index]; int deleted = 0;
+        for (int command_index = 0; command_index < command_count; command_index++) {
+            struct sed_cmd *command = &commands[command_index];
+            if (!sed_address(command, line, index + 1, index == line_count - 1)) continue;
+            if (command->op == 's') {
+                int changed; char *next = sed_substitute(line, command, &changed);
+                if (!next) { deleted = 1; break; }
+                free(line); line = next;
+                if (changed && command->print) { out1(line); write(1, "\n", 1); }
+            } else if (command->op == 'p') { out1(line); write(1, "\n", 1); }
+            else if (command->op == 'd') { deleted = 1; break; }
+            else if (command->op == 'q') { quit = 1; break; }
+        }
+        if (!quiet && !deleted) { out1(line); write(1, "\n", 1); }
+        free(line);
+        for (int rest = index + 1; quit && rest < line_count; rest++) { free(lines[rest]); lines[rest] = 0; }
+    }
+    free(lines); sed_free(commands, command_count); return 0;
+}
+
+#define AWK_MAX_VAR 64
+#define AWK_MAX_FIELD 128
+#define AWK_MAX_CLAUSE 32
+struct awk_var { char name[32]; char *value; };
+struct awk_ctx {
+    struct awk_var vars[AWK_MAX_VAR]; int variable_count;
+    char *record, *work, *fields[AWK_MAX_FIELD]; int field_count;
+    long nr, fnr; const char *filename; char fs[32], ofs[32];
+};
+struct awk_value { char text[512]; double number; int numeric; };
+struct awk_parser { const char *cursor; struct awk_ctx *ctx; int error; };
+struct awk_clause { int type; char *pattern, *action; };
+static struct awk_value awk_expression(struct awk_parser *parser);
+static void awk_skip(struct awk_parser *parser) { while (*parser->cursor == ' ' || *parser->cursor == '\t') parser->cursor++; }
+static struct awk_value awk_string(const char *text) {
+    struct awk_value value; snprintf(value.text, sizeof value.text, "%s", text ? text : "");
+    char *end; value.number = strtod(value.text, &end); value.numeric = end != value.text && !*end; return value;
+}
+static struct awk_value awk_number(double number) {
+    struct awk_value value; value.number = number; value.numeric = 1;
+    snprintf(value.text, sizeof value.text, "%.6g", number); return value;
+}
+static const char *awk_get(struct awk_ctx *ctx, const char *name) {
+    for (int i = 0; i < ctx->variable_count; i++) if (!strcmp(ctx->vars[i].name, name)) return ctx->vars[i].value;
+    return "";
+}
+static int awk_set(struct awk_ctx *ctx, const char *name, const char *value) {
+    if (!strcmp(name, "FS")) { snprintf(ctx->fs, sizeof ctx->fs, "%s", value); return 0; }
+    if (!strcmp(name, "OFS")) { snprintf(ctx->ofs, sizeof ctx->ofs, "%s", value); return 0; }
+    for (int i = 0; i < ctx->variable_count; i++) if (!strcmp(ctx->vars[i].name, name)) {
+        char *copy = strdup(value); if (!copy) return -1; free(ctx->vars[i].value); ctx->vars[i].value = copy; return 0;
+    }
+    if (ctx->variable_count >= AWK_MAX_VAR || strlen(name) >= sizeof ctx->vars[0].name) return -1;
+    struct awk_var *variable = &ctx->vars[ctx->variable_count++]; strcpy(variable->name, name);
+    variable->value = strdup(value); return variable->value ? 0 : -1;
+}
+static struct awk_value awk_factor(struct awk_parser *parser);
+static struct awk_value awk_product(struct awk_parser *parser) {
+    struct awk_value value = awk_factor(parser); awk_skip(parser);
+    while (*parser->cursor == '*' || *parser->cursor == '/') {
+        char op = *parser->cursor++; struct awk_value right = awk_factor(parser);
+        double divisor = right.number; value = awk_number(op == '*' ? value.number * divisor : (divisor ? value.number / divisor : 0)); awk_skip(parser);
+    }
+    return value;
+}
+static struct awk_value awk_sum(struct awk_parser *parser) {
+    struct awk_value value = awk_product(parser); awk_skip(parser);
+    while (*parser->cursor == '+' || *parser->cursor == '-') {
+        char op = *parser->cursor++; struct awk_value right = awk_product(parser);
+        value = awk_number(op == '+' ? value.number + right.number : value.number - right.number); awk_skip(parser);
+    }
+    return value;
+}
+static struct awk_value awk_factor(struct awk_parser *parser) {
+    awk_skip(parser);
+    if (*parser->cursor == '(') { parser->cursor++; struct awk_value value = awk_sum(parser); awk_skip(parser); if (*parser->cursor == ')') parser->cursor++; else parser->error = 1; return value; }
+    if (*parser->cursor == '-') { parser->cursor++; struct awk_value value = awk_factor(parser); return awk_number(-value.number); }
+    if (*parser->cursor == '"') {
+        parser->cursor++; char text[512]; int length = 0;
+        while (*parser->cursor && *parser->cursor != '"') {
+            char ch = *parser->cursor++;
+            if (ch == '\\' && *parser->cursor) { ch = *parser->cursor++; if (ch == 'n') ch = '\n'; else if (ch == 't') ch = '\t'; }
+            if (length < (int)sizeof text - 1) text[length++] = ch;
+        }
+        if (*parser->cursor == '"') parser->cursor++; else parser->error = 1;
+        text[length] = 0; return awk_string(text);
+    }
+    if (*parser->cursor == '$') {
+        parser->cursor++; int field = 0;
+        if (isdigit((unsigned char)*parser->cursor)) while (isdigit((unsigned char)*parser->cursor)) field = field * 10 + *parser->cursor++ - '0';
+        else { char name[32]; int length = 0; while (isalnum((unsigned char)*parser->cursor) || *parser->cursor == '_') if (length < 31) name[length++] = *parser->cursor++; else parser->cursor++; name[length] = 0; field = (int)strtol(awk_get(parser->ctx, name), 0, 10); }
+        if (!field) return awk_string(parser->ctx->record);
+        return awk_string(field <= parser->ctx->field_count ? parser->ctx->fields[field - 1] : "");
+    }
+    if (isdigit((unsigned char)*parser->cursor) || *parser->cursor == '.') {
+        char *end; double number = strtod(parser->cursor, &end);
+        if (end == parser->cursor) { parser->error = 1; return awk_string(""); }
+        parser->cursor = end; return awk_number(number);
+    }
+    char name[32]; int length = 0;
+    while (isalnum((unsigned char)*parser->cursor) || *parser->cursor == '_') {
+        if (length < 31) name[length++] = *parser->cursor;
+        parser->cursor++;
+    }
+    name[length] = 0;
+    if (!length) { parser->error = 1; return awk_string(""); }
+    if (!strcmp(name, "length")) {
+        awk_skip(parser);
+        if (*parser->cursor != '(') return awk_number(strlen(parser->ctx->record));
+        parser->cursor++; awk_skip(parser);
+        struct awk_value argument = *parser->cursor == ')' ? awk_string(parser->ctx->record) : awk_expression(parser);
+        awk_skip(parser); if (*parser->cursor == ')') parser->cursor++; else parser->error = 1;
+        return awk_number(strlen(argument.text));
+    }
+    if (!strcmp(name, "NR")) return awk_number(parser->ctx->nr);
+    if (!strcmp(name, "FNR")) return awk_number(parser->ctx->fnr);
+    if (!strcmp(name, "NF")) return awk_number(parser->ctx->field_count);
+    if (!strcmp(name, "FILENAME")) return awk_string(parser->ctx->filename ? parser->ctx->filename : "");
+    return awk_string(awk_get(parser->ctx, name));
+}
+static int awk_regex(const char *text, const char *pattern) {
+    regex_t regex; if (regcomp(&regex, pattern, REG_EXTENDED | REG_NOSUB) != 0) return -1;
+    int matched = regexec(&regex, text, 0, 0, 0) == 0; regfree(&regex); return matched;
+}
+static struct awk_value awk_comparison(struct awk_parser *parser) {
+    struct awk_value left = awk_sum(parser); awk_skip(parser);
+    const char *operator = 0; int length = 0;
+    if (!strncmp(parser->cursor, "!~", 2) || !strncmp(parser->cursor, "==", 2) || !strncmp(parser->cursor, "!=", 2) ||
+        !strncmp(parser->cursor, ">=", 2) || !strncmp(parser->cursor, "<=", 2)) { operator = parser->cursor; length = 2; }
+    else if (*parser->cursor == '~' || *parser->cursor == '>' || *parser->cursor == '<') { operator = parser->cursor; length = 1; }
+    if (!operator) return left;
+    char op[3] = { 0 }; memcpy(op, operator, (size_t)length); parser->cursor += length; awk_skip(parser);
+    if (!strcmp(op, "~") || !strcmp(op, "!~")) {
+        char pattern[512]; int pattern_length = 0;
+        if (*parser->cursor == '/') { parser->cursor++; while (*parser->cursor && *parser->cursor != '/') { if (pattern_length < 255) pattern[pattern_length++] = *parser->cursor; parser->cursor++; } if (*parser->cursor == '/') parser->cursor++; else parser->error = 1; }
+        else { struct awk_value right = awk_sum(parser); memcpy(pattern, right.text, sizeof pattern - 1); pattern[sizeof pattern - 1] = 0; pattern_length = strlen(pattern); }
+        pattern[pattern_length] = 0; int matched = awk_regex(left.text, pattern); if (matched < 0) parser->error = 1;
+        return awk_number((!strcmp(op, "!~")) ? !matched : matched);
+    }
+    struct awk_value right = awk_sum(parser); int comparison;
+    if (left.numeric && right.numeric) comparison = left.number < right.number ? -1 : left.number > right.number;
+    else comparison = strcmp(left.text, right.text);
+    if (!strcmp(op, "==")) return awk_number(comparison == 0);
+    if (!strcmp(op, "!=")) return awk_number(comparison != 0);
+    if (!strcmp(op, ">=")) return awk_number(comparison >= 0);
+    if (!strcmp(op, "<=")) return awk_number(comparison <= 0);
+    if (!strcmp(op, ">")) return awk_number(comparison > 0);
+    return awk_number(comparison < 0);
+}
+static int awk_truth(struct awk_value value) { return value.numeric ? value.number != 0 : value.text[0] != 0; }
+static struct awk_value awk_expression(struct awk_parser *parser) {
+    struct awk_value value = awk_comparison(parser); awk_skip(parser);
+    while (!strncmp(parser->cursor, "&&", 2) || !strncmp(parser->cursor, "||", 2)) {
+        int is_and = parser->cursor[0] == '&'; parser->cursor += 2;
+        struct awk_value right = awk_comparison(parser);
+        value = awk_number(is_and ? (awk_truth(value) && awk_truth(right)) : (awk_truth(value) || awk_truth(right)));
+        awk_skip(parser);
+    }
+    return value;
+}
+static void awk_fields(struct awk_ctx *ctx, char *line) {
+    free(ctx->work); ctx->work = strdup(line); ctx->field_count = 0;
+    char *cursor = ctx->work;
+    if (!ctx->fs[0] || !strcmp(ctx->fs, " ")) {
+        while (*cursor && ctx->field_count < AWK_MAX_FIELD) {
+            while (isspace((unsigned char)*cursor)) cursor++;
+            if (!*cursor) break;
+            ctx->fields[ctx->field_count++] = cursor;
+            while (*cursor && !isspace((unsigned char)*cursor)) cursor++;
+            if (*cursor) *cursor++ = 0;
+        }
+    } else {
+        char separator = ctx->fs[0];
+        for (;;) {
+            if (ctx->field_count >= AWK_MAX_FIELD) break;
+            ctx->fields[ctx->field_count++] = cursor; char *end = strchr(cursor, separator);
+            if (!end) break;
+            *end = 0; cursor = end + 1;
+        }
+    }
+}
+static char *awk_trim_copy(const char *start, const char *end) {
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    size_t length = (size_t)(end - start); char *copy = malloc(length + 1); if (!copy) return 0;
+    memcpy(copy, start, length); copy[length] = 0; return copy;
+}
+static int awk_compile(const char *program, struct awk_clause *clauses, int *count) {
+    const char *cursor = program; *count = 0;
+    while (*cursor) {
+        while (isspace((unsigned char)*cursor) || *cursor == ';') cursor++;
+        if (!*cursor) break;
+        if (*count >= AWK_MAX_CLAUSE) return -1;
+        const char *pattern_start = cursor, *brace = 0; int quote = 0, slash = 0;
+        for (; *cursor; cursor++) {
+            if (*cursor == '"' && (cursor == program || cursor[-1] != '\\') && !slash) quote = !quote;
+            else if (*cursor == '/' && !quote && (cursor == program || cursor[-1] != '\\')) slash = !slash;
+            else if (*cursor == '{' && !quote && !slash) { brace = cursor; break; }
+        }
+        struct awk_clause *clause = &clauses[(*count)++]; memset(clause, 0, sizeof *clause);
+        if (!brace) { clause->pattern = awk_trim_copy(pattern_start, cursor); clause->action = strdup("print"); break; }
+        clause->pattern = awk_trim_copy(pattern_start, brace); cursor = brace + 1;
+        const char *action_start = cursor; quote = 0;
+        while (*cursor) { if (*cursor == '"' && (cursor == action_start || cursor[-1] != '\\')) quote = !quote; else if (*cursor == '}' && !quote) break; cursor++; }
+        if (*cursor != '}') return -1;
+        clause->action = awk_trim_copy(action_start, cursor++);
+        if (!strcmp(clause->pattern, "BEGIN")) clause->type = 1;
+        else if (!strcmp(clause->pattern, "END")) clause->type = 2;
+        if (!clause->pattern || !clause->action) return -1;
+    }
+    return 0;
+}
+static void awk_free_clauses(struct awk_clause *clauses, int count) { for (int i = 0; i < count; i++) { free(clauses[i].pattern); free(clauses[i].action); } }
+static int awk_pattern(struct awk_ctx *ctx, const char *pattern) {
+    if (!*pattern) return 1;
+    size_t length = strlen(pattern);
+    if (length >= 2 && pattern[0] == '/' && pattern[length - 1] == '/') {
+        char *copy = strndup(pattern + 1, length - 2); if (!copy) return -1;
+        int matched = awk_regex(ctx->record, copy); free(copy); return matched;
+    }
+    struct awk_parser parser = { pattern, ctx, 0 }; struct awk_value value = awk_expression(&parser); awk_skip(&parser);
+    return parser.error || *parser.cursor ? -1 : awk_truth(value);
+}
+static int awk_statement(struct awk_ctx *ctx, const char *statement) {
+    while (isspace((unsigned char)*statement)) statement++;
+    if (!strcmp(statement, "next")) return 1;
+    if (!strcmp(statement, "exit")) return 2;
+    if (!strncmp(statement, "print", 5) && (!statement[5] || isspace((unsigned char)statement[5]))) {
+        const char *cursor = statement + 5; while (isspace((unsigned char)*cursor)) cursor++;
+        if (!*cursor) { out1(ctx->record); write(1, "\n", 1); return 0; }
+        int first = 1;
+        while (*cursor) {
+            struct awk_parser parser = { cursor, ctx, 0 }; struct awk_value value = awk_expression(&parser);
+            if (parser.error) return -1;
+            if (!first) out1(ctx->ofs);
+            out1(value.text); first = 0;
+            cursor = parser.cursor; awk_skip(&parser); cursor = parser.cursor;
+            if (*cursor == ',') { cursor++; while (isspace((unsigned char)*cursor)) cursor++; }
+            else if (*cursor) return -1;
+        }
+        write(1, "\n", 1); return 0;
+    }
+    if (!strncmp(statement, "printf", 6) && (!statement[6] || isspace((unsigned char)statement[6]))) {
+        const char *cursor = statement + 6; while (isspace((unsigned char)*cursor)) cursor++;
+        struct awk_parser parser = { cursor, ctx, 0 }; struct awk_value format = awk_expression(&parser);
+        if (parser.error) return -1; cursor = parser.cursor; while (isspace((unsigned char)*cursor)) cursor++;
+        struct awk_value arguments[16]; int argument_count = 0;
+        while (*cursor == ',' && argument_count < 16) {
+            cursor++; while (isspace((unsigned char)*cursor)) cursor++;
+            parser.cursor = cursor; parser.error = 0; arguments[argument_count++] = awk_expression(&parser);
+            if (parser.error) return -1; cursor = parser.cursor; while (isspace((unsigned char)*cursor)) cursor++;
+        }
+        if (*cursor) return -1;
+        int argument = 0;
+        for (const char *ch = format.text; *ch; ch++) {
+            if (*ch != '%') { write(1, ch, 1); continue; }
+            if (ch[1] == '%') { write(1, "%", 1); ch++; continue; }
+            const char *start = ch++; while (*ch && strchr("-+ #0.123456789", *ch)) ch++;
+            if (!*ch || argument >= argument_count || !strchr("sdigf", *ch)) return -1;
+            char spec[32]; size_t spec_length = (size_t)(ch - start + 1); if (spec_length >= sizeof spec) return -1;
+            memcpy(spec, start, spec_length); spec[spec_length] = 0; char output[512];
+            if (*ch == 's') snprintf(output, sizeof output, spec, arguments[argument].text);
+            else if (*ch == 'd' || *ch == 'i') snprintf(output, sizeof output, spec, (int)arguments[argument].number);
+            else snprintf(output, sizeof output, spec, arguments[argument].number);
+            out1(output); argument++;
+        }
+        return 0;
+    }
+    const char *cursor = statement; char name[32]; int name_length = 0;
+    if (!(isalpha((unsigned char)*cursor) || *cursor == '_')) return -1;
+    while (isalnum((unsigned char)*cursor) || *cursor == '_') { if (name_length < 31) name[name_length++] = *cursor; cursor++; }
+    name[name_length] = 0; while (isspace((unsigned char)*cursor)) cursor++;
+    if (!strcmp(cursor, "++")) { struct awk_value old = awk_string(awk_get(ctx, name)), value = awk_number(old.number + 1); return awk_set(ctx, name, value.text); }
+    char op = 0;
+    if (*cursor == '=' && cursor[1] != '=') { op = '='; cursor++; }
+    else if ((*cursor == '+' || *cursor == '-' || *cursor == '*' || *cursor == '/') && cursor[1] == '=') { op = *cursor; cursor += 2; }
+    else return -1;
+    struct awk_parser parser = { cursor, ctx, 0 }; struct awk_value value = awk_expression(&parser); awk_skip(&parser);
+    if (parser.error || *parser.cursor) return -1;
+    if (op != '=') { struct awk_value old = awk_string(awk_get(ctx, name)); double right = value.number;
+        value = awk_number(op == '+' ? old.number + right : op == '-' ? old.number - right : op == '*' ? old.number * right : (right ? old.number / right : 0)); }
+    return awk_set(ctx, name, value.text);
+}
+static int awk_action(struct awk_ctx *ctx, const char *action) {
+    const char *start = action, *cursor = action; int quote = 0;
+    for (;;) {
+        if (*cursor == '"' && (cursor == action || cursor[-1] != '\\')) quote = !quote;
+        if ((!*cursor || (*cursor == ';' && !quote))) {
+            char *statement = awk_trim_copy(start, cursor); if (!statement) return -1;
+            int result = *statement ? awk_statement(ctx, statement) : 0; free(statement);
+            if (result) return result;
+            if (!*cursor) break;
+            start = cursor + 1;
+        }
+        cursor++;
+    }
+    return 0;
+}
+static int awk_run_clauses(struct awk_ctx *ctx, struct awk_clause *clauses, int count, int type) {
+    for (int i = 0; i < count; i++) if (clauses[i].type == type) {
+        int matches = type ? 1 : awk_pattern(ctx, clauses[i].pattern);
+        if (matches < 0) return -1;
+        if (matches) { int result = awk_action(ctx, clauses[i].action); if (result) return result; }
+    }
+    return 0;
+}
+static int ap_awk(int argc, char **argv) {
+    struct awk_ctx ctx; memset(&ctx, 0, sizeof ctx); strcpy(ctx.fs, " "); strcpy(ctx.ofs, " ");
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strncmp(argv[i], "-F", 2)) { const char *fs = argv[i] + 2; if (!*fs && ++i < argc) fs = argv[i]; if (!*fs) return 2; snprintf(ctx.fs, sizeof ctx.fs, "%s", fs); }
+        else if (!strcmp(argv[i], "-v") && ++i < argc) { char *equal = strchr(argv[i], '='); if (!equal) return 2; *equal = 0; awk_set(&ctx, argv[i], equal + 1); *equal = '='; }
+        else { outs(2, "usage: awk [-F sep] [-v name=value] PROGRAM [FILE...]\n"); return 2; }
+    }
+    if (i >= argc) { outs(2, "usage: awk [-F sep] [-v name=value] PROGRAM [FILE...]\n"); return 2; }
+    struct awk_clause clauses[AWK_MAX_CLAUSE]; int clause_count;
+    if (awk_compile(argv[i++], clauses, &clause_count) != 0) { outs(2, "awk: malformed program\n"); return 2; }
+    int files[128], file_count = 0, status = 0;
+    for (int argument = i; argument < argc; argument++) {
+        char *equal = strchr(argv[argument], '='); int valid = equal && equal != argv[argument];
+        for (char *ch = argv[argument]; valid && ch < equal; ch++) if (!(isalnum((unsigned char)*ch) || *ch == '_') || (ch == argv[argument] && isdigit((unsigned char)*ch))) valid = 0;
+        if (valid) { *equal = 0; if (awk_set(&ctx, argv[argument], equal + 1) != 0) { *equal = '='; status = -1; break; } *equal = '='; }
+        else if (file_count < 128) files[file_count++] = argument;
+    }
+    ctx.record = (char *)"";
+    if (status >= 0) status = awk_run_clauses(&ctx, clauses, clause_count, 1);
+    int stop = status == 2;
+    int inputs = file_count ? file_count : 1;
+    for (int input = 0; input < inputs && !stop && status >= 0; input++) {
+        const char *name = file_count ? argv[files[input]] : 0; int fd = name ? open(name, O_RDONLY) : 0;
+        if (fd < 0) { outs(2, "awk: "); outs(2, name); outs(2, ": not found\n"); status = -1; break; }
+        ctx.filename = name ? name : "-"; ctx.fnr = 0; char *line = 0; size_t capacity = 0; long length;
+        while (!stop && (length = read_line_fd(fd, &line, &capacity)) >= 0) {
+            if (length && line[length - 1] == '\n') line[--length] = 0;
+            ctx.record = line; ctx.nr++; ctx.fnr++; awk_fields(&ctx, line);
+            int result = awk_run_clauses(&ctx, clauses, clause_count, 0);
+            if (result < 0) { status = -1; break; } if (result == 2) stop = 1;
+        }
+        free(line); if (fd) close(fd);
+    }
+    if (status >= 0) { ctx.record = (char *)""; int result = awk_run_clauses(&ctx, clauses, clause_count, 2); if (result < 0) status = -1; }
+    if (status < 0) outs(2, "awk: unsupported or malformed expression\n");
+    free(ctx.work); for (int variable = 0; variable < ctx.variable_count; variable++) free(ctx.vars[variable].value);
+    awk_free_clauses(clauses, clause_count); return status < 0 ? 2 : 0;
 }
 static int ap_wc(int argc, char **argv) {
     int wl = 0, ww = 0, wc = 0, any = 0, i = 1;
@@ -239,33 +803,123 @@ static int ap_tr(int argc, char **argv) {
 }
 
 /* ---- files --------------------------------------------------------------- */
+static void ls_print(const char *name, const struct stat *st, int lng) {
+    if (lng) {
+        out1(S_ISDIR(st->st_mode) ? "drwxr-xr-x 1 root root " : "-rw-r--r-- 1 root root ");
+        outnum(1, (long)st->st_size); write(1, "\t", 1);
+    }
+    out1(name);
+    write(1, lng ? "\n" : "  ", lng ? 1 : 2);
+}
 static int ap_ls(int argc, char **argv) {
     int all = 0, lng = 0, i = 1;
     for (; i < argc && argv[i][0] == '-'; i++)
         for (const char *f = argv[i] + 1; *f; f++) { if (*f == 'a') all = 1; else if (*f == 'l') lng = 1; }
-    const char *dir = i < argc ? argv[i] : ".";
-    DIR *d = opendir(dir);
-    if (!d) { outs(2, "ls: "); outs(2, dir); outs(2, ": not a directory\n"); return 1; }
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (!all && e->d_name[0] == '.') continue;
-        if (lng) {
+    int first = i, last = i < argc ? argc : i + 1, rc = 0;
+    for (; i < last; i++) {
+        const char *path = first < argc ? argv[i] : ".";
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            outs(2, "ls: "); outs(2, path); outs(2, ": not found\n"); rc = 1; continue;
+        }
+        if (!S_ISDIR(st.st_mode)) { ls_print(path, &st, lng); continue; }
+        DIR *d = opendir(path);
+        if (!d) { outs(2, "ls: "); outs(2, path); outs(2, ": cannot open\n"); rc = 1; continue; }
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (!all && e->d_name[0] == '.') continue;
             char full[288]; int n = 0;
-            for (const char *p = dir; *p && n < 200; p++) full[n++] = *p;
+            for (const char *p = path; *p && n < 200; p++) full[n++] = *p;
             if (n && full[n - 1] != '/') full[n++] = '/';
             for (const char *p = e->d_name; *p && n < 280; p++) full[n++] = *p;
             full[n] = 0;
-            struct stat st; int isdir = 0; long sz = 0;
-            if (stat(full, &st) == 0) { isdir = S_ISDIR(st.st_mode); sz = (long)st.st_size; }
-            out1(isdir ? "drwxr-xr-x 1 root root " : "-rw-r--r-- 1 root root ");
-            outnum(1, sz); write(1, "\t", 1);
+            struct stat entry;
+            if (stat(full, &entry) != 0) memset(&entry, 0, sizeof entry);
+            ls_print(e->d_name, &entry, lng);
         }
-        out1(e->d_name);
-        if (lng) write(1, "\n", 1); else write(1, "  ", 2);
+        closedir(d);
     }
     if (!lng) write(1, "\n", 1);
-    closedir(d);
-    return 0;
+    return rc;
+}
+struct tree_entry { char *name; int isdir; };
+struct tree_opts { int all, dirs_only, max_depth, dirs, files, rc; };
+static void tree_join(char *out, int cap, const char *dir, const char *name) {
+    int n = 0;
+    for (const char *p = dir; *p && n < cap - 2; p++) out[n++] = *p;
+    if (n && out[n - 1] != '/') out[n++] = '/';
+    for (const char *p = name; *p && n < cap - 1; p++) out[n++] = *p;
+    out[n] = 0;
+}
+static int tree_cmp(const void *a, const void *b) {
+    const struct tree_entry *ea = a, *eb = b;
+    return strcmp(ea->name, eb->name);
+}
+static void tree_indent(const unsigned char *last, int depth, int is_last) {
+    for (int i = 0; i < depth; i++) out1(last[i] ? "    " : "|   ");
+    out1(is_last ? "`-- " : "|-- ");
+}
+static void tree_walk(const char *path, int depth, unsigned char *last, struct tree_opts *opt) {
+    if (depth >= opt->max_depth) return;
+    DIR *dir = opendir(path);
+    if (!dir) { outs(2, "tree: cannot open "); outs(2, path); outs(2, "\n"); opt->rc = 1; return; }
+    struct tree_entry *entries = 0; int count = 0, capacity = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!opt->all && entry->d_name[0] == '.') continue;
+        char full[512]; tree_join(full, sizeof full, path, entry->d_name);
+        struct stat st; int isdir = stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+        if (opt->dirs_only && !isdir) continue;
+        if (count == capacity) {
+            int next = capacity ? capacity * 2 : 16;
+            struct tree_entry *grown = realloc(entries, (size_t)next * sizeof *entries);
+            if (!grown) { opt->rc = 1; break; }
+            entries = grown; capacity = next;
+        }
+        entries[count].name = strdup(entry->d_name);
+        if (!entries[count].name) { opt->rc = 1; break; }
+        entries[count++].isdir = isdir;
+    }
+    closedir(dir);
+    qsort(entries, (size_t)count, sizeof *entries, tree_cmp);
+    for (int i = 0; i < count; i++) {
+        int is_last = i == count - 1;
+        tree_indent(last, depth, is_last); out1(entries[i].name); write(1, "\n", 1);
+        char full[512]; tree_join(full, sizeof full, path, entries[i].name);
+        if (entries[i].isdir) {
+            opt->dirs++; last[depth] = (unsigned char)is_last;
+            tree_walk(full, depth + 1, last, opt);
+        } else opt->files++;
+        free(entries[i].name);
+    }
+    free(entries);
+}
+static int ap_tree(int argc, char **argv) {
+    struct tree_opts opt = { 0, 0, 64, 0, 0, 0 };
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (!strcmp(argv[i], "--")) { i++; break; }
+        if (!strcmp(argv[i], "-a")) opt.all = 1;
+        else if (!strcmp(argv[i], "-d")) opt.dirs_only = 1;
+        else if (!strcmp(argv[i], "-L")) {
+            if (++i >= argc || (opt.max_depth = atoi(argv[i])) < 1) {
+                outs(2, "tree: -L requires a positive depth\n"); return 1;
+            }
+        } else { outs(2, "usage: tree [-a] [-d] [-L depth] [path]\n"); return 1; }
+    }
+    if (argc - i > 1) { outs(2, "tree: only one path may be specified\n"); return 1; }
+    const char *path = i < argc ? argv[i] : ".";
+    struct stat st;
+    if (stat(path, &st) != 0) { outs(2, "tree: "); outs(2, path); outs(2, ": not found\n"); return 1; }
+    out1(path); write(1, "\n", 1);
+    if (S_ISDIR(st.st_mode)) {
+        unsigned char last[64] = { 0 };
+        tree_walk(path, 0, last, &opt);
+    } else if (!opt.dirs_only) opt.files = 1;
+    out1("\n"); outnum(1, opt.dirs); out1(opt.dirs == 1 ? " directory, " : " directories, ");
+    outnum(1, opt.files); out1(opt.files == 1 ? " file\n" : " files\n");
+    return opt.rc;
 }
 /* join dir + '/' + name -> out (bounded) */
 static void cp_join(char *out, int cap, const char *dir, const char *name) {
@@ -287,7 +941,7 @@ static int cp_is_dir(const char *p) {
 static int cp_file(const char *src, const char *dst) {
     int s = open(src, O_RDONLY);
     if (s < 0) { outs(2, "cp: cannot open "); outs(2, src); outs(2, "\n"); return 1; }
-    int d = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+    int d = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (d < 0) { close(s); outs(2, "cp: cannot create "); outs(2, dst); outs(2, "\n"); return 1; }
     char b[512]; int n, rc = 0;
     while ((n = read(s, b, sizeof b)) > 0) if (write(d, b, n) != n) { rc = 1; break; }
@@ -301,7 +955,9 @@ static int cp_tree(const char *src, const char *dst, int rflag) {
     if (stat(src, &st) != 0) { outs(2, "cp: "); outs(2, src); outs(2, ": not found\n"); return 1; }
     if (!S_ISDIR(st.st_mode)) return cp_file(src, dst);
     if (!rflag) { outs(2, "cp: omitting directory "); outs(2, src); outs(2, " (use -r)\n"); return 1; }
-    mkdir(dst, 0755);                                  /* ok if it already exists */
+    if (mkdir(dst, 0755) != 0 && !cp_is_dir(dst)) {
+        outs(2, "cp: cannot create directory "); outs(2, dst); outs(2, "\n"); return 1;
+    }
     DIR *dir = opendir(src);
     if (!dir) { outs(2, "cp: cannot read "); outs(2, src); outs(2, "\n"); return 1; }
     struct dirent *e; int rc = 0;
@@ -954,10 +1610,10 @@ static int ap_web(int argc, char **argv) {
 
 /* ---- dispatch ------------------------------------------------------------ */
 static const struct { const char *name; int (*fn)(int, char **); } g_applets[] = {
-    { "sh", run_shell }, { "echo", ap_echo }, { "cat", ap_cat }, { "more", ap_more }, { "grep", ap_grep },
+    { "sh", run_shell }, { "echo", ap_echo }, { "cat", ap_cat }, { "more", ap_more }, { "grep", ap_grep }, { "sed", ap_sed }, { "awk", ap_awk },
     { "wc", ap_wc }, { "head", ap_head }, { "tail", ap_tail }, { "rev", ap_rev },
     { "tee", ap_tee }, { "nl", ap_nl }, { "yes", ap_yes }, { "seq", ap_seq },
-    { "sort", ap_sort }, { "uniq", ap_uniq }, { "tr", ap_tr }, { "ls", ap_ls },
+    { "sort", ap_sort }, { "uniq", ap_uniq }, { "tr", ap_tr }, { "ls", ap_ls }, { "tree", ap_tree },
     { "cp", ap_cp }, { "mv", ap_mv }, { "rm", ap_rm }, { "mkdir", ap_mkdir },
     { "rmdir", ap_rmdir }, { "touch", ap_touch }, { "cmp", ap_cmp }, { "stat", ap_stat },
     { "basename", ap_basename }, { "dirname", ap_dirname }, { "pwd", ap_pwd },
@@ -1006,31 +1662,127 @@ static void exec_command(char **argv) {
 }
 
 /* ---- pipeline + shell ---------------------------------------------------- */
+struct shell_stage {
+    char *argv[24];
+    unsigned char glob[24];
+    char text[512];
+    const char *input;
+    const char *output;
+    int argc;
+    int append;
+};
+
+static int parse_stage(const char *source, struct shell_stage *stage) {
+    memset(stage, 0, sizeof *stage);
+    char *writep = stage->text;
+    char *end = stage->text + sizeof stage->text;
+    int redirect = 0;
+
+    while (*source) {
+        while (*source == ' ') source++;
+        if (!*source) break;
+        if (*source == '<' || *source == '>') {
+            redirect = *source++;
+            if (redirect == '>') {
+                stage->append = *source == '>';
+                if (stage->append) source++;
+            }
+            while (*source == ' ') source++;
+            if (!*source || *source == '<' || *source == '>') {
+                outs(2, "sh: missing redirection file\n");
+                return -1;
+            }
+        }
+
+        char *word = writep;
+        int single = 0, dbl = 0, allow_glob = 0;
+        while (*source) {
+            if (!dbl && *source == '\'') { single = !single; source++; continue; }
+            if (!single && *source == '"') { dbl = !dbl; source++; continue; }
+            if (!single && *source == '\\' && source[1]) {
+                source++;
+                if (writep + 1 >= end) { outs(2, "sh: command too long\n"); return -1; }
+                *writep++ = *source++;
+                continue;
+            }
+            if (!single && !dbl && (*source == ' ' || *source == '<' || *source == '>')) break;
+            if (writep + 1 >= end) { outs(2, "sh: command too long\n"); return -1; }
+            if (!single && !dbl && (*source == '*' || *source == '?' || *source == '[')) allow_glob = 1;
+            *writep++ = *source++;
+        }
+        if (single || dbl) { outs(2, "sh: unterminated quote\n"); return -1; }
+        if (writep == word) continue;
+        *writep++ = 0;
+        if (redirect == '<') stage->input = word;
+        else if (redirect == '>') stage->output = word;
+        else if (stage->argc < 23) {
+            stage->glob[stage->argc] = (unsigned char)allow_glob;
+            stage->argv[stage->argc++] = word;
+        }
+        else { outs(2, "sh: too many arguments\n"); return -1; }
+        redirect = 0;
+    }
+    stage->argv[stage->argc] = 0;
+    if (redirect) { outs(2, "sh: missing redirection file\n"); return -1; }
+    if (!stage->argc) { outs(2, "sh: empty pipeline stage\n"); return -1; }
+    return 0;
+}
+
+static int expand_stage_globs(struct shell_stage *stage, char **argv, int capacity) {
+    int argc = 0;
+    for (int i = 0; i < stage->argc; i++) {
+        tglob_result matches;
+        int count = stage->glob[i] ? tglob_expand(stage->argv[i], &matches) : 0;
+        if (count < 0) { outs(2, "sh: glob: out of memory\n"); return -1; }
+        if (count == 0) {
+            if (argc + 1 >= capacity) { outs(2, "sh: too many expanded arguments\n"); return -1; }
+            argv[argc++] = stage->argv[i];
+        } else {
+            for (int j = 0; j < count; j++) {
+                if (argc + 1 >= capacity) { tglob_free(&matches); outs(2, "sh: too many expanded arguments\n"); return -1; }
+                argv[argc++] = strdup(matches.items[j]);
+                if (!argv[argc - 1]) { tglob_free(&matches); return -1; }
+            }
+            tglob_free(&matches);
+        }
+    }
+    argv[argc] = 0;
+    return argc;
+}
+
 static int run_pipeline(char *cmd) {
     char *stages[8]; int ns = 0;
     stages[ns++] = cmd;
     for (char *p = cmd; *p && ns < 8; p++) if (*p == '|') { *p = 0; stages[ns++] = p + 1; }
 
+    struct shell_stage parsed[8];
+    for (int s = 0; s < ns; s++) if (parse_stage(stages[s], &parsed[s]) != 0) return 2;
+
     int prev_read = -1, pids[8], np = 0;
     for (int s = 0; s < ns; s++) {
-        char *argv[24]; int argc = 0;
-        for (char *p = stages[s]; *p && argc < 23; ) {
-            while (*p == ' ') p++;
-            if (!*p) break;
-            argv[argc++] = p;
-            while (*p && *p != ' ') p++;
-            if (*p) *p++ = 0;
-        }
-        argv[argc] = 0;
-        if (argc == 0) continue;
+        struct shell_stage *stage = &parsed[s];
 
         int pfd[2] = { -1, -1 };
         if (s < ns - 1) pipe(pfd);
         int pid = fork();
         if (pid == 0) {
+            char *argv[128];
+            int argc = expand_stage_globs(stage, argv, 128);
+            if (argc < 0) _exit(1);
             signal(SIGINT, SIG_DFL);            /* foreground child dies on Ctrl-C */
             if (prev_read >= 0) { dup2(prev_read, 0); close(prev_read); }
             if (pfd[1] >= 0) { dup2(pfd[1], 1); close(pfd[1]); close(pfd[0]); }
+            if (stage->input) {
+                int fd = open(stage->input, O_RDONLY);
+                if (fd < 0) { outs(2, "sh: cannot open "); outs(2, stage->input); outs(2, "\n"); _exit(1); }
+                dup2(fd, 0); close(fd);
+            }
+            if (stage->output) {
+                int flags = O_WRONLY | O_CREAT | (stage->append ? O_APPEND : O_TRUNC);
+                int fd = open(stage->output, flags, 0666);
+                if (fd < 0) { outs(2, "sh: cannot open "); outs(2, stage->output); outs(2, "\n"); _exit(1); }
+                dup2(fd, 1); close(fd);
+            }
             if (applet_fn(argv[0])) _exit(run_applet(argv[0], argc, argv));
             exec_command(argv);                 /* /abs, ./rel, or a bare name -> /NAME.BIN on the path */
             outs(2, argv[0]); outs(2, ": not found\n");
@@ -1046,6 +1798,30 @@ static int run_pipeline(char *cmd) {
     int result = 0;
     for (int i = 0; i < np; i++) { int st, w = wait(&st); if (w == pids[np - 1] && WIFEXITED(st)) result = WEXITSTATUS(st); }
     return result;
+}
+
+static int shell_io_selftest(void) {
+    static char write_file[] = "echo hello > /mbbio.txt";
+    static char append_file[] = "echo world >> /mbbio.txt";
+    static char input_file[] = "wc -w < /mbbio.txt > /mbbwc.txt";
+    static char pipe_file[] = "echo pipeline | wc -w > /mbbpipe.txt";
+    int ok = run_pipeline(write_file) == 0 && run_pipeline(append_file) == 0 &&
+             run_pipeline(input_file) == 0 && run_pipeline(pipe_file) == 0;
+    char buf[32];
+    int fd = ok ? open("/mbbio.txt", O_RDONLY) : -1;
+    int n = fd >= 0 ? read(fd, buf, sizeof buf) : -1;
+    if (fd >= 0) close(fd);
+    if (n != 12 || memcmp(buf, "hello\nworld\n", 12)) ok = 0;
+    fd = ok ? open("/mbbwc.txt", O_RDONLY) : -1;
+    n = fd >= 0 ? read(fd, buf, sizeof buf) : -1;
+    if (fd >= 0) close(fd);
+    if (n <= 0 || !memchr(buf, '2', n)) ok = 0;
+    fd = ok ? open("/mbbpipe.txt", O_RDONLY) : -1;
+    n = fd >= 0 ? read(fd, buf, sizeof buf) : -1;
+    if (fd >= 0) close(fd);
+    if (n <= 0 || !memchr(buf, '1', n)) ok = 0;
+    unlink("/mbbio.txt"); unlink("/mbbwc.txt"); unlink("/mbbpipe.txt");
+    return ok ? 0 : -1;
 }
 
 /* Run a line: split on ';', handle shell built-ins (cd/exit), else pipeline. */
@@ -1167,6 +1943,28 @@ static int net_sock_selftest(void) {
     return 0;
 }
 
+static int cp_selftest(void) {
+    int ok = mkdir("/cpt", 0755) == 0 && mkdir("/cpt/s", 0755) == 0 &&
+             mkdir("/cpt/s/d", 0755) == 0;
+    int fd = ok ? open("/cpt/s/a", O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
+    if (fd < 0 || write(fd, "alpha", 5) != 5) ok = 0;
+    if (fd >= 0) close(fd);
+    fd = ok ? open("/cpt/s/d/b", O_WRONLY | O_CREAT | O_TRUNC, 0666) : -1;
+    if (fd < 0 || write(fd, "beta", 4) != 4) ok = 0;
+    if (fd >= 0) close(fd);
+    if (ok && cp_tree("/cpt/s", "/cpt/o", 1) != 0) ok = 0;
+    char buf[8];
+    fd = ok ? open("/cpt/o/a", O_RDONLY) : -1;
+    if (fd < 0 || read(fd, buf, sizeof buf) != 5 || memcmp(buf, "alpha", 5)) ok = 0;
+    if (fd >= 0) close(fd);
+    fd = ok ? open("/cpt/o/d/b", O_RDONLY) : -1;
+    if (fd < 0 || read(fd, buf, sizeof buf) != 4 || memcmp(buf, "beta", 4)) ok = 0;
+    if (fd >= 0) close(fd);
+    unlink("/cpt/o/d/b"); rmdir("/cpt/o/d"); unlink("/cpt/o/a"); rmdir("/cpt/o");
+    unlink("/cpt/s/d/b"); rmdir("/cpt/s/d"); unlink("/cpt/s/a"); rmdir("/cpt/s"); rmdir("/cpt");
+    return ok ? 0 : -1;
+}
+
 int main(int argc, char **argv) {
     const char *ap = base(argv[0]);
     if (applet_fn(ap)) return run_applet(ap, argc, argv);        /* invoked by applet name */
@@ -1199,6 +1997,14 @@ int main(int argc, char **argv) {
                                       : "[tinygl-umd] 3D self-test FAILED\n");
         outs(1, net_sock_selftest() == 0 ? "[net-umd] socket loopback connect+data+close ok\n"
                                          : "[net-umd] socket self-test FAILED\n");
+        int cp_result = cp_selftest();
+        outs(1, cp_result == 0 ? "[mbb-cp] recursive directory copy ok\n"
+                       : "[mbb-cp] recursive directory copy FAILED\n");
+        if (cp_result != 0) ok = 0;
+        int shell_io_result = shell_io_selftest();
+        outs(1, shell_io_result == 0 ? "[mbb-sh] pipe + redirection operators ok\n"
+                         : "[mbb-sh] pipe + redirection operators FAILED\n");
+        if (shell_io_result != 0) ok = 0;
         return ok ? 0 : 1;
     }
     (void)ci_eq;

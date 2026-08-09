@@ -176,6 +176,54 @@ python /reversi.py
 Script files are preferred for multi-word expressions because the current
 TinyOS shell does not yet group quoted arguments.
 
+TinyOS also includes a standalone Bash-like scripting shell as `/BASH.BIN`.
+Launch it from the normal shell with `bash`, run the included example with
+`bash /hello.sh`, or execute a command string with `bash -c 'echo "$PWD"'`.
+It supports quoted strings, variables and positional parameters, functions,
+`if`/`elif`/`else`, `while`/`until`, `for`, `&&`/`||`, pipelines, redirection,
+pathname globbing (`*`, `?`, and bracket expressions), `test`, and `source`.
+It is an independent compact implementation rather than GNU Bash; command
+substitution, arithmetic expansion, arrays, and job control are not yet
+implemented.
+
+The default `mbb` shell supports pipelines, file redirection, quoting, and
+pathname globbing. Examples: `wc < hello.c`, `echo hello > hello_out.txt`,
+`echo again >> hello_out.txt`, `ls | wc`, `ls hello.c`, `ls *.c`, and
+`wc -l *.c`. Quoted patterns such as `"*.c"` remain literal. Pipeline stages
+may also invoke external binaries such as `ls | wc.o` when `/wc.o` is present.
+Both the default shell and the Bash-like shell provide `tree [path]` for a
+sorted recursive directory view. Use `tree -a` to include hidden entries,
+`tree -d` for directories only, or `tree -L N` to limit traversal depth.
+
+Run `reader FILE.txt` or `reader FILE.md` to open a fullscreen TinyGL document
+reader. Text is wrapped at a readable 2x font size; CommonMark/GFM headings,
+lists, tasks, quotes, rules, tables, links, inline tags, HTML presentation tags,
+and fenced or indented code receive distinct page styling. Markdown images may
+use relative paths; 8-bit non-interlaced PNG, uncompressed 24/32-bit BMP, and
+P3/P6 PPM files are decoded and scaled while preserving their aspect ratio.
+Reader decodes UTF-8 locally and transliterates common wide typography to the
+ASCII font (`—` to `--`, smart quotes to straight quotes, and `…` to `...`).
+Accented Latin and full-width ASCII are normalized; unsupported code points are
+shown explicitly as `[U+XXXX]` instead of disappearing. The system terminal and
+other TinyOS applications remain ASCII-only.
+Use Up/Down to scroll one visual line, Right or Space for the next page, Left
+or B for the previous page, `g`/`G` for the beginning/end, and Q or Esc to close.
+Try `reader /docs/lantern.txt` for a short book or
+`reader /docs/reader-showcase.md` for the bundled tag and image gallery.
+
+TinyOS includes the first playable `doom` milestone as `/DOOM.BIN`. It is a
+clean-room Doom-style raycaster, not the id Software Doom engine, and contains
+no copyrighted Doom assets. The current level has textured corridors, hostile
+enemies, hitscan combat, health and ammo pickups, an exit objective, and Intel
+HDA sound effects. Use W/S to move, A/D to strafe, the arrow keys to move and
+turn, Space to fire, R to restart, and Q or Esc to quit.
+
+Run `solitaire` for one-card Klondike Solitaire. Use the arrow keys to navigate
+the stock, waste, foundations, and tableau cards; Space or Enter selects and
+drops a card or run. Press A to move the exposed card to its foundation, N for
+a new deal, and Q or Esc to quit. Empty tableau piles accept Kings, hidden cards
+turn automatically, and the waste recycles when the stock is exhausted.
+
 The minimal build currently imports `builtins`, `os`, `sys`, `tgl`, and
 `taudio`; it intentionally omits most optional standard-library modules. See
 [`docs/MICROPYTHON.md`](docs/MICROPYTHON.md) for the complete build, packaging,
@@ -192,9 +240,11 @@ sudo dd if=tinyos-usb.img of=/dev/sdX bs=4M conv=fsync status=progress   # ERASE
 ```
 
 A physical PC has no virtio-blk/StorVSC, so TinyOS runs **live from a RAM disk**
-embedded in the loader (the mbb shell + coreutils, local `git`, standalone
-syntax-highlighting `vim`, Tetris/2048/Pac-Man/Sudoku/Snake/15-Puzzle/Reversi,
-MicroPython, the TinyGL demos, and an Intel HDA `audio` test). See
+embedded in the loader (the mbb shell + coreutils, Bash-like script shell,
+local `git`, standalone
+syntax-highlighting `vim`, Tetris/2048/Pac-Man/Doom/Sudoku/Snake/15-Puzzle/Reversi/Solitaire,
+the fullscreen text/Markdown `reader`, MicroPython, the TinyGL demos, and an
+Intel HDA `audio` test). See
 [`docs/AUDIO.md`](docs/AUDIO.md) for the game sound API. On machines with a
 **SATA (AHCI)** controller — e.g. the
 ThinkPad T440s — the internal disk is mounted read/write at **`/mnt`** and
@@ -210,7 +260,9 @@ Sign in as `root` / `root`. From the terminal, `./musl.bin`,
 reference; syntax highlighting is selected automatically for C/C++, Python,
 shell scripts, and Makefiles;
 `cp kr.c /usb/kr.c` copies a file out to the USB stick. Press **F5** to split
-the terminal into concurrent panes (**F4** to cycle focus), and **F3** (or close
+Use `cp -r source-folder destination-folder` to copy a directory and all of its
+subdirectories and files; `-R` and `-a` are accepted aliases. Press **F5** to
+split the terminal into concurrent panes (**F4** to cycle focus), and **F3** (or close
 the lid) to sleep.
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design.
 
