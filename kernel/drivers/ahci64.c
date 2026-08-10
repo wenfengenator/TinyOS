@@ -49,6 +49,7 @@ static void pci_wr(int bus, int dev, int fn, int off, uint32_t v) {
 #define P_TFD   0x20
 #define P_SIG   0x24
 #define P_SSTS  0x28
+#define P_SCTL  0x2C
 #define P_SERR  0x30
 #define P_CI    0x38
 #define CMD_ST  (1u << 0)
@@ -87,6 +88,9 @@ static int      g_port = -1;
 static uint64_t g_nsect;
 static struct cmd_hdr *g_clb;         /* command list (32 headers)     */
 static struct cmd_tbl *g_ctbl;        /* one command table (slot 0)    */
+static uint8_t *g_fis;
+static uint16_t *g_ident;
+static int g_bus = -1, g_dev, g_fn;
 
 static inline uint32_t hr(uint32_t o)            { return g_abar[o >> 2]; }
 static inline void     hw(uint32_t o, uint32_t v){ g_abar[o >> 2] = v; }
@@ -137,15 +141,17 @@ static int ahci_cmd(uint8_t cmd, uint64_t lba, uint16_t count, void *buf, int wr
     struct cmd_hdr *h = &g_clb[0];
     h->cfl_flags = (uint8_t)((sizeof(struct fis_h2d) / 4) | (write ? 0x40 : 0));
     h->pmp = 0;
-    h->prdtl = 1;
+    h->prdtl = count ? 1 : 0;
     h->prdbc = 0;
     uint64_t tpa = (uint64_t)(uintptr_t)g_ctbl;
     h->ctba = (uint32_t)tpa; h->ctbau = (uint32_t)(tpa >> 32);
 
     for (unsigned i = 0; i < sizeof(*g_ctbl); i++) ((uint8_t *)g_ctbl)[i] = 0;
-    g_ctbl->prdt[0].dba  = (uint32_t)bpa;
-    g_ctbl->prdt[0].dbau = (uint32_t)(bpa >> 32);
-    g_ctbl->prdt[0].dbc  = (bytes ? bytes - 1 : 0);                 /* byte count - 1 */
+    if (count) {
+        g_ctbl->prdt[0].dba  = (uint32_t)bpa;
+        g_ctbl->prdt[0].dbau = (uint32_t)(bpa >> 32);
+        g_ctbl->prdt[0].dbc  = bytes - 1;                           /* byte count - 1 */
+    }
 
     struct fis_h2d *f = (struct fis_h2d *)g_ctbl->cfis;
     f->fis_type = 0x27;                                             /* H2D register FIS */
@@ -206,23 +212,52 @@ static int bringup(int bus, int dev, int fn) {
     if (!dma) { g_port = -1; return 0; }
     for (int i = 0; i < 4096; i++) dma[i] = 0;
     g_clb  = (struct cmd_hdr *)(dma + 0);                           /* 1 KiB, 1 KiB-aligned */
-    uint8_t *fis = dma + 1024;                                     /* 256 B, 256-aligned    */
+    g_fis = dma + 1024;                                            /* 256 B, 256-aligned    */
     g_ctbl = (struct cmd_tbl *)(dma + 1280);                       /* 128-aligned           */
-    uint64_t clbpa = (uint64_t)(uintptr_t)g_clb, fispa = (uint64_t)(uintptr_t)fis;
+    uint64_t clbpa = (uint64_t)(uintptr_t)g_clb, fispa = (uint64_t)(uintptr_t)g_fis;
     pw(P_CLB, (uint32_t)clbpa); pw(P_CLBU, (uint32_t)(clbpa >> 32));
     pw(P_FB,  (uint32_t)fispa); pw(P_FBU,  (uint32_t)(fispa >> 32));
     pw(P_SERR, ~0u); pw(P_IS, ~0u);
     port_start();
 
-    uint16_t *id = (uint16_t *)page_alloc(1);                       /* IDENTIFY -> sector count */
-    if (id && ahci_cmd(0xEC, 0, 1, id, 0) == 0) {
-        g_nsect = (uint64_t)id[100] | ((uint64_t)id[101] << 16) |
-                  ((uint64_t)id[102] << 32) | ((uint64_t)id[103] << 48);
-        if (!g_nsect) g_nsect = (uint32_t)id[60] | ((uint32_t)id[61] << 16);
+    g_ident = (uint16_t *)page_alloc(1);                            /* IDENTIFY -> sector count */
+    if (g_ident && ahci_cmd(0xEC, 0, 1, g_ident, 0) == 0) {
+        g_nsect = (uint64_t)g_ident[100] | ((uint64_t)g_ident[101] << 16) |
+                  ((uint64_t)g_ident[102] << 32) | ((uint64_t)g_ident[103] << 48);
+        if (!g_nsect) g_nsect = (uint32_t)g_ident[60] | ((uint32_t)g_ident[61] << 16);
     }
     kputs("[ahci] SATA disk sectors="); kput_u64hex(g_nsect);
     kputs(" ("); kput_u32dec((uint32_t)(g_nsect / 2048)); kputs(" MB)\n");
+    g_bus = bus; g_dev = dev; g_fn = fn;
     return 1;
+}
+
+int ahci_suspend(void) {
+    if (g_port < 0) return 0;
+    if (ahci_cmd(0xEA, 0, 0, 0, 0) != 0) return -1;                /* FLUSH CACHE EXT */
+    uint64_t deadline = millis() + 1000;
+    while (pr(P_CI) && millis() < deadline) __asm__ volatile("pause");
+    if (pr(P_CI)) return -2;
+    pw(P_IE, 0);
+    port_stop();
+    return (pr(P_CMD) & (CMD_CR | CMD_FR)) ? -3 : 0;
+}
+
+int ahci_resume(void) {
+    if (g_port < 0) return 0;
+    if (g_bus < 0 || !g_clb || !g_fis || !g_ctbl) return -1;
+    pci_wr(g_bus, g_dev, g_fn, 0x04, pci_rd(g_bus, g_dev, g_fn, 0x04) | 0x6);
+    hw(HBA_GHC, hr(HBA_GHC) | GHC_AE);
+    if ((pr(P_SSTS) & 0x0F) != 3) {
+        pw(P_SCTL, (pr(P_SCTL) & ~0x0Fu) | 1u); sleep_ms(2);
+        pw(P_SCTL, pr(P_SCTL) & ~0x0Fu); sleep_ms(20);              /* COMRESET */
+    }
+    uint64_t clbpa = (uint64_t)(uintptr_t)g_clb, fispa = (uint64_t)(uintptr_t)g_fis;
+    pw(P_CLB, (uint32_t)clbpa); pw(P_CLBU, (uint32_t)(clbpa >> 32));
+    pw(P_FB, (uint32_t)fispa); pw(P_FBU, (uint32_t)(fispa >> 32));
+    pw(P_SERR, ~0u); pw(P_IS, ~0u); pw(P_IE, 0);
+    port_start();
+    return g_ident && ahci_cmd(0xEC, 0, 1, g_ident, 0) == 0 ? 0 : -2;
 }
 
 int ahci_init(void) {

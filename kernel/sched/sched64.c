@@ -272,6 +272,13 @@ static void lapic_timer_start(void) {
  * so it never fires while a ring-3 program is executing. */
 int  lapic_ready(void)      { return g_per_tick != 0; }
 void lapic_idle_arm(void)   { if (g_per_tick) { lw(LAPIC_LVT_TIMER, LVT_PERIODIC | TIMER_VEC); lw(LAPIC_TIMER_ICR, g_per_tick); } }
+void lapic_suspend_arm(void) {
+    if (!g_per_tick) return;
+    uint64_t count = (uint64_t)g_per_tick * 100u;        /* calibrated 10 ms tick -> ~1 second */
+    if (count > 0xFFFFFFFFu) count = 0xFFFFFFFFu;
+    lw(LAPIC_LVT_TIMER, LVT_PERIODIC | TIMER_VEC);
+    lw(LAPIC_TIMER_ICR, (uint32_t)count);
+}
 void lapic_idle_disarm(void){ lw(LAPIC_LVT_TIMER, LVT_MASKED | TIMER_VEC); lw(LAPIC_TIMER_ICR, 0); }
 
 void sched_init(void) {
@@ -297,6 +304,23 @@ void sched_stop(void)  {
     lw(LAPIC_LVT_TIMER, LVT_MASKED | TIMER_VEC);
     lw(LAPIC_TIMER_ICR, 0);
     vmbus_synic_set_masked(0);                     /* restore the VMBus message interrupt */
+}
+
+void sched_s3_resume(int was_running) {
+    uint64_t base = smp_lapic_base();
+    g_lapic = (volatile uint8_t *)(uintptr_t)(base ? base : 0xFEE00000ull);
+    outb(0x21, 0xFF); outb(0xA1, 0xFF);
+    lw(LAPIC_SVR, 0x100 | SPURIOUS_VEC);
+    arch_set_irq_gate(TIMER_VEC, timer_isr_addr());
+    arch_set_irq_gate(SPURIOUS_VEC, spurious_isr_addr());
+    if (g_tasks[g_cur].is_user) {
+        arch_set_tss_rsp0(g_tasks[g_cur].rsp0);
+        arch_set_syscall_stack(g_tasks[g_cur].rsp0);
+    }
+    if (g_tasks[g_cur].proc) arch_switch_current(g_tasks[g_cur].proc);
+    g_sched_running = 0;
+    if (was_running) sched_start();
+    else { lw(LAPIC_LVT_TIMER, LVT_MASKED | TIMER_VEC); lw(LAPIC_TIMER_ICR, 0); }
 }
 
 /* ---- the `sched` console demo ---- */

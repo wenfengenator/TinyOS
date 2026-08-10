@@ -7,6 +7,7 @@
  * mirrored to both, so the boot can be verified headlessly over serial while a
  * VM/monitor shows the same output on screen. */
 #include "boot64.h"
+#include "arch64.h"
 #include "font8x16.h"
 
 /* Freestanding memcpy/memset so the compiler always has a real symbol to call
@@ -16,6 +17,18 @@ void *memset(void *d, int c, unsigned long n) {
 }
 void *memcpy(void *d, const void *s, unsigned long n) {
     unsigned char *a = d; const unsigned char *b = s; while (n--) *a++ = *b++; return d;
+}
+void *memmove(void *d, const void *s, unsigned long n) {
+    unsigned char *dst = d; const unsigned char *src = s;
+    if (dst < src) for (unsigned long i = 0; i < n; i++) dst[i] = src[i];
+    else if (dst > src) while (n) { n--; dst[n] = src[n]; }
+    return d;
+}
+int memcmp(const void *a, const void *b, unsigned long n) {
+    const unsigned char *left = a, *right = b;
+    for (unsigned long i = 0; i < n; i++)
+        if (left[i] != right[i]) return left[i] < right[i] ? -1 : 1;
+    return 0;
 }
 
 /* ---- COM1 serial ---- */
@@ -45,18 +58,35 @@ static void serial_putc(char c) {
 /* ---- framebuffer state ---- */
 static volatile uint32_t *g_fb;         /* 0 until fb_init(): serial-only before */
 static uint32_t g_w, g_h, g_pitch, g_fmt;
+static uint64_t g_fb_size;
 static uint32_t g_cx, g_cy;             /* text cursor (glyph cells)             */
 static uint32_t g_fg = 0xC0C0C0;        /* light grey on dark blue               */
 static uint32_t g_bg = 0x001020;
 
-/* Haswell Intel display PWM registers.  Save and restore both CPU and PCH
- * controls because firmware may route the internal panel through either path.
- * Other GPUs and VMs are left untouched. */
-#define BLC_PWM_CPU_CTL  0x48254
-#define BLC_PWM_PCH_CTL2 0xC8254
+/* Haswell Intel display backlight + panel-power registers (IGD MMIO BAR, PCH
+ * south-display block).  A real S3 resets the display engine, clearing the PWM
+ * *enable* bits (in CTL1 / CPU_CTL2) and the panel-power sequencer, so restoring
+ * only the duty/frequency leaves the panel dark.  Other GPUs and VMs untouched. */
+#define BLC_PWM_CPU_CTL2  0x48250      /* CPU PWM enable (bit 31)              */
+#define BLC_PWM_CPU_CTL   0x48254      /* CPU PWM duty                        */
+#define BLC_PWM_PCH_CTL1  0xC8250      /* PCH PWM enable (bit 31)             */
+#define BLC_PWM_PCH_CTL2  0xC8254      /* PCH PWM frequency + duty            */
+#define PCH_PP_STATUS     0xC7200      /* bit 31 = panel powered on           */
+#define PCH_PP_CONTROL    0xC7204      /* power/BLC bits + 0xABCD key in [31:16] */
+#define PCH_PP_ON_DELAYS  0xC7208
+#define PCH_PP_OFF_DELAYS 0xC720C
+#define PCH_PP_DIVISOR    0xC7210
+#define PP_UNLOCK_MASK    0xFFFF0000u
+#define PP_UNLOCK_KEY     0xABCD0000u
+#define PP_POWER_ON       (1u << 0)
+#define PP_POWER_RESET    (1u << 1)
+#define PP_BLC_ENABLE     (1u << 2)
+#define PWM_ENABLE        (1u << 31)
 static volatile uint8_t *g_igd;
-static uint32_t g_cpu_ctl, g_pch_ctl2;
+static uint32_t g_cpu_ctl, g_pch_ctl2;   /* deep-S0 backlight blank (fb_panel_power) */
 static int g_panel_saved, g_panel_off;
+static uint32_t g_s3_pp[8];              /* full backlight+PPS snapshot for S3 resume */
+static int g_s3_pp_saved;
 
 static uint32_t pci_read(int bus, int dev, int fn, int off) {
     uint32_t addr = 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)dev << 11) |
@@ -106,6 +136,20 @@ void fb_panel_power(int on) {
     }
 }
 
+void fb_s3_suspend(void) {
+    panel_probe();
+    if (!g_igd) return;
+    g_s3_pp[0] = igd_read(BLC_PWM_CPU_CTL2);
+    g_s3_pp[1] = igd_read(BLC_PWM_CPU_CTL);
+    g_s3_pp[2] = igd_read(BLC_PWM_PCH_CTL1);
+    g_s3_pp[3] = igd_read(BLC_PWM_PCH_CTL2);
+    g_s3_pp[4] = igd_read(PCH_PP_CONTROL);
+    g_s3_pp[5] = igd_read(PCH_PP_ON_DELAYS);
+    g_s3_pp[6] = igd_read(PCH_PP_OFF_DELAYS);
+    g_s3_pp[7] = igd_read(PCH_PP_DIVISOR);
+    g_s3_pp_saved = 1;
+}
+
 /* Pack an 0xRRGGBB colour for the firmware's pixel layout.  pixel_format gives
  * the in-memory byte order; as a little-endian dword that is:
  *   fmt 0 (RGBX): byte0=R byte1=G byte2=B  ->  dword = B<<16 | G<<8 | R
@@ -125,8 +169,64 @@ void fb_init(const boot_info_t *bi) {
     g_h     = bi->height;
     g_pitch = bi->pitch_px ? bi->pitch_px : bi->width;
     g_fmt   = bi->pixel_format;
+    g_fb_size = bi->fb_size;
     g_cx = g_cy = 0;
     fb_fill(g_bg);
+}
+/* Dump key Haswell display-engine registers as "NAME=0xVAL " pairs.  Diagnostic
+ * only: a pre-S3 vs post-resume diff (written to /mnt/S3TRACE.TXT) reveals exactly
+ * which pipe/plane/PLL/DDI registers the resume reset cleared, so the scanout
+ * restore can be targeted instead of guessed. */
+int fb_igd_dump(char *buf, int max) {
+    static const uint32_t off[] = {
+        0x70180, 0x7019C, 0x70188, 0x70008, 0x7001C, 0x6F400, 0x64000,
+        0x130040, 0x46020, 0x46100, 0x45400, 0x45404,
+        0xC7200, 0xC7204, 0xC8250, 0xC8254, 0x48250, 0x48254,
+    };
+    static const char *const nm[] = {
+        "DSPCNTR", "DSPSURF", "DSPSTRD", "PIPECONF", "PIPESRC", "TRDDI", "DDIBUF",
+        "LCPLL", "SPLL", "PORTCLK", "PWRWELL", "PWRWDRV",
+        "PPSTS", "PPCTL", "PCHPWM1", "PCHPWM2", "CPUPWM2", "CPUPWM",
+    };
+    panel_probe();
+    int p = 0;
+    if (!g_igd || max < 24) { if (max > 0) buf[0] = 0; return 0; }
+    for (unsigned i = 0; i < sizeof(off) / sizeof(off[0]) && p < max - 22; i++) {
+        uint32_t v = igd_read(off[i]);
+        for (const char *s = nm[i]; *s; s++) buf[p++] = *s;
+        buf[p++] = '='; buf[p++] = '0'; buf[p++] = 'x';
+        for (int sh = 28; sh >= 0; sh -= 4) buf[p++] = "0123456789ABCDEF"[(v >> sh) & 0xF];
+        buf[p++] = ' ';
+    }
+    buf[p] = 0;
+    return p;
+}
+
+static char g_igd_post[420];
+const char *fb_igd_post_dump(void) { return g_igd_post; }
+
+void fb_s3_resume(void) {
+    panel_probe();
+    fb_igd_dump(g_igd_post, sizeof g_igd_post);   /* raw post-reset snapshot before we touch anything */
+    if (g_igd && g_s3_pp_saved) {
+        igd_write(PCH_PP_ON_DELAYS, g_s3_pp[5]);
+        igd_write(PCH_PP_OFF_DELAYS, g_s3_pp[6]);
+        igd_write(PCH_PP_DIVISOR, g_s3_pp[7]);
+        /* Power the panel back on; PP_CONTROL drops writes without the unlock key. */
+        uint32_t pp = (g_s3_pp[4] & ~PP_UNLOCK_MASK) | PP_UNLOCK_KEY | PP_POWER_ON | PP_POWER_RESET;
+        igd_write(PCH_PP_CONTROL, pp);
+        for (int i = 0; i < 2000000 && !(igd_read(PCH_PP_STATUS) & (1u << 31)); i++)
+            __asm__ volatile("pause");
+        /* Re-enable the backlight PWM: the enable bits live in CTL1/CPU_CTL2, which
+         * the reset cleared and the old duty-only restore never rewrote. */
+        igd_write(BLC_PWM_PCH_CTL2, g_s3_pp[3]);
+        igd_write(BLC_PWM_PCH_CTL1, g_s3_pp[2] | PWM_ENABLE);
+        igd_write(BLC_PWM_CPU_CTL, g_s3_pp[1]);
+        igd_write(BLC_PWM_CPU_CTL2, g_s3_pp[0]);
+        igd_write(PCH_PP_CONTROL, pp | PP_BLC_ENABLE);
+        g_panel_off = 0;
+    }
+    disp_present_full();
 }
 void fb_fill(uint32_t rgb) {
     uint32_t px = pack(rgb);

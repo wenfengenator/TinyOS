@@ -262,6 +262,11 @@ void arch_load_cpu_tables(void) {
     __asm__ volatile("lidt %0" :: "m"(g_idtr));
 }
 
+static int g_deep_cstate = 1;
+static uint32_t g_mwait_hint;
+static int g_mwait_ok;
+static void deep_idle_init(void);
+
 void arch_init(void) {
     enable_sse();    { uint64_t cr4; __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
       kputs("[arch] sse on cr4="); kput_u64hex(cr4); kputc('\n'); }
@@ -292,6 +297,9 @@ void arch_init(void) {
     kputs("[arch] gdt + tss + idt installed (ring 0/3 ready)\n");
 
     arch_apic_force_xapic();
+    deep_idle_init();
+    kputs("[power] CPU idle C"); kput_u32dec((uint32_t)g_deep_cstate);
+    kputs(g_mwait_ok ? " via MWAIT\n" : " via HLT\n");
 }
 
 /* Normalize the local APIC into xAPIC (MMIO) mode.  Real Haswell/Broadwell UEFI
@@ -320,6 +328,32 @@ void arch_apic_force_xapic(void) {
         kputs("[apic] enabled xAPIC; IA32_APIC_BASE=");
         kput_u64hex(rd_msr(0x1B)); kputc('\n');
     }                                                      /* already xAPIC: leave as-is */
+}
+
+/* Select the deepest MONITOR/MWAIT C-state advertised by this CPU.  Haswell
+ * exposes package-capable C6/C7 substates here; virtual CPUs commonly expose no
+ * MWAIT and safely retain the HLT fallback.  Hint encoding is C1=0x00,
+ * C2=0x10, ... C7=0x60. */
+static void deep_idle_init(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    if (!(c & (1u << 3))) return;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(5), "c"(0));
+    for (int state = 7; state >= 1; state--) {
+        if ((d >> (state * 4)) & 0xFu) {
+            g_deep_cstate = state;
+            g_mwait_hint = (uint32_t)(state - 1) << 4;
+            break;
+        }
+    }
+    g_mwait_ok = 1;
+}
+int arch_cpu_deep_state(void) { return g_deep_cstate; }
+void arch_cpu_deep_idle(volatile int *condition, int expected) {
+    if (!g_mwait_ok) { __asm__ volatile("sti; hlt; cli" ::: "memory"); return; }
+    __asm__ volatile("monitor" :: "a"(condition), "c"(0), "d"(0) : "memory");
+    if (*condition != expected) return;
+    __asm__ volatile("sti; mwait; cli" :: "a"(g_mwait_hint), "c"(0) : "memory");
 }
 
 /* Install an interrupt gate at runtime.  The IDT is already loaded (arch_init),
@@ -2784,6 +2818,7 @@ void arch_user_init(void) {
     }
     else                  kputs("[fs] fat16 mount failed\n");
 
+#if RUN_BOOT_SELFTESTS
     void *pf_a = page_alloc(1); page_free(pf_a, 1);
     void *pf_b = page_alloc(1);
     kputs(pf_b == pf_a ? "[pagefree] page free-list reuse OK\n" : "[pagefree] page free-list reuse FAIL\n");
@@ -2857,6 +2892,7 @@ void arch_user_init(void) {
     sched_test_run(0);
     arch_proc_test(0);
     arch_procsched_test();
+#endif
 }
 
 /* ---- Phase B: preemptive user-process scheduling (self-test) ----------------

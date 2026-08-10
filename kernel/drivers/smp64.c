@@ -19,6 +19,10 @@ static volatile int g_online = 1;          /* BSP counts itself */
 static int          g_cpu_count = 1;
 static uint8_t      g_apic_ids[256];
 static volatile uint64_t g_lapic = 0xFEE00000ull;
+static volatile int g_ap_park = 1;
+static volatile int g_s3_park_request;
+static volatile int g_s3_parked;
+static void *g_ap_stacks;
 
 /* ---- local APIC MMIO ---- */
 static inline void     lapic_w(uint32_t reg, uint32_t v) { *(volatile uint32_t *)(uintptr_t)(g_lapic + reg) = v; }
@@ -75,7 +79,15 @@ void ap_entry(void) {
     kputs("[smp] AP online: APIC id "); kput_u32dec(id);
     kputs("  ("); kput_u32dec((uint32_t)g_online); kputs(" cores up)\n");
     spin_unlock(&g_console_lock);
-    for (;;) __asm__ volatile("hlt");             /* park (no SMP scheduler yet) */
+    int s3_ack = 0;
+    for (;;) {
+        if (g_s3_park_request) {
+            if (!s3_ack) { __sync_fetch_and_add(&g_s3_parked, 1); s3_ack = 1; }
+            while (g_s3_park_request) __asm__ volatile("pause");
+            s3_ack = 0;
+        }
+        arch_cpu_deep_idle(&g_ap_park, 1);         /* deep park (no SMP scheduler yet) */
+    }
 }
 
 /* ---- send INIT-SIPI-SIPI to one AP ---- */
@@ -107,11 +119,11 @@ void smp_init(boot_info_t *bi) {
     volatile uint8_t *dst = (volatile uint8_t *)0x8000;
     for (unsigned i = 0; i < sizeof(ap_tramp); i++) dst[i] = ap_tramp[i];
 
-    void *stacks = kmalloc((uint64_t)g_cpu_count * 0x4000);   /* 16 KiB per AP */
+    g_ap_stacks = kmalloc((uint64_t)g_cpu_count * 0x4000);    /* 16 KiB per AP */
     volatile uint64_t *p = (volatile uint64_t *)0x9000;
     p[0] = read_cr3();                            /* CR3 (PML4) */
     p[1] = (uint64_t)(uintptr_t)&ap_entry;        /* AP entry   */
-    p[2] = (uint64_t)(uintptr_t)stacks;           /* stack base */
+    p[2] = (uint64_t)(uintptr_t)g_ap_stacks;      /* stack base */
     p[3] = 0;                                     /* AP index   */
 
     uint32_t vector = 0x8000 >> 12;               /* SIPI vector -> 0x8000 */
@@ -125,4 +137,38 @@ void smp_init(boot_info_t *bi) {
     kputs("[smp] "); kput_u32dec((uint32_t)g_online);
     kputs(" / ");    kput_u32dec((uint32_t)g_cpu_count); kputs(" cores online\n");
     spin_unlock(&g_console_lock);
+}
+
+int smp_s3_quiesce(void) {
+    if (g_online <= 1) return 0;
+    g_s3_parked = 0;
+    g_s3_park_request = 1;
+    g_ap_park = 0;                                /* wake AP MONITOR/MWAIT loops */
+    uint64_t deadline = millis() + 500;
+    while (g_s3_parked < g_online - 1 && millis() < deadline) __asm__ volatile("pause");
+    if (g_s3_parked == g_online - 1) return 0;
+    g_s3_park_request = 0; g_ap_park = 1;
+    return -1;
+}
+
+void smp_s3_abort(void) {
+    g_s3_park_request = 0;
+    g_ap_park = 1;
+}
+
+int smp_s3_restart(void) {
+    if (g_cpu_count <= 1) { g_online = 1; smp_s3_abort(); return 0; }
+    if (!g_ap_stacks) return -1;
+    g_s3_park_request = 0; g_s3_parked = 0; g_ap_park = 1; g_online = 1;
+    volatile uint8_t *dst = (volatile uint8_t *)0x8000;
+    for (unsigned i = 0; i < sizeof(ap_tramp); i++) dst[i] = ap_tramp[i];
+    volatile uint64_t *p = (volatile uint64_t *)0x9000;
+    p[0] = read_cr3(); p[1] = (uint64_t)(uintptr_t)&ap_entry;
+    p[2] = (uint64_t)(uintptr_t)g_ap_stacks; p[3] = 0;
+    uint32_t bsp = lapic_id(), vector = 0x8000 >> 12;
+    for (int i = 0; i < g_cpu_count; i++)
+        if (g_apic_ids[i] != bsp) start_ap(g_apic_ids[i], vector);
+    uint64_t deadline = millis() + 500;
+    while (g_online < g_cpu_count && millis() < deadline) __asm__ volatile("pause");
+    return g_online == g_cpu_count ? 0 : -1;
 }

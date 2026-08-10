@@ -85,17 +85,27 @@ VIRTIO_NET := -netdev user,id=net0,hostfwd=tcp::8080-:80 \
 EFI_CFLAGS  := -m64 -ffreestanding -fshort-wchar -mno-red-zone -fno-stack-protector \
                -fPIC -fvisibility=hidden -fno-ident -fno-builtin -fno-asynchronous-unwind-tables \
                -mno-sse -mno-mmx -O2 $(CWARN) -Ikernel/include -I$(BUILD)
+UACPI_CFLAGS := $(filter-out -fPIC,$(EFI_CFLAGS)) -fPIE \
+	-include kernel/include/uacpi_visibility.h -Ithird_party/uacpi/include
 EFI_LDFLAGS := -mi386pep -e efi_main --subsystem=10 --image-base 0x100000 \
                -nostdlib --strip-all
 
+UACPI_NAMES := tables types uacpi utilities interpreter opcodes namespace stdlib \
+			   shareable opregion default_handlers io notify sleep registers \
+			   resources event mutex osi
+UACPI_OBJS := $(patsubst %,$(BUILD)/uacpi_%.o,$(UACPI_NAMES))
+UACPI_HDRS := $(wildcard third_party/uacpi/include/uacpi/*.h \
+						 third_party/uacpi/include/uacpi/internal/*.h \
+						 third_party/uacpi/include/uacpi/platform/*.h)
+
 # x64 kernel objects linked into the single PE32+ EFI application.
 EFI_HDRS := kernel/include/boot64.h kernel/include/font8x8.h kernel/include/wm64.h kernel/include/arch64.h kernel/include/fat64.h kernel/include/proc64.h kernel/include/tinygl.h
-EFI_OBJS := $(BUILD)/efi_main.o $(BUILD)/entry64.o \
+EFI_OBJS := $(BUILD)/efi_main.o $(BUILD)/entry64.o $(BUILD)/s3_context.o \
             $(BUILD)/kmain64.o $(BUILD)/fb64.o $(BUILD)/mm64.o \
             $(BUILD)/time64.o $(BUILD)/kbd64.o $(BUILD)/demo64.o $(BUILD)/pong64.o \
             $(BUILD)/smp64.o $(BUILD)/vmbus64.o \
             $(BUILD)/disp64.o $(BUILD)/wm64.o $(BUILD)/term64.o $(BUILD)/login64.o \
-			$(BUILD)/acpi64.o $(BUILD)/ahci64.o $(BUILD)/hda64.o $(BUILD)/esp64.o $(BUILD)/install64.o $(BUILD)/datavol64.o $(BUILD)/usb64.o \
+			$(BUILD)/acpi64.o $(BUILD)/uacpi64.o $(UACPI_OBJS) $(BUILD)/ahci64.o $(BUILD)/hda64.o $(BUILD)/esp64.o $(BUILD)/install64.o $(BUILD)/datavol64.o $(BUILD)/usb64.o \
             $(BUILD)/tinygl64.o $(BUILD)/tgl3d64.o $(BUILD)/tglcomp64.o $(BUILD)/tglbo64.o \
             $(BUILD)/arch64.o $(BUILD)/trap64.o $(BUILD)/fat64.o $(BUILD)/sched64.o $(BUILD)/sched_test64.o $(BUILD)/vblk64.o $(BUILD)/storvsc64.o $(BUILD)/vnet64.o $(BUILD)/net64.o $(BUILD)/tcp64.o $(BUILD)/netvsc64.o
 
@@ -230,7 +240,13 @@ $(BUILD)/efi_main.o: boot/efi_main.c $(EFI_HDRS) | $(BUILD)
 	$(CC) $(EFI_CFLAGS) -c -o $@ $<
 $(BUILD)/%64.o: %64.c $(EFI_HDRS) | $(BUILD)
 	$(CC) $(EFI_CFLAGS) -c -o $@ $<
+$(BUILD)/uacpi64.o: kernel/drivers/uacpi64.c $(EFI_HDRS) $(UACPI_HDRS) | $(BUILD)
+	$(CC) $(UACPI_CFLAGS) -c -o $@ $<
+$(BUILD)/uacpi_%.o: third_party/uacpi/source/%.c $(UACPI_HDRS) | $(BUILD)
+	$(CC) $(UACPI_CFLAGS) -c -o $@ $<
 $(BUILD)/entry64.o: entry64.s | $(BUILD)
+	$(AS) --64 -o $@ $<
+$(BUILD)/s3_context.o: s3_context.s | $(BUILD)
 	$(AS) --64 -o $@ $<
 
 # AP startup trampoline: real->protected->long mode, linked flat at 0x8000 and
@@ -243,6 +259,15 @@ $(BUILD)/ap_trampoline.bin: ap_trampoline.s | $(BUILD)
 $(BUILD)/ap_tramp_array.h: $(BUILD)/ap_trampoline.bin | $(BUILD)
 	$(PYTHON) -c "d=open('$(BUILD)/ap_trampoline.bin','rb').read(); open('$(BUILD)/ap_tramp_array.h','w').write('static const unsigned char ap_tramp[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
 $(BUILD)/smp64.o: $(BUILD)/ap_tramp_array.h
+
+# ACPI S3 wake trampoline: firmware enters physical 0x7000 in real mode.
+$(BUILD)/s3_trampoline.bin: s3_trampoline.s | $(BUILD)
+	$(AS) --64 -o $(BUILD)/s3_tramp_pre.o $<
+	$(LD) -m elf_x86_64 -Ttext=0x7000 -e _s3_start -nostdlib -o $(BUILD)/s3_tramp.elf $(BUILD)/s3_tramp_pre.o
+	$(OBJCOPY) -O binary $(BUILD)/s3_tramp.elf $@
+$(BUILD)/s3_tramp_array.h: $(BUILD)/s3_trampoline.bin | $(BUILD)
+	$(PYTHON) -c "d=open('$(BUILD)/s3_trampoline.bin','rb').read(); open('$(BUILD)/s3_tramp_array.h','w').write('static const unsigned char s3_tramp[%d]={%s};\n'%(len(d),','.join(str(b) for b in d)))"
+$(BUILD)/acpi64.o: $(BUILD)/s3_tramp_array.h
 
 # ring-0/ring-3 plumbing (trap64.s)
 $(BUILD)/trap64.o: trap64.s | $(BUILD)
@@ -375,6 +400,9 @@ $(BUILD)/fat64.o: $(BUILD)/fatfs.h
 $(BUILD)/BOOTX64.EFI: $(EFI_OBJS)
 	$(LD) $(EFI_LDFLAGS) -o $@ $(EFI_OBJS)
 	@file $@
+
+$(BUILD)/BOOTX64.sym.efi: $(EFI_OBJS)
+	$(LD) $(filter-out --strip-all,$(EFI_LDFLAGS)) -o $@ $(EFI_OBJS)
 
 bootx64: $(BUILD)/BOOTX64.EFI
 

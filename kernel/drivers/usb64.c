@@ -144,6 +144,9 @@ static int       g_dci_in, g_dci_out;        /* bulk endpoint DCIs         */
 static uint8_t  *g_small;                    /* CBW/CSW/descriptor DMA buf */
 static uint8_t  *g_bounce;                   /* 64KB-aligned data DMA buf  */
 static uint32_t  g_tag = 1;
+static volatile uint32_t *g_erst;
+static volatile uint64_t *g_scratch_array;
+static int g_pci_bus = -1, g_pci_dev, g_pci_fn;
 
 /* context field helpers (byte offsets into a context array) */
 static volatile uint32_t *cx(volatile uint32_t *base, int index) {
@@ -437,6 +440,7 @@ static void intel_port_switchover(int bus, int dev, int fn) {
 }
 
 static int bringup(int bus, int dev, int fn) {
+    g_pci_bus = bus; g_pci_dev = dev; g_pci_fn = fn;
     pci_wr(bus, dev, fn, 0x04, pci_rd(bus, dev, fn, 0x04) | 0x6);   /* mem space + bus master */
     intel_port_switchover(bus, dev, fn);
     uint32_t bar0 = pci_rd(bus, dev, fn, 0x10);
@@ -480,37 +484,44 @@ static int bringup(int bus, int dev, int fn) {
     wr32(g_op, O_CONFIG, g_maxslots);
 
     /* DCBAA (+ scratchpad) */
-    g_dcbaa = (volatile uint32_t *)page_alloc(1);
-    if (scratch) {
-        volatile uint64_t *sp = (volatile uint64_t *)page_alloc(1);
-        for (uint32_t i = 0; i < scratch; i++) sp[i] = (uint64_t)(uintptr_t)page_alloc(1);
-        ((volatile uint64_t *)g_dcbaa)[0] = (uint64_t)(uintptr_t)sp;
+    if (!g_dcbaa) g_dcbaa = (volatile uint32_t *)page_alloc(1);
+    if (scratch && !g_scratch_array) {
+        g_scratch_array = (volatile uint64_t *)page_alloc(1);
+        for (uint32_t i = 0; i < scratch; i++) g_scratch_array[i] = (uint64_t)(uintptr_t)page_alloc(1);
     }
+    for (uint32_t i = 2; i < 1024; i++) g_dcbaa[i] = 0;
+    ((volatile uint64_t *)g_dcbaa)[0] = (uint64_t)(uintptr_t)g_scratch_array;
     wr64(g_op, O_DCBAAP, (uint64_t)(uintptr_t)g_dcbaa);
 
     /* command ring */
-    ring_init(&g_cmd, (volatile uint32_t *)page_alloc(1));
+    if (!g_cmd.trb) g_cmd.trb = (volatile uint32_t *)page_alloc(1);
+    ring_init(&g_cmd, g_cmd.trb);
     wr64(g_op, O_CRCR, g_cmd.pa | 1u);                          /* RCS = 1 */
 
     /* event ring (single segment) + ERST */
-    g_ering = (volatile uint32_t *)page_alloc(1);
+    if (!g_ering) g_ering = (volatile uint32_t *)page_alloc(1);
+    memset((void *)g_ering, 0, 4096);
     g_edeq = 0; g_ecycle = 1;
-    volatile uint32_t *erst = (volatile uint32_t *)page_alloc(1);
+    if (!g_erst) g_erst = (volatile uint32_t *)page_alloc(1);
     uint64_t epa = (uint64_t)(uintptr_t)g_ering;
-    erst[0] = (uint32_t)epa; erst[1] = (uint32_t)(epa >> 32); erst[2] = RING_TRBS; erst[3] = 0;
+    g_erst[0] = (uint32_t)epa; g_erst[1] = (uint32_t)(epa >> 32); g_erst[2] = RING_TRBS; g_erst[3] = 0;
     wr32(g_rt, R_ERSTSZ, 1);
     wr64(g_rt, R_ERDP, epa);
-    wr64(g_rt, R_ERSTBA, (uint64_t)(uintptr_t)erst);
+    wr64(g_rt, R_ERSTBA, (uint64_t)(uintptr_t)g_erst);
 
     /* per-device structures */
-    g_inctx  = (volatile uint32_t *)page_alloc(1);
-    g_devctx = (volatile uint32_t *)page_alloc(1);
-    ring_init(&g_ep0, (volatile uint32_t *)page_alloc(1));
-    ring_init(&g_in,  (volatile uint32_t *)page_alloc(1));
-    ring_init(&g_out, (volatile uint32_t *)page_alloc(1));
-    g_small  = (uint8_t *)page_alloc(1);
-    uint8_t *braw = (uint8_t *)page_alloc(32);                  /* 128KB -> 64KB-aligned 64KB */
-    g_bounce = (uint8_t *)(((uintptr_t)braw + 0xFFFF) & ~(uintptr_t)0xFFFF);
+    if (!g_inctx) g_inctx = (volatile uint32_t *)page_alloc(1);
+    if (!g_devctx) g_devctx = (volatile uint32_t *)page_alloc(1);
+    memset((void *)g_inctx, 0, 4096); memset((void *)g_devctx, 0, 4096);
+    if (!g_ep0.trb) g_ep0.trb = (volatile uint32_t *)page_alloc(1);
+    if (!g_in.trb) g_in.trb = (volatile uint32_t *)page_alloc(1);
+    if (!g_out.trb) g_out.trb = (volatile uint32_t *)page_alloc(1);
+    ring_init(&g_ep0, g_ep0.trb); ring_init(&g_in, g_in.trb); ring_init(&g_out, g_out.trb);
+    if (!g_small) g_small = (uint8_t *)page_alloc(1);
+    if (!g_bounce) {
+        uint8_t *braw = (uint8_t *)page_alloc(32);              /* 128KB -> aligned 64KB */
+        g_bounce = (uint8_t *)(((uintptr_t)braw + 0xFFFF) & ~(uintptr_t)0xFFFF);
+    }
 
     /* run */
     wr32(g_op, O_USBCMD, rd32(g_op, O_USBCMD) | 1u);           /* R/S = 1 */
@@ -554,4 +565,25 @@ int usb_init(void) {
             }
     kputs("[usb] no USB mass-storage device found\n");
     return 0;
+}
+
+int usb_suspend(void) {
+    if (!g_ctrl_up || !g_op) return 0;
+    if (g_ready) {
+        uint8_t cdb[10] = { 0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0 };   /* SYNCHRONIZE CACHE(10) */
+        if (scsi(cdb, 10, 0, 0, 0) != 0) return -2;
+    }
+    wr32(g_op, O_USBCMD, rd32(g_op, O_USBCMD) & ~1u);
+    uint64_t deadline = millis() + 1000;
+    while (!(rd32(g_op, O_USBSTS) & 1u) && millis() < deadline) __asm__ volatile("pause");
+    if (!(rd32(g_op, O_USBSTS) & 1u)) return -1;
+    g_ready = 0; g_ctrl_up = 0; g_gen++;
+    return 0;
+}
+
+int usb_resume(void) {
+    if (g_pci_bus < 0) return 0;
+    g_ready = 0; g_ctrl_up = 0;
+    bringup(g_pci_bus, g_pci_dev, g_pci_fn);
+    return g_ctrl_up ? 0 : -1;
 }

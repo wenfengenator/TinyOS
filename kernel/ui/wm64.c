@@ -441,23 +441,23 @@ void wm_sleep_set(int on) {
 }
 
 void wm_sleep_wait(void) {
+    int scheduler_active = sched_is_running();
+    if (lapic_ready()) lapic_suspend_arm();
     while (g_sleeping) {
         power_poll();
         int key = kbd64_getkey();
         if (key < 0) key = hvkbd_getkey();
         if (key >= 0) { wm_sleep_set(0); break; }       /* consume the wake key */
         uint64_t t0 = millis();
-        if (sched_is_running()) {
-            __asm__ volatile("sti; hlt; cli");
-        } else if (lapic_ready()) {
-            lapic_idle_arm();
-            __asm__ volatile("sti; hlt; cli");
-            lapic_idle_disarm();
+        if (lapic_ready()) {
+            arch_cpu_deep_idle(&g_sleeping, 1);
         } else {
-            sleep_ms(3);
+            sleep_ms(250);
         }
         cpu_idle_add_ms(millis() - t0);
     }
+    if (scheduler_active) lapic_idle_arm();
+    else if (lapic_ready()) lapic_idle_disarm();
 }
 
 /* Sample the lid ~4x/s and sleep/wake on an open<->closed *transition* only, so

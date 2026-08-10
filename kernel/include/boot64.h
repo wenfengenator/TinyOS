@@ -8,7 +8,22 @@
 #include <stdint.h>
 
 /* TinyOS product version. */
-#define TINYOS_VERSION "2.0.0"
+#define TINYOS_VERSION "3.0.0"
+
+/* Boot-time self-tests (linux-abi/musl/TCC/ELF probes, scheduler/proc, TinyGL,
+ * and network connectivity checks) slow the boot noticeably.  They are proven
+ * stable, so default them OFF; set to 1 to re-enable for verification.  The
+ * test code itself is retained (compiled only when this is 1). */
+#ifndef RUN_BOOT_SELFTESTS
+#define RUN_BOOT_SELFTESTS 0
+#endif
+
+/* Verbose boot diagnostics (uACPI table dump, HDA codec enumeration, EC RAM
+ * slab, ACPI/framebuffer info): off for a fast, quiet boot; set to 1 to debug
+ * hardware bring-up.  The diagnostic code is retained (compiled only when 1). */
+#ifndef BOOT_DIAG
+#define BOOT_DIAG 0
+#endif
 
 /* Handoff block: the UEFI loader fills this before ExitBootServices and passes
  * a pointer to the 64-bit kernel entry. */
@@ -74,6 +89,10 @@ void     fb_present(const uint32_t *back);     /* blit a tight w*h back buffer  
 void     fb_present_diff(const uint32_t *back, uint32_t *shadow,
                         uint32_t w, uint32_t h); /* blit only changed scanlines     */
 void     fb_panel_power(int on);               /* Intel PWM backlight; no-op elsewhere */
+void     fb_s3_suspend(void);                  /* snapshot panel state before ACPI S3 */
+void     fb_s3_resume(void);                   /* restore PAT/panel and repaint scanout */
+int      fb_igd_dump(char *buf, int max);      /* diagnostic: key display regs -> string */
+const char *fb_igd_post_dump(void);            /* raw display regs captured at resume    */
 
 /* display layer (kernel/disp64.c): a swappable backend behind a stable seam.
  * The default backend is the GOP / Hyper-V framebuffer (double buffer + scanline
@@ -153,9 +172,13 @@ void     sched_wake(int chan);                 /* wake tasks blocked on a channe
 void     sched_wait(volatile int *addr, int want, int chan); /* race-free block until *addr==want */
 void     sched_exit(void);                     /* retire the running task (never returns)  */
 int      sched_is_running(void);               /* 1 while the LAPIC timer is live (safe to HLT) */
+void     sched_s3_resume(int was_running);      /* restore LAPIC/IDT state without clearing tasks */
 int      lapic_ready(void);                    /* LAPIC timer calibrated (idle-tick usable) */
 void     lapic_idle_arm(void);                 /* arm a periodic tick to wake a native-console HLT */
 void     lapic_idle_disarm(void);             /* mask it again after waking */
+void     lapic_suspend_arm(void);              /* arm a ~1 Hz wake tick for system suspend */
+void     arch_cpu_deep_idle(volatile int *condition, int expected); /* deepest advertised C-state */
+int      arch_cpu_deep_state(void);            /* selected C-state number, or 1 */
 uint64_t cpu_idle_ms(void);                    /* accumulated CPU-halted milliseconds (for CPU%%) */
 void     cpu_idle_add_ms(uint64_t ms);         /* add halted time from a HLT outside idle_wait */
 
@@ -190,15 +213,23 @@ void     smp_init(boot_info_t *bi);
 int      smp_cpu_count(void);      /* CPUs the firmware/ACPI reported */
 int      smp_online_count(void);   /* cores that reached long-mode kernel code */
 uint64_t smp_lapic_base(void);     /* Local APIC MMIO base (from ACPI MADT)     */
+int      smp_s3_quiesce(void);     /* park every AP before firmware sleep       */
+void     smp_s3_abort(void);       /* release APs after a failed transition     */
+int      smp_s3_restart(void);     /* INIT-SIPI APs after BSP resume            */
 
 /* ---- ACPI power management + Embedded Controller (kernel/acpi64.c) ---- */
 typedef struct { int present, ac_online, charging, percent, voltage_mv; uint8_t raw[8]; } acpi_batt_t;
 void     acpi_init(uint64_t rsdp);            /* parse FADT/ECDT/DSDT, probe EC       */
 int      acpi_battery(acpi_batt_t *b);        /* fill battery/AC state; <0 if no EC   */
 int      acpi_ec_read(uint8_t off, uint8_t *out);  /* raw EC RAM read (battery calibration) */
+int      acpi_ec_region_read(uint8_t off, uint8_t *out);   /* ungated EC read for the uACPI EC handler  */
+int      acpi_ec_region_write(uint8_t off, uint8_t val);   /* ungated EC write for the uACPI EC handler */
 int      acpi_poweroff(void);                 /* ACPI S5 soft-off; <0 if unavailable  */
 void     acpi_reset(void);                    /* reset register / 0xCF9 / 8042        */
-int      acpi_s3_available(void);             /* 1 if S3 SLP_TYP + PM1 known          */
+int      acpi_s3_available(void);             /* 1 if FACS + low wake trampoline ready */
+int      acpi_s3_enter(void);                 /* 0 after wake; negative on bounded failure */
+uint32_t acpi_s3_phase(void);                 /* retained: 1=armed, 2=legacy, 3=long, 4=resumed */
+void     acpi_s3_persist_boot_phase(void);    /* write retained wake phase to /mnt/S3BOOT.TXT */
 
 /* ---- virtio-blk persistent disk (kernel/vblk64.c) ---- */
 int      vblk_init(void);                    /* 1 if a virtio-blk device is present */
@@ -210,6 +241,8 @@ int      ahci_read(uint64_t lba, uint32_t count, void *buf);
 int      ahci_write(uint64_t lba, uint32_t count, const void *buf);
 uint64_t ahci_sectors(void);                         /* disk size in 512-byte sectors */
 int      ahci_present(void);
+int      ahci_suspend(void);                         /* flush cache and stop port DMA */
+int      ahci_resume(void);                          /* restore HBA and verify disk   */
 
 /* ---- Intel High Definition Audio (kernel/drivers/hda64.c) ---- */
 typedef struct hda_diag {
@@ -225,6 +258,8 @@ int      hda_get_volume(void);
 int      hda_play(const int16_t *samples, uint32_t frames); /* 48 kHz S16 stereo, synchronous */
 int      hda_tone(uint32_t hz, uint32_t duration_ms, uint32_t volume);
 void     hda_stop(void);
+void     hda_suspend(void);
+int      hda_resume(void);
 
 /* ---- USB host (xHCI) + Mass Storage block device (kernel/drivers/usb64.c) ---- */
 int      usb_init(void);                             /* 1 if a USB mass-storage device is ready */
@@ -233,6 +268,8 @@ int      usb_gen(void);                              /* bumps on connect/disconn
 uint64_t usb_sectors(void);                          /* stick size in 512-byte sectors */
 int      usb_read(uint64_t lba, uint32_t count, void *buf);
 int      usb_write(uint64_t lba, uint32_t count, const void *buf);
+int      usb_suspend(void);
+int      usb_resume(void);
 
 /* ---- FAT32 reader for the internal-disk ESP over AHCI (kernel/fs/esp64.c) ---- */
 typedef void (*esp_dirent_cb)(const char *name, uint32_t size, int isdir,
@@ -279,8 +316,15 @@ int      dv_resolve(const char *path, uint32_t *clus, uint32_t *size, int *isdir
 int      dv_read(uint32_t first, uint32_t size, void *buf, uint32_t max);
 int      dv_readdir(uint32_t dir_clus, int idx, char *name);
 int      dv_write(const char *path, const void *data, uint32_t len);
+void     dv_sync(void);                              /* flush cached FAT metadata */
 int      dv_mkdir(const char *path);
 int      dv_unlink(const char *path);
+
+/* ---- AML interpreter (uACPI 6.0.0 host adapter) ---- */
+int      tinyos_uacpi_init(uint64_t rsdp);
+int      tinyos_uacpi_prepare_s3(void);             /* executes firmware _PTS */
+int      tinyos_uacpi_wake_s3(void);                /* executes firmware _WAK */
+int      tinyos_uacpi_enter_s3(void);               /* ACPICA-equivalent SLP_TYP/SLP_EN write */
 /* ---- VMBus primitives shared by synthetic drivers (kernel/vmbus64.c) ---- */
 int      vmbus_ready(void);                   /* VMBus connected + offers enumerated */
 void    *vmbus_palloc(unsigned pages);

@@ -408,6 +408,7 @@ int net_selftest(void) {
     } else {
         kputs("[net] dhcp: no lease (using "); put_ip(g_ip); kputs(")\n");
     }
+#if RUN_BOOT_SELFTESTS
     { int nt = netvsc_diag(); if (nt > 0) { kputs("[net] netvsc frames sent "); kput_u32dec((uint32_t)nt); kputc('\n'); } }
 
     { uint32_t us = 0;                               /* loopback ICMP: exercises the echo responder */
@@ -467,5 +468,6 @@ int net_selftest(void) {
         kputs(okh ? "[net] httpd serve loopback -> client got 200 OK\n"
                   : "[net] httpd serve loopback FAILED\n");
     }
+#endif
     return 0;
 }

@@ -27,17 +27,10 @@ void kmain64(boot_info_t *bi) {
         kputs(" @ ");     kput_u64hex(bi->fb_base);
         kputc('\n');
 
-        /* Colour swatches in the top-right prove real GOP pixel writes and the
-         * pixel-format packing; read three back and report over serial so the
-         * framebuffer path is verifiable headlessly. */
+        /* Colour swatches in the top-right prove real GOP pixel writes. */
         fb_rect(bi->width - 96, 8, 24, 24, 0xFF0000);   /* red   */
         fb_rect(bi->width - 64, 8, 24, 24, 0x00FF00);   /* green */
         fb_rect(bi->width - 32, 8, 24, 24, 0x0000FF);   /* blue  */
-        kputs("[tinyos64] fb readback R="); kput_u64hex(fb_peek(bi->width - 96 + 12, 20));
-        kputs(" G="); kput_u64hex(fb_peek(bi->width - 64 + 12, 20));
-        kputs(" B="); kput_u64hex(fb_peek(bi->width - 32 + 12, 20));
-        kputc('\n');
-        arch_fb_mem_diag(bi->fb_base, bi->fb_size);
     } else {
         kputs("[tinyos64] WARNING: firmware provided no framebuffer\n");
     }
@@ -60,17 +53,6 @@ void kmain64(boot_info_t *bi) {
     kputs(" MHz; heap ");      kput_u32dec((uint32_t)(heap_total() / (1024 * 1024)));
     kputs(" MB\n");
 
-    if (bi->asset_base) {
-        const uint8_t *a = (const uint8_t *)(uintptr_t)bi->asset_base;
-        uint64_t sum = 0;
-        for (uint64_t i = 0; i < bi->asset_size; i++) sum += a[i];
-        kputs("[tinyos64] asset "); kput_u32dec((uint32_t)bi->asset_size);
-        kputs(" B @ "); kput_u64hex(bi->asset_base);
-        kputs(" sum "); kput_u64hex(sum); kputc('\n');
-    } else {
-        kputs("[tinyos64] no asset loaded\n");
-    }
-
     arch_init();
     /* Map the framebuffer write-combining so blits run at bus speed instead of
      * ~3 FPS uncached.  The earlier "only refreshes on a keypress" symptom was
@@ -92,6 +74,7 @@ void kmain64(boot_info_t *bi) {
         kputs("[disp] backend "); kputs(display_backend_name());
         kputs(" ("); kput_u32dec((uint32_t)display_outputs()); kputs(" output) ");
         kput_u32dec(dw); kputc('x'); kput_u32dec(dh); kputc('\n');
+#if RUN_BOOT_SELFTESTS
         kputs(tgl_selftest() == 0 ? "[tinygl] G2/G3 clear+compose+2D (fill/blend/clip/line/gradient) OK\n"
                                   : "[tinygl] G2/G3 self-test FAILED\n");
         kputs(tgl3d_selftest() == 0 ? "[tinygl] G4 3D raster + depth + cull OK\n"
@@ -102,11 +85,14 @@ void kmain64(boot_info_t *bi) {
                                     : "[tinygl] G6 BO self-test FAILED\n");
         { int z = arch_bo_zerocopy_test();
           kputs(z == 0 ? "[tinygl] G6 BO user-mapped zero-copy (shared frames) OK\n"
-                       : "[tinygl] G6 BO user-map FAILED\n"); } }
+                       : "[tinygl] G6 BO user-map FAILED\n"); }
+#endif
+    }
     if (nic_init()) {
         net_init();
         net_selftest();
     }
+    acpi_s3_persist_boot_phase();
     login_run(bi);
     wm_run(bi);
 

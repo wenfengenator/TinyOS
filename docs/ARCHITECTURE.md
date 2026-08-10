@@ -463,6 +463,11 @@ This closes the north-star loop: the OS can build native executables for itself.
 
 ## 14. Design principles and rationale
 
+- **Energy first.** The T440s is the reference target and battery life is a
+  primary acceptance criterion. Idle code must block instead of poll, display
+  work must follow damage, periodic wakeups must be justified, and drivers must
+  provide a quiescent state. New subsystems should report both functionality
+  and their idle wake/power cost on real hardware.
 - **Assembly only where required.** Just the AP trampoline, the SYSCALL/IDT/
   context-switch stubs, and a boot shim; everything else is C.
 - **One binary, no host.** The whole system is a single freestanding PE32+.
@@ -513,21 +518,48 @@ The terminal splits into up to **four concurrent shells** in a 2-column grid
 
 ### Power management
 
-The original desktop and shell loops spun at 100% CPU. They now **idle on
-`HLT`**:
+Low power is a primary system-design target, with three operating states:
 
-- `idle_wait()` runs `sti; hlt` (gated on the scheduler) in the shell read
-  loops; the scheduler-stopped native console arms a scoped one-shot LAPIC tick
-  around the halt. Idle cores drop from ~100% to ~0%.
+- **Active** uses the 100 Hz scheduler only while runnable work needs it.
+- **Idle** blocks on interrupts instead of spinning and renders only damaged
+  content. Idle cores drop from ~100% busy to halted time.
+- **Suspend (deep S0)** stops HDA, powers down the panel, parks APs, selects the
+  deepest MONITOR/MWAIT C-state advertised by CPUID, and reduces the BSP LAPIC
+  wake cadence from 100 Hz to about 1 Hz. CPUs without MWAIT, including the
+  default QEMU model, safely fall back to HLT.
+
+The implementation follows these rules:
+
+- `idle_wait()` uses `sti; hlt` in shell read loops; the scheduler-stopped
+  native console arms a scoped LAPIC tick around the halt.
 - The compositor renders **on change** (plus the 500 ms cursor-blink/clock
   cadence), so a quiet screen blits nothing.
 - The system monitor gained a **CPU %** meter (halted-time accounting), battery,
   voltage, and **LID** rows.
-- **Sleep** — framebuffer blanked, deepest idle — triggers on **F3**, **lid
-  close** (EC), or the **power button** (ACPI PM1 `PWRBTN_STS`), and wakes on
-  lid-open or any key. `power_poll()` samples the lid ~4×/s and acts only on a
-  real open⇄closed *transition*, so a wrong static reading can never blank the
-  screen.
+- Suspend triggers on **F3**, **lid close** (EC), or the **power button** (ACPI
+  PM1 `PWRBTN_STS`), and wakes within about one second on lid-open or any key.
+  `power_poll()` acts only on a real open⇄closed *transition*, so a wrong static
+  reading can never blank the screen.
+
+The ACPI S3 path discovers and validates the FACS, copies a wake trampoline to
+physical `0x7000`, publishes the legacy waking vector only during the
+transition, saves CR3/RSP/callee state, and returns through a dual
+real-mode/firmware-preserved-long-mode resume entry. Before `SLP_EN`, it stops
+the scheduler without destroying tasks, parks every AP with acknowledgement,
+flushes SATA and USB mass-storage caches, halts AHCI/xHCI DMA, stops HDA,
+preserves PM1 control state, and arms power-button/RTC fixed-event wake. Resume
+restores BSP CPU tables, restarts APs with INIT-SIPI-SIPI, reinstalls scheduler
+IDT/LAPIC state, restores AHCI/xHCI/HDA and PS/2 input, reapplies framebuffer
+write combining and panel PWM, and forces a full repaint. Device waits have
+bounded failure paths.
+
+The native `s3test` command remains the activation gate. F3/lid sleep stays on
+the proven deep-S0 path until repeated T440s cycles verify firmware
+`_PTS`/`_GTS`/`_WAK` and model-specific GPE behavior plus Haswell pipe/plane
+retention. QEMU/OVMF reaches S3, but the local QEMU 8.2 monitor aborts in its
+`system_wakeup` path, so it cannot serve as the final resume oracle. Virtio and
+VMBus queue transports also need a host-specific reset/rebind contract before
+VM S3 is supported; the current S3 activation target is the physical T440s.
 
 ### Real hardware: storage, USB, and firmware-safe teardown
 

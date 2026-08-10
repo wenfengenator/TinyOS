@@ -681,6 +681,7 @@ int dv_resolve(const char *path, uint32_t *clus, uint32_t *size, int *isdir) { r
 int dv_read(uint32_t first, uint32_t size, void *buf, uint32_t max) { return fv_read(&g_dv, first, size, buf, max); }
 int dv_readdir(uint32_t dir_clus, int idx, char *name) { return fv_readdir(&g_dv, dir_clus, idx, name); }
 int dv_write(const char *path, const void *data, uint32_t len) { return fv_write(&g_dv, path, data, len); }
+void dv_sync(void) { if (g_fc_v == &g_dv) fat_flush(); }
 int dv_mkdir(const char *path) { return fv_mkdir(&g_dv, path); }
 int dv_unlink(const char *path) { return fv_unlink(&g_dv, path); }
 

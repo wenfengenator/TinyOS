@@ -133,10 +133,15 @@ application (`BOOTX64.EFI`). It boots on `qemu-system-x86_64` + OVMF and on
   grid; **F5** splits a new pane, **F4** cycles focus. Each pane has its own
   line discipline, history, and cursor, so you can edit in one pane while a
   build runs in another.
-* **Power management for battery life** — an **HLT-based idle** (idle cores draw
-  ~0% instead of spinning), render-on-change compositing, a live **CPU %** meter,
-  and **sleep** (screen off + deep idle) on **F3**, **lid close**, or the
-  **power button**; a wake on lid-open or keypress.
+* **Energy-first system design** — battery life on the T440s is a primary
+  acceptance criterion. Idle work blocks, compositing follows damage, APs park
+  in the deepest advertised MWAIT C-state, and deep-S0 suspend drops LAPIC
+  polling from 100 Hz to about 1 Hz while the screen and audio are off. **F3**,
+  lid close, or the power button suspends; lid-open or a key wakes. The explicit
+  `s3test` path now quiesces and restarts APs, preserves scheduler state, flushes
+  and restores AHCI/xHCI, reinitializes HDA/input, restores framebuffer caching
+  and panel state, and arms fixed-event wake sources. F3/lid remain on deep-S0
+  until repeated T440s tests validate firmware AML/GPE and display behavior.
 * **Runs on real hardware** — bring-up and stability hardening on a **ThinkPad
   T440s** (Haswell): **AHCI** persistence at `/mnt`, **xHCI USB mass-storage**
   read/write at `/usb` (the file bridge to the outside world), EC battery/AC

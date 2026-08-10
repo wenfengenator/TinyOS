@@ -1,3 +1,14 @@
+## uACPI
+
+`uacpi/` is uACPI 6.0.0 at commit `9c9b26d6291a1cdd9014cc5bb6b03e596697cbfd`,
+vendored unchanged under its MIT license. TinyOS uses it to execute platform
+ACPI sleep methods such as `_PTS` and `_WAK`.
+
+The uACPI objects are compiled with `-fPIE` under TinyOS's forced hidden
+declaration context. Keep both settings: ordinary `-fPIC` creates GOT references
+that GNU's PE linker mishandles, while `-fno-pic` leaves preferred-base pointers
+that fail when physical firmware relocates `BOOTX64.EFI`.
+
 # third_party — vendored build materials
 
 TinyOS's **target toolchain** is built from source vendored here, so all three

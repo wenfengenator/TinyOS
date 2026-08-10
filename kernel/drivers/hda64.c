@@ -43,6 +43,7 @@ static uint32_t diag_stage, diag_gcap, diag_codecs;
 static int master_volume = 80;
 static int16_t *pcm;
 static struct hda_bdl *bdl;
+static int pci_bus = -1, pci_dev, pci_fn;
 
 static uint8_t r8(int off) { return *(volatile uint8_t *)(regs + off); }
 static uint16_t r16(int off) { return *(volatile uint16_t *)(regs + off); }
@@ -78,28 +79,35 @@ static uint32_t param(int nid, int which) { return hda_verb(codec, nid, 0xF00, (
 static void power_node(int nid) { hda_verb(codec, nid, 0x705, 0); }
 static uint32_t widget_caps(int nid) { return param(nid, 9); }
 
+/* Verbose codec-enumeration logging, gated by BOOT_DIAG (boot64.h). */
+#if BOOT_DIAG
+#define HDBG(stmt) do { stmt; } while (0)
+#else
+#define HDBG(stmt) do {} while (0)
+#endif
+
 static int find_codec_path(void) {
     uint16_t codecs = r16(0x0E);
     diag_codecs = codecs;
-    kputs("[hda] codec bitmap "); kput_u64hex(codecs); kputc('\n');
+    HDBG(kputs("[hda] codec bitmap "); kput_u64hex(codecs); kputc('\n'));
     for (int cad = 0; cad < 15; cad++) if (codecs & (1u << cad)) {
         codec = cad; afg = dac = pin = -1;
         uint32_t vendor = param(0, 0);
-        kputs("[hda] cad "); kput_u32dec((uint32_t)cad); kputs(" vendor "); kput_u64hex(vendor); kputc('\n');
+        HDBG(kputs("[hda] cad "); kput_u32dec((uint32_t)cad); kputs(" vendor "); kput_u64hex(vendor); kputc('\n'));
         uint32_t root = param(0, 4); int first = (int)((root >> 16) & 0xFF), count = (int)(root & 0xFF);
-        kputs("[hda] cad "); kput_u32dec((uint32_t)cad); kputs(" root "); kput_u64hex(root); kputc('\n');
+        HDBG(kputs("[hda] cad "); kput_u32dec((uint32_t)cad); kputs(" root "); kput_u64hex(root); kputc('\n'));
         for (int node = first; node < first + count; node++) {
             uint32_t type = param(node, 5);
-            kputs("[hda] fg "); kput_u32dec((uint32_t)node); kputs(" type "); kput_u64hex(type); kputc('\n');
+            HDBG(kputs("[hda] fg "); kput_u32dec((uint32_t)node); kputs(" type "); kput_u64hex(type); kputc('\n'));
             if ((type & 0xFF) == 1) { afg = node; break; }
         }
         if (afg < 0 && count == 1 && first > 0) {
             afg = first;
-            kputs("[hda] sole function-group fallback "); kput_u32dec((uint32_t)afg); kputc('\n');
+            HDBG(kputs("[hda] sole function-group fallback "); kput_u32dec((uint32_t)afg); kputc('\n'));
         }
         if (afg < 0) continue;
         uint32_t nodes = param(afg, 4); first = (int)((nodes >> 16) & 0xFF); count = (int)(nodes & 0xFF);
-        kputs("[hda] afg nodes "); kput_u64hex(nodes); kputc('\n');
+        HDBG(kputs("[hda] afg nodes "); kput_u64hex(nodes); kputc('\n'));
         if (!count || count > 128 || first < 2) continue;
         afg_first = first; afg_count = count;
         int pin_score = -1;
@@ -111,7 +119,7 @@ static int find_codec_path(void) {
             uint32_t formats = param(node, 0x0B);
             if (dac < 0 && (formats & 1u) && !(pcaps & (1u << 4))) {
                 dac = node;
-                kputs("[hda] PCM converter fallback "); kput_u32dec((uint32_t)node); kputc('\n');
+                HDBG(kputs("[hda] PCM converter fallback "); kput_u32dec((uint32_t)node); kputc('\n'));
             }
             if ((type == 4 || (pcaps & (1u << 4))) && pcaps != 0xFFFFFFFFu) {
                 uint32_t config = hda_verb(codec, node, 0xF1C, 0);
@@ -122,15 +130,15 @@ static int find_codec_path(void) {
                     if (device == 1) score += 30;     /* internal speaker */
                     else if (device == 2) score += 20;/* headphones */
                     else score += 10;                 /* line out */
-                    kputs("[hda] analog pin "); kput_u32dec((uint32_t)node);
-                    kputs(" cfg "); kput_u64hex(config); kputs(" caps "); kput_u64hex(pcaps); kputc('\n');
+                    HDBG(kputs("[hda] analog pin "); kput_u32dec((uint32_t)node);
+                         kputs(" cfg "); kput_u64hex(config); kputs(" caps "); kput_u64hex(pcaps); kputc('\n'));
                     if (score > pin_score) { pin = node; pin_score = score; }
                 }
             }
         }
         if (pin < 0 && vendor == 0x10EC0292u && first <= 0x14 && first + count > 0x14) {
             pin = 0x14; pin_score = 100;
-            kputs("[hda] ALC292 T440s speaker pin quirk NID 20\n");
+            HDBG(kputs("[hda] ALC292 T440s speaker pin quirk NID 20\n"));
         }
         if (dac >= 0 && pin >= 0) return 1;
         if (cad + 1 < 15 && (codecs & (uint16_t)~((1u << (cad + 1)) - 1u)))
@@ -164,8 +172,8 @@ static void configure_analog_path(void) {
 }
 
 static int probe_controller(int bus, int dev, int fn, int *input_streams) {
-        kputs("[hda] PCI "); kput_u32dec((uint32_t)bus); kputc(':'); kput_u32dec((uint32_t)dev);
-        kputc('.'); kput_u32dec((uint32_t)fn); kputc('\n');
+        HDBG(kputs("[hda] PCI "); kput_u32dec((uint32_t)bus); kputc(':'); kput_u32dec((uint32_t)dev);
+             kputc('.'); kput_u32dec((uint32_t)fn); kputc('\n'));
         pci_power_d0(bus, dev, fn);
         uint32_t barlo = pci_read(bus, dev, fn, 0x10); uint64_t bar = barlo & ~0xFu;
         if ((barlo & 6) == 4) bar |= (uint64_t)pci_read(bus, dev, fn, 0x14) << 32;
@@ -182,7 +190,7 @@ static int probe_controller(int bus, int dev, int fn, int *input_streams) {
             while (!r16(0x0E) && millis() < end) { sleep_ms(1); } }
         uint16_t gcap = r16(0x00); int iss = (gcap >> 8) & 15, oss = (gcap >> 12) & 15;
         diag_gcap = gcap; diag_codecs = r16(0x0E); diag_stage = 5;
-        kputs("[hda] GCAP "); kput_u64hex(gcap); kputs(" STATESTS "); kput_u64hex(r16(0x0E)); kputc('\n');
+        HDBG(kputs("[hda] GCAP "); kput_u64hex(gcap); kputs(" STATESTS "); kput_u64hex(r16(0x0E)); kputc('\n'));
         if (!oss) { kputs("[hda] controller has no output streams\n"); return 0; }
         if (!find_codec_path()) { kputs("[hda] no analog output widget found on controller\n"); return 0; }
         *input_streams = iss;
@@ -206,13 +214,16 @@ int hda_init(void) {
         if ((cls >> 24) == 0x04 && ((cls >> 16) & 0xFF) == 0x03) {
             diag_stage = 2;
             codec = afg = dac = pin = -1; afg_first = afg_count = 0;
-            if (probe_controller(b, d, f, &iss)) found = 1;
+            if (probe_controller(b, d, f, &iss)) {
+                pci_bus = b; pci_dev = d; pci_fn = f; found = 1;
+            }
         }
     }
     if (!found) { kputs("[hda] no PCI controller with analog output\n"); return 0; }
     diag_stage = 6;
     stream_off = 0x80 + iss * 0x20;
-    pcm = (int16_t *)page_alloc(16); bdl = (struct hda_bdl *)page_alloc(1);
+    if (!pcm) pcm = (int16_t *)page_alloc(16);
+    if (!bdl) bdl = (struct hda_bdl *)page_alloc(1);
     if (!pcm || !bdl) { diag_stage = 7; return 0; }
     power_node(afg); power_node(dac); power_node(pin);
     configure_analog_path();
@@ -243,6 +254,15 @@ int hda_set_volume(int volume) {
 }
 int hda_get_volume(void) { return master_volume; }
 void hda_stop(void) { stop_stream(); }
+void hda_suspend(void) { stop_stream(); }
+int hda_resume(void) {
+    if (pci_bus < 0) return 0;
+    ready = 0; regs = 0; stream_off = -1;
+    codec = afg = dac = pin = -1; afg_first = afg_count = 0;
+    pci_power_d0(pci_bus, pci_dev, pci_fn);
+    pci_write(pci_bus, pci_dev, pci_fn, 4, pci_read(pci_bus, pci_dev, pci_fn, 4) | 6u);
+    return hda_init() ? 0 : -1;
+}
 
 int hda_play(const int16_t *samples, uint32_t frames) {
     if (!ready || !samples || !frames) return -1;

@@ -222,7 +222,7 @@ static void console_exec(terminal_t *t, char *line) {
         t_puts(t, "COMMANDS:\n");
         t_puts(t, "  SH (LINUX SHELL)  HELP  CLEAR  ECHO <T>  VER\n");
         t_puts(t, "  MEM  CPU  UPTIME  TIME\n");
-        t_puts(t, "  ASSET  WIN  RUN <P>  SPAWN <ELF>  DEMO  TGL  TGL3D  COMP  BO  PONG  SCHED  USCHED  STEST  EC  DISK  ESP  MNT  USB  INSTALL  REBOOT  POWEROFF\n");
+        t_puts(t, "  ASSET  WIN  RUN <P>  SPAWN <ELF>  DEMO  TGL  TGL3D  COMP  BO  PONG  SCHED  USCHED  STEST  EC  DISK  ESP  MNT  USB  INSTALL  S3TEST  REBOOT  POWEROFF\n");
         t_puts(t, "DESKTOP: F1=FOCUS  F2=MOVE+ARROWS\n");
     } else if (t_ieq(cmd, "clear") || t_ieq(cmd, "cls")) {
         t_clear(t);
@@ -556,6 +556,14 @@ static void console_exec(terminal_t *t, char *line) {
         t_puts(t, "POWERING OFF...\n");
         sleep_ms(300);
         if (acpi_poweroff() < 0) t_puts(t, "ACPI S5 UNAVAILABLE (POWER OFF MANUALLY)\n");
+    } else if (t_ieq(cmd, "s3test")) {
+        t_puts(t, "EXPERIMENTAL ACPI S3: automatic RTC wake in 10 seconds...\n");
+        int rc = acpi_s3_enter();
+        if (rc == 0) t_puts(t, "ACPI S3 RESUME OK\n");
+        else if (rc == -2) t_puts(t, "S3 BLOCKED: one or more APs did not quiesce\n");
+        else { t_puts(t, "S3 TRANSITION FAILED rc=-"); t_u32(t, (uint32_t)-rc); t_putc(t, '\n'); }
+        t_puts(t, "S3 PHASE "); t_u32(t, acpi_s3_phase());
+        t_puts(t, " (1=armed 2=legacy-vector 3=long-vector 4=resumed)\n");
     } else if (t_ieq(cmd, "reboot")) {
         t_puts(t, "REBOOTING...\n");
         sleep_ms(300);
